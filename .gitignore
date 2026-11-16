@@ -1,0 +1,15 @@
+node_modules/
+hosts.json
+*.log
+packages/*/hosts.json
+
+# 根目录的临时运维脚本与本地实验产物不属于插件包本体，不推送
+/*.mjs
+/*.py
+/*.sh
+/*.ps1
+/*.bat
+/deploy22/
+/-w
+/novnc.tmp
+/examples/demo-site/dist/

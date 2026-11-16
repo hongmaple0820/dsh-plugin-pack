@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="AI news">
+  <title>AI 资讯</title>
+  <defs>
+    <linearGradient id="aihot-ink" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#2f6df6"/>
+      <stop offset="1" stop-color="#18b6a4"/>
+    </linearGradient>
+  </defs>
+  <rect x="3" y="3" width="58" height="58" rx="16" fill="#101623"/>
+  <rect x="3.75" y="3.75" width="56.5" height="56.5" rx="15.25" fill="none" stroke="#2b3550" stroke-width="1.5"/>
+  <rect x="14" y="36" width="8" height="16" rx="4" fill="url(#aihot-ink)" opacity="0.55"/>
+  <rect x="28" y="26" width="8" height="26" rx="4" fill="url(#aihot-ink)" opacity="0.8"/>
+  <rect x="42" y="15" width="8" height="37" rx="4" fill="url(#aihot-ink)"/>
+  <circle cx="52" cy="20" r="4.5" fill="#7ef0d0"/>
+</svg>

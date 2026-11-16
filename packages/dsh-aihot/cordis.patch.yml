@@ -1,0 +1,6 @@
+- insert:
+    - id: dsh-aihot
+      name: '@local/dsh-aihot'
+      config:
+        timeoutMs: 8000
+        cacheTtlMs: 120000

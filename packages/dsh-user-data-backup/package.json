@@ -1,0 +1,16 @@
+{
+  "name": "@local/dsh-user-data-backup",
+  "version": "1.0.0",
+  "private": true,
+  "description": "数据管理：备份包导出/导入 + WebDAV/S3 同步的设置页",
+  "type": "module",
+  "files": [
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

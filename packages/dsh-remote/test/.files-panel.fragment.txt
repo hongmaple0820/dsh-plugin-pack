@@ -1,0 +1,895 @@
+// File browser for SSH hosts: list, preview, download/upload, context actions and an inline editor.
+    // Every write is a GET route gated by x-dsh-remote-exec, so no POST is ever attempted.
+    function FilesPanel({ host }) {
+      const [cwd, setCwd] = useState('/')
+      const [pathInput, setPathInput] = useState('/')
+      const [entries, setEntries] = useState([])
+      const [total, setTotal] = useState(0)
+      const [truncated, setTruncated] = useState(false)
+      const [loading, setLoading] = useState(false)
+      const [listError, setListError] = useState(null)
+      const [selectedFile, setSelectedFile] = useState(null)
+      const [preview, setPreview] = useState(null)
+      const [previewLoading, setPreviewLoading] = useState(false)
+      const [previewError, setPreviewError] = useState(null)
+      const [downloadBusy, setDownloadBusy] = useState(false)
+      const [uploading, setUploading] = useState(false)
+      const [uploadProgress, setUploadProgress] = useState(null)
+      const [fileActionError, setFileActionError] = useState(null)
+      const [fileNotice, setFileNotice] = useState(null)
+      const [sortMode, setSortMode] = useState('name')
+      const [showHidden, setShowHidden] = useState(true)
+      const [menu, setMenu] = useState(null)
+      const [dialog, setDialog] = useState(null)
+      const [editor, setEditor] = useState(null)
+      const [busyAction, setBusyAction] = useState(false)
+      const uploadTargetRef = useRef(null)
+      const fileInputRef = useRef(null)
+      const loadSeq = useRef(0)
+      const previewSeq = useRef(0)
+
+      const load = useCallback(async (targetPath) => {
+        const seq = loadSeq.current + 1
+        loadSeq.current = seq
+        if (!host) {
+          setListError('先在左侧选择一台主机')
+          return
+        }
+        setLoading(true)
+        setListError(null)
+        try {
+          const query = new URLSearchParams({
+            host,
+            path: targetPath,
+            sort: sortMode,
+            hidden: showHidden ? '1' : '0',
+          })
+          const data = await callApi(API.files + '?' + query.toString(), { headers: WRITE_HEADERS })
+          if (seq !== loadSeq.current) return
+          const nextPath = typeof data.path === 'string' && data.path ? data.path : targetPath
+          setCwd(nextPath)
+          setPathInput(nextPath)
+          setEntries(Array.isArray(data.entries) ? data.entries : [])
+          setTotal(Number(data.total) || 0)
+          setTruncated(Boolean(data.truncated))
+          setSelectedFile(null)
+          setPreview(null)
+          setPreviewError(null)
+          setPreviewLoading(false)
+        } catch (failure) {
+          if (seq !== loadSeq.current) return
+          setEntries([])
+          setTotal(0)
+          setTruncated(false)
+          setListError(failure.message)
+        } finally {
+          if (seq === loadSeq.current) setLoading(false)
+        }
+      }, [host, showHidden, sortMode])
+
+      useEffect(() => {
+        loadSeq.current += 1 // invalidate a listing still in flight for the previous host
+        previewSeq.current += 1
+        if (!host) {
+          setCwd('/')
+          setPathInput('/')
+          setEntries([])
+          setTotal(0)
+          setTruncated(false)
+          setSelectedFile(null)
+          setPreview(null)
+          setPreviewError(null)
+          setListError(null)
+          setLoading(false)
+          setMenu(null)
+          setDialog(null)
+          setEditor(null)
+          return
+        }
+        setCwd('/')
+        setPathInput('/')
+        setPreview(null)
+        setSelectedFile(null)
+        setPreviewError(null)
+        setMenu(null)
+        setDialog(null)
+        setEditor(null)
+        load('/')
+      }, [host, load])
+
+      useEffect(() => {
+        if (!fileNotice) return undefined
+        const timer = setTimeout(() => setFileNotice(null), 3000)
+        return () => clearTimeout(timer)
+      }, [fileNotice])
+
+      const openFile = useCallback(async (entry) => {
+        if (!host) return
+        const path = joinPath(cwd, entry.name)
+        const seq = previewSeq.current + 1
+        previewSeq.current = seq
+        setSelectedFile(path)
+        setPreview(null)
+        setPreviewError(null)
+        setPreviewLoading(true)
+        try {
+          const query = new URLSearchParams({ host, path })
+          const data = await callApi(API.file + '?' + query.toString(), { headers: WRITE_HEADERS })
+          if (seq !== previewSeq.current) return
+          setPreview(data)
+        } catch (failure) {
+          if (seq !== previewSeq.current) return
+          setPreviewError(failure.message)
+        } finally {
+          if (seq === previewSeq.current) setPreviewLoading(false)
+        }
+      }, [cwd, host])
+
+      const goUp = () => {
+        if (cwd === '/') return
+        const next = parentPath(cwd)
+        setPathInput(next)
+        load(next)
+      }
+
+      const submitPath = (event) => {
+        event.preventDefault()
+        const next = pathInput.trim()
+        if (!next) {
+          setListError('路径不能为空')
+          return
+        }
+        if (!next.startsWith('/')) {
+          setListError('路径必须是绝对路径（以 / 开头）')
+          return
+        }
+        load(next)
+      }
+
+      const openEntry = (entry) => {
+        setMenu(null)
+        if (entry.type === 'dir') {
+          const next = joinPath(cwd, entry.name)
+          setPathInput(next)
+          load(next)
+        } else if (entry.type === 'file' || entry.type === 'link') {
+          setPreview(null)
+          setPreviewError(null)
+          setPreviewLoading(true) // show the reading state before the request starts
+          openFile(entry)
+        }
+      }
+
+      const previewMeta = preview
+        ? preview.binary
+          ? '二进制文件 · ' + formatBytes(preview.size)
+          : (preview.truncated ? '已截断 · ' : '') + (preview.truncated ? '前 ' : '') + formatBytes(preview.bytes) + (preview.truncated ? ' / 共 ' + formatBytes(preview.size) : '')
+        : ''
+
+      const beginEdit = async (entry) => {
+        if (!host) return
+        const path = joinPath(cwd, entry.name)
+        setMenu(null)
+        setFileActionError(null)
+        setFileNotice(null)
+        try {
+          const query = new URLSearchParams({ host, path })
+          const data = await callApi(API.fileDownload + '?' + query.toString(), { headers: WRITE_HEADERS })
+          const bytes = decodeBase64Bytes(data.content)
+          if (data.truncated) {
+            setEditor({ path, content: '', size: Number(data.size) || bytes.length, readOnly: true, note: '文件超过可下载上限，只能查看，不能就地编辑' })
+            return
+          }
+          if (bytes.includes(0)) {
+            setFileActionError('二进制文件不能就地编辑')
+            return
+          }
+          const text = new TextDecoder().decode(bytes)
+          const readOnly = bytes.length > FILE_EDIT_MAX_BYTES
+          setEditor({ path, content: text, size: bytes.length, readOnly, note: readOnly ? '文件超过 256KB，只读' : null })
+        } catch (error) {
+          setFileActionError('读取文件失败：' + (error && error.message ? error.message : String(error)))
+        }
+      }
+
+      const saveEditor = async (asPath) => {
+        if (!editor || !host || busyAction) return
+        const target = asPath ? joinPath(parentPath(editor.path), asPath.trim()) : editor.path
+        if (asPath && !asPath.trim()) { setFileActionError('另存路径不能为空'); return }
+        setBusyAction(true)
+        setFileActionError(null)
+        setFileNotice(null)
+        try {
+          const bytes = new TextEncoder().encode(editor.content)
+          if (bytes.length > FILE_EDIT_MAX_BYTES) throw new Error('内容超过 256KB 上限')
+          const query = new URLSearchParams({
+            host,
+            path: target,
+            data: encodeBytesBase64(bytes),
+            mode: asPath ? 'create' : 'overwrite',
+          })
+          await callApi(API.fileWrite + '?' + query.toString(), { headers: WRITE_HEADERS })
+          setEditor(asPath ? { ...editor, path: target } : null)
+          setFileNotice((asPath ? '已另存 ' : '已保存 ') + target)
+          await load(cwd)
+        } catch (error) {
+          setFileActionError('保存失败：' + (error && error.message ? error.message : String(error)))
+        } finally {
+          setBusyAction(false)
+        }
+      }
+
+      const downloadSelected = async () => {
+        if (!host || !selectedFile || downloadBusy) return
+        setDownloadBusy(true)
+        setFileActionError(null)
+        setFileNotice(null)
+        try {
+          const query = new URLSearchParams({ host, path: selectedFile })
+          const data = await callApi(API.fileDownload + '?' + query.toString(), { headers: WRITE_HEADERS })
+          const bytes = decodeBase64Bytes(data.content)
+          const name = data.name || selectedFile.split('/').filter(Boolean).pop() || 'download.bin'
+          saveBlob(new Blob([bytes], { type: 'application/octet-stream' }), name)
+          setFileNotice(data.truncated
+            ? '已截断，只下载了前 ' + formatBytes(Number(data.bytes) || bytes.length) + '（原文件 ' + formatBytes(Number(data.size) || 0) + '）'
+            : '已下载 ' + name + '（' + formatBytes(Number(data.bytes) || bytes.length) + '）')
+        } catch (error) {
+          setFileActionError('下载失败：' + (error && error.message ? error.message : String(error)))
+        } finally {
+          setDownloadBusy(false)
+        }
+      }
+
+      const downloadEntry = async (entry) => {
+        const path = joinPath(cwd, entry.name)
+        setMenu(null)
+        if (!host) return
+        setDownloadBusy(true)
+        setFileActionError(null)
+        setFileNotice(null)
+        try {
+          const query = new URLSearchParams({ host, path })
+          const data = await callApi(API.fileDownload + '?' + query.toString(), { headers: WRITE_HEADERS })
+          const bytes = decodeBase64Bytes(data.content)
+          saveBlob(new Blob([bytes], { type: 'application/octet-stream' }), entry.name)
+          setFileNotice(data.truncated
+            ? '已截断，只下载了前 ' + formatBytes(Number(data.bytes) || bytes.length)
+            : '已下载 ' + entry.name + '（' + formatBytes(Number(data.bytes) || bytes.length) + '）')
+        } catch (error) {
+          setFileActionError('下载失败：' + (error && error.message ? error.message : String(error)))
+        } finally {
+          setDownloadBusy(false)
+        }
+      }
+
+      const onFileChosen = async (event) => {
+        const input = event.target
+        const file = input.files && input.files[0]
+        input.value = '' // allow choosing the same file again
+        if (!file || !host || uploading) return
+        const targetDir = uploadTargetRef.current || cwd
+        uploadTargetRef.current = null
+        setFileActionError(null)
+        setFileNotice(null)
+        if (file.size > UPLOAD_MAX_BYTES) {
+          setFileActionError('文件超过 ' + formatBytes(UPLOAD_MAX_BYTES) + ' 上限，请改用 Agent 的 remote_upload 工具')
+          return
+        }
+        setUploading(true)
+        setUploadProgress({ sent: 0, total: file.size })
+        let uploadId = null
+        try {
+          const beginQuery = new URLSearchParams({
+            host,
+            path: joinPath(targetDir, file.name),
+            size: String(file.size),
+            mode: 'overwrite',
+          })
+          const begin = await callApi(API.uploadBegin + '?' + beginQuery.toString(), { headers: WRITE_HEADERS })
+          uploadId = begin.uploadId
+          const bytes = new Uint8Array(await file.arrayBuffer())
+          const chunkBytes = Number.isInteger(begin.chunkBytes) && begin.chunkBytes > 0 ? begin.chunkBytes : UPLOAD_CHUNK_BYTES
+          for (let offset = 0; offset < bytes.length; offset += chunkBytes) {
+            const piece = bytes.subarray(offset, Math.min(bytes.length, offset + chunkBytes))
+            const chunkQuery = new URLSearchParams({
+              uploadId,
+              offset: String(offset),
+              data: encodeBytesBase64(piece),
+            })
+            const result = await callApi(API.uploadChunk + '?' + chunkQuery.toString(), { headers: WRITE_HEADERS })
+            setUploadProgress({ sent: Number(result.received) || offset + piece.length, total: file.size })
+          }
+          const done = await callApi(API.uploadFinish + '?' + new URLSearchParams({ uploadId }).toString(), { headers: WRITE_HEADERS })
+          setFileNotice('已上传 ' + file.name + '（' + formatBytes(Number(done.bytes) || file.size) + '）')
+          await load(cwd)
+        } catch (error) {
+          if (uploadId) {
+            try {
+              await callApi(API.uploadAbort + '?' + new URLSearchParams({ uploadId }).toString(), { headers: WRITE_HEADERS })
+            } catch { /* the session may already be gone */ }
+          }
+          setFileActionError('上传失败：' + (error && error.message ? error.message : String(error)))
+        } finally {
+          setUploading(false)
+          setUploadProgress(null)
+        }
+      }
+
+      const entryPath = (entry) => joinPath(cwd, entry.name)
+
+      const startUploadHere = (entry) => {
+        setMenu(null)
+        uploadTargetRef.current = joinPath(cwd, entry.name)
+        if (fileInputRef.current) fileInputRef.current.click()
+      }
+
+      const openDialog = (kind, entry) => {
+        setMenu(null)
+        setFileActionError(null)
+        setFileNotice(null)
+        const path = entry ? entryPath(entry) : cwd
+        if (kind === 'mkdir') setDialog({ kind, path, value: '' })
+        else if (kind === 'newfile') setDialog({ kind, path, value: '' })
+        else if (kind === 'rename') setDialog({ kind, path, value: entry.name })
+        else if (kind === 'delete') setDialog({ kind, path, name: entry.name, recursive: Boolean(entry.type === 'dir') })
+        else if (kind === 'chmod') setDialog({ kind, path, name: entry.name, mode: entry.type === 'dir' ? '0755' : '0644', recursive: false })
+        else if (kind === 'chown') setDialog({ kind, path, name: entry.name, uid: '0', gid: '0', recursive: false })
+      }
+
+      const updateDialog = (patch) => setDialog((previous) => (previous ? { ...previous, ...patch } : previous))
+
+      const runDialog = async () => {
+        if (!dialog || !host || busyAction) return
+        const value = String(dialog.value || '').trim()
+        setBusyAction(true)
+        setFileActionError(null)
+        setFileNotice(null)
+        try {
+          if (dialog.kind === 'mkdir' || dialog.kind === 'newfile') {
+            if (!value) throw new Error('名称不能为空')
+            const target = joinPath(dialog.path, value)
+            if (dialog.kind === 'mkdir') {
+              await callApi(API.fileMkdir + '?' + new URLSearchParams({ host, path: target }).toString(), { headers: WRITE_HEADERS })
+              setFileNotice('已新建目录 ' + target)
+            } else {
+              await callApi(API.fileWrite + '?' + new URLSearchParams({ host, path: target, data: '', mode: 'create' }).toString(), { headers: WRITE_HEADERS })
+              setFileNotice('已新建文件 ' + target)
+            }
+          } else if (dialog.kind === 'rename') {
+            if (!value || value.includes('/')) throw new Error('新名称不能为空，且不能包含 /')
+            const target = joinPath(parentPath(dialog.path), value)
+            await callApi(API.fileRename + '?' + new URLSearchParams({ host, from: dialog.path, to: target }).toString(), { headers: WRITE_HEADERS })
+            setFileNotice('已重命名为 ' + target)
+            if (selectedFile === dialog.path) setSelectedFile(target)
+          } else if (dialog.kind === 'delete') {
+            const query = new URLSearchParams({ host, path: dialog.path })
+            if (dialog.recursive) query.set('recursive', '1')
+            await callApi(API.fileDelete + '?' + query.toString(), { headers: WRITE_HEADERS })
+            setFileNotice('已删除 ' + dialog.path)
+            if (selectedFile === dialog.path) { setSelectedFile(null); setPreview(null) }
+            if (editor && editor.path === dialog.path) setEditor(null)
+          } else if (dialog.kind === 'chmod') {
+            if (!/^[0-7]{3,4}$/.test(dialog.mode)) throw new Error('权限必须是八进制数字，如 0644')
+            await callApi(API.fileChmod + '?' + new URLSearchParams({ host, path: dialog.path, mode: dialog.mode }).toString(), { headers: WRITE_HEADERS })
+            setFileNotice('已设置权限 ' + dialog.mode + ' · ' + dialog.path)
+          } else if (dialog.kind === 'chown') {
+            const uid = Number(dialog.uid)
+            const gid = Number(dialog.gid)
+            if (!Number.isInteger(uid) || uid < 0 || !Number.isInteger(gid) || gid < 0) throw new Error('uid 与 gid 必须是非负整数')
+            await callApi(API.fileChown + '?' + new URLSearchParams({ host, path: dialog.path, uid: String(uid), gid: String(gid) }).toString(), { headers: WRITE_HEADERS })
+            setFileNotice('已设置所有者 ' + uid + ':' + gid + ' · ' + dialog.path)
+          }
+          setDialog(null)
+          await load(cwd)
+        } catch (error) {
+          setFileActionError((error && error.message ? error.message : String(error)))
+        } finally {
+          setBusyAction(false)
+        }
+      }
+
+      const copyPath = (entry) => {
+        setMenu(null)
+        const path = entryPath(entry)
+        const done = () => setFileNotice('已复制路径 ' + path)
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(path).then(done).catch(() => {
+            if (copyTextFallback(path)) done()
+            else setFileActionError('复制失败，请手动选择路径')
+          })
+        } else if (copyTextFallback(path)) {
+          done()
+        } else {
+          setFileActionError('复制失败，请手动选择路径')
+        }
+      }
+
+      const toggleModeBit = (offset, checked) => {
+        if (!dialog) return
+        const digits = String(dialog.mode || '0644').padStart(4, '0').slice(-3).split('').map((digit) => Number(digit))
+        const bit = offset % 3
+        const weights = [4, 2, 1]
+        const index = Math.floor(offset / 3)
+        if (checked) digits[index] |= weights[bit]
+        else digits[index] &= ~weights[bit]
+        updateDialog({ mode: '0' + digits.join('') })
+      }
+
+      const modeChar = (digit, offset) => {
+        const weights = [4, 2, 1]
+        return (Number(digit) & weights[offset % 3]) !== 0
+      }
+
+      const menuItems = (entry) => {
+        const items = []
+        if (entry.type === 'dir') {
+          items.push({ label: '打开', run: () => openEntry(entry) })
+          items.push({ label: '上传到此处', run: () => startUploadHere(entry) })
+          items.push({ label: '新建文件', run: () => openDialog('newfile', entry) })
+          items.push({ label: '新建目录', run: () => openDialog('mkdir', entry) })
+        } else {
+          items.push({ label: '预览', run: () => openEntry(entry) })
+          items.push({ label: '编辑', run: () => beginEdit(entry) })
+          items.push({ label: '下载', run: () => downloadEntry(entry) })
+        }
+        items.push({ label: '重命名', run: () => openDialog('rename', entry) })
+        items.push({ label: '复制路径', run: () => copyPath(entry) })
+        items.push({ label: '权限…', run: () => openDialog('chmod', entry) })
+        items.push({ label: '所有者…', run: () => openDialog('chown', entry) })
+        items.push({ label: '删除', danger: true, run: () => openDialog('delete', entry) })
+        return items
+      }
+
+      const dialogTitle = dialog
+        ? ({
+          mkdir: '新建目录', newfile: '新建文件', rename: '重命名', delete: '删除', chmod: '修改权限', chown: '修改所有者',
+        })[dialog.kind]
+        : ''
+
+      const dialogNode = dialog
+        ? h('div', {
+          style: {
+            position: 'absolute',
+            inset: 0,
+            zIndex: 20,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            background: 'var(--dsw-alias-bg-overlay)',
+            padding: '8px',
+          },
+        },
+        h('div', {
+          style: {
+            width: '100%',
+            maxWidth: '280px',
+            padding: '10px',
+            borderRadius: 'var(--dsw-radius-sm, 6px)',
+            border: '1px solid ' + T.borderStrong,
+            background: T.surface,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '8px',
+          },
+        },
+        h('div', { style: { fontSize: '12px', color: T.text } }, dialogTitle),
+        dialog.kind === 'mkdir' || dialog.kind === 'newfile' || dialog.kind === 'rename'
+          ? h('label', { style: fieldLabelStyle }, '名称',
+            h('input', {
+              value: dialog.value,
+              onChange: (event) => updateDialog({ value: event.target.value }),
+              spellCheck: false,
+              autoFocus: true,
+              style: fieldStyle,
+            }))
+          : null,
+        dialog.kind === 'delete'
+          ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: '4px' } },
+            h('p', { style: { margin: 0, fontSize: '11px', color: T.error, wordBreak: 'break-all' } }, dialog.path),
+            h('p', { style: { margin: 0, fontSize: '10px', color: T.muted } }, '删除后无法恢复，确认继续？'))
+          : null,
+        dialog.kind === 'chmod'
+          ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+            h('div', { style: { fontSize: '10px', color: T.muted, wordBreak: 'break-all' } }, dialog.path),
+            h('div', { style: { display: 'flex', gap: '4px' } },
+              ['r', 'w', 'x'].map((label, offset) => h('label', {
+                key: label,
+                style: { flex: '1 1 0', fontSize: '10px', color: T.muted, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '2px' },
+              }, label,
+              h('input', {
+                type: 'checkbox',
+                checked: modeChar(String(dialog.mode || '0644').padStart(4, '0').slice(-3).split('')[0], offset),
+                onChange: (event) => toggleModeBit(offset, event.target.checked),
+              })))),
+            h('div', { style: { display: 'flex', gap: '4px' } },
+              ['r', 'w', 'x'].map((label, offset) => h('label', {
+                key: 'g' + label,
+                style: { flex: '1 1 0', fontSize: '10px', color: T.muted, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '2px' },
+              }, label,
+              h('input', {
+                type: 'checkbox',
+                checked: modeChar(String(dialog.mode || '0644').padStart(4, '0').slice(-3).split('')[1], offset),
+                onChange: (event) => toggleModeBit(offset + 3, event.target.checked),
+              })))),
+            h('div', { style: { display: 'flex', gap: '4px' } },
+              ['r', 'w', 'x'].map((label, offset) => h('label', {
+                key: 'o' + label,
+                style: { flex: '1 1 0', fontSize: '10px', color: T.muted, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '2px' },
+              }, label,
+              h('input', {
+                type: 'checkbox',
+                checked: modeChar(String(dialog.mode || '0644').padStart(4, '0').slice(-3).split('')[2], offset),
+                onChange: (event) => toggleModeBit(offset + 6, event.target.checked),
+              })))),
+            h('input', {
+              value: dialog.mode,
+              onChange: (event) => updateDialog({ mode: event.target.value }),
+              placeholder: '0644',
+              spellCheck: false,
+              style: { ...fieldStyle, fontFamily: T.mono },
+            }))
+          : null,
+        dialog.kind === 'chown'
+          ? h('div', { style: { display: 'flex', gap: '6px' } },
+            h('label', { style: { ...fieldLabelStyle, flex: '1 1 0' } }, 'UID',
+              h('input', { value: dialog.uid, onChange: (event) => updateDialog({ uid: event.target.value }), inputMode: 'numeric', style: fieldStyle })),
+            h('label', { style: { ...fieldLabelStyle, flex: '1 1 0' } }, 'GID',
+              h('input', { value: dialog.gid, onChange: (event) => updateDialog({ gid: event.target.value }), inputMode: 'numeric', style: fieldStyle })))
+          : null,
+        h('div', { style: { display: 'flex', gap: '6px', justifyContent: 'flex-end' } },
+          h('button', {
+            type: 'button',
+            onClick: () => setDialog(null),
+            disabled: busyAction,
+            style: { ...buttonStyle(false), height: '28px', padding: '0 10px' },
+          }, '取消'),
+          h('button', {
+            type: 'button',
+            onClick: runDialog,
+            disabled: busyAction,
+            style: {
+              ...buttonStyle(false),
+              height: '28px',
+              padding: '0 10px',
+              borderColor: dialog.kind === 'delete' ? T.error : T.accent,
+              color: dialog.kind === 'delete' ? T.error : T.accent,
+              opacity: busyAction ? 0.55 : 1,
+            },
+          }, busyAction ? '处理中…' : dialog.kind === 'delete' ? '确认删除' : '确定'))))
+        : null
+
+      const editorNode = editor
+        ? h('div', {
+          style: {
+            flex: '1 1 0',
+            minHeight: '140px',
+            display: 'flex',
+            flexDirection: 'column',
+            border: '1px solid ' + T.borderStrong,
+            borderRadius: '8px',
+            background: T.base,
+            overflow: 'hidden',
+          },
+        },
+        h('div', {
+          style: {
+            flex: '0 0 auto',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            padding: '4px 8px',
+            borderBottom: '1px solid ' + T.border,
+            background: T.surface,
+            fontSize: '11px',
+            color: T.muted,
+          },
+        },
+        h('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: T.mono, color: T.text } },
+          '编辑 · ' + editor.path),
+        editor.note ? h('span', { style: { color: T.warn, fontSize: '10px' } }, editor.note) : null,
+        h('button', {
+          type: 'button',
+          onClick: () => saveEditor(null),
+          disabled: editor.readOnly || busyAction,
+          style: { ...smallButtonStyle(editor.readOnly || busyAction), marginLeft: 'auto', height: '28px', padding: '0 10px' },
+        }, busyAction ? '保存中…' : '保存'),
+        h('button', {
+          type: 'button',
+          onClick: () => {
+            const name = window.prompt('另存为（文件名）', editor.path.split('/').pop() + '.copy')
+            if (name !== null) saveEditor(name)
+          },
+          disabled: busyAction,
+          style: { ...smallButtonStyle(busyAction), height: '28px', padding: '0 10px' },
+        }, '另存'),
+        h('button', {
+          type: 'button',
+          onClick: () => setEditor(null),
+          disabled: busyAction,
+          style: { ...smallButtonStyle(busyAction), height: '28px', padding: '0 10px' },
+        }, '放弃')),
+        h('textarea', {
+          value: editor.content,
+          onChange: (event) => setEditor({ ...editor, content: event.target.value }),
+          readOnly: editor.readOnly,
+          spellCheck: false,
+          'aria-label': '就地文件编辑器',
+          style: {
+            flex: '1 1 auto',
+            minHeight: 0,
+            resize: 'none',
+            border: 'none',
+            outline: 'none',
+            padding: '8px',
+            background: T.base,
+            color: T.text,
+            fontFamily: T.mono,
+            fontSize: '12px',
+            lineHeight: '17px',
+          },
+        }))
+        : null
+
+      return h('aside', {
+        style: {
+          width: '100%',
+          flex: '1 1 auto',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '8px',
+          minHeight: 0,
+          position: 'relative',
+        },
+      },
+      h('div', { style: { fontSize: '12px', color: T.muted } },
+        '文件' + (host ? '（' + host + '）' : '')),
+      h('form', {
+        onSubmit: submitPath,
+        style: { display: 'flex', gap: '5px', alignItems: 'center', flex: '0 0 auto' },
+      },
+      h('input', {
+        value: pathInput,
+        onChange: (event) => setPathInput(event.target.value),
+        placeholder: '/',
+        spellCheck: false,
+        'aria-label': '远端目录路径',
+        style: { ...fieldStyle, flex: '1 1 0', minWidth: 0, fontFamily: T.mono },
+      }),
+      h('button', {
+        type: 'submit',
+        disabled: !host || loading,
+        style: { ...buttonStyle(false), height: '28px', padding: '0 10px', opacity: !host || loading ? 0.55 : 1 },
+      }, loading ? '…' : '转到')),
+      h('div', { style: { display: 'flex', gap: '6px', flex: '0 0 auto', alignItems: 'center', flexWrap: 'wrap' } },
+        h('button', {
+          type: 'button',
+          onClick: goUp,
+          disabled: !host || cwd === '/',
+          style: { ...buttonStyle(false), height: '28px', padding: '0 10px', opacity: !host || cwd === '/' ? 0.55 : 1 },
+        }, '上一级'),
+        h('button', {
+          type: 'button',
+          onClick: () => load(cwd),
+          disabled: !host || loading,
+          style: { ...buttonStyle(false), height: '28px', padding: '0 10px', opacity: !host || loading ? 0.55 : 1 },
+        }, '刷新'),
+        h('input', {
+          ref: fileInputRef,
+          type: 'file',
+          className: 'remote-upload-input',
+          onChange: onFileChosen,
+          style: { display: 'none' },
+          'aria-hidden': true,
+        }),
+        h('button', {
+          type: 'button',
+          className: 'remote-file-upload remote-upload-button',
+          title: '上传到 ' + cwd,
+          onClick: () => { uploadTargetRef.current = cwd; if (fileInputRef.current) fileInputRef.current.click() },
+          disabled: !host || loading || uploading,
+          style: {
+            ...buttonStyle(false),
+            height: '28px',
+            padding: '0 10px',
+            opacity: !host || loading || uploading ? 0.55 : 1,
+          },
+        }, uploading && uploadProgress
+          ? '上传中 ' + Math.round(uploadProgress.total > 0 ? (uploadProgress.sent / uploadProgress.total) * 100 : 100) + '%'
+          : '上传文件'),
+        h('div', { style: { marginLeft: 'auto', display: 'flex', gap: '6px', alignItems: 'center' } },
+          h('select', {
+            value: sortMode,
+            onChange: (event) => setSortMode(event.target.value),
+            'aria-label': '排序方式',
+            style: { ...fieldStyle, height: '28px', padding: '0 4px', fontSize: '11px' },
+          },
+          h('option', { value: 'name' }, '名称'),
+          h('option', { value: 'size' }, '大小'),
+          h('option', { value: 'mtime' }, '时间')),
+          h('label', { style: { display: 'flex', alignItems: 'center', gap: '3px', fontSize: '10px', color: T.muted } },
+            h('input', { type: 'checkbox', checked: showHidden, onChange: (event) => setShowHidden(event.target.checked) }),
+            '隐藏文件'))),
+      listError
+        ? h('p', { role: 'alert', style: { margin: 0, fontSize: '11px', color: T.error, wordBreak: 'break-word' } }, listError)
+        : null,
+      uploadProgress
+        ? h('p', { style: { margin: 0, fontSize: '10px', color: T.muted } },
+          '已上传 ' + formatBytes(uploadProgress.sent) + ' / ' + formatBytes(uploadProgress.total))
+        : null,
+      fileActionError
+        ? h('p', { role: 'alert', style: { margin: 0, fontSize: '11px', color: T.error, wordBreak: 'break-word' } }, fileActionError)
+        : null,
+      fileNotice
+        ? h('p', { role: 'status', style: { margin: 0, fontSize: '10px', color: T.success, wordBreak: 'break-word' } }, fileNotice)
+        : null,
+      h('div', {
+        style: {
+          flex: '1 1 0',
+          minHeight: '96px',
+          overflowY: 'auto',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '1px',
+          border: '1px solid ' + T.border,
+          borderRadius: '8px',
+          background: T.base,
+          padding: '4px',
+        },
+      },
+      loading && entries.length === 0
+        ? h('p', { style: { margin: 0, padding: '6px', fontSize: '11px', color: T.muted } }, '加载中…')
+        : entries.length === 0
+          ? h('p', { style: { margin: 0, padding: '6px', fontSize: '11px', color: T.muted } },
+            host ? '空目录' : '先在左侧选择一台主机')
+          : entries.map((entry) => h('button', {
+            key: entry.name,
+            type: 'button',
+            title: entry.name,
+            onClick: () => openEntry(entry),
+            onDoubleClick: () => { if (entry.type === 'file' || entry.type === 'link') beginEdit(entry) },
+            onContextMenu: (event) => {
+              event.preventDefault()
+              setMenu({ x: event.clientX, y: event.clientY, entry })
+            },
+            style: {
+              appearance: 'none',
+              font: 'inherit',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              width: '100%',
+              textAlign: 'left',
+              padding: '4px 6px',
+              borderRadius: 'var(--dsw-radius-sm, 6px)',
+              cursor: 'pointer',
+              color: T.text,
+              background: selectedFile === joinPath(cwd, entry.name) ? T.surface2 : 'transparent',
+              border: '1px solid transparent',
+            },
+          },
+          h('span', {
+            'aria-hidden': true,
+            style: { width: '12px', flex: '0 0 auto', color: entry.type === 'dir' ? T.accent : T.muted },
+          }, entry.type === 'dir' ? '▸' : entry.type === 'link' ? '↪' : '·'),
+          h('span', {
+            style: {
+              flex: '1 1 auto',
+              minWidth: 0,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              fontSize: '11px',
+              fontFamily: entry.type === 'dir' ? 'inherit' : T.mono,
+            },
+          }, entry.name),
+          h('span', { style: { flex: '0 0 auto', fontSize: '10px', color: T.muted } },
+            entry.type === 'dir' ? '' : formatBytes(entry.size)),
+          h('span', { style: { flex: '0 0 auto', fontSize: '10px', color: T.muted } },
+            formatMtime(entry.mtime))))),
+      editorNode || h('div', {
+        style: {
+          flex: '1 1 0',
+          minHeight: '120px',
+          display: 'flex',
+          flexDirection: 'column',
+          border: '1px solid ' + T.border,
+          borderRadius: '8px',
+          background: T.base,
+          overflow: 'hidden',
+        },
+      },
+      h('div', {
+        style: {
+          flex: '0 0 auto',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '6px',
+          padding: '4px 8px',
+          borderBottom: '1px solid ' + T.border,
+          background: T.surface,
+          fontSize: '11px',
+          color: T.muted,
+        },
+      },
+      h('span', {
+        style: {
+          minWidth: 0,
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+          fontFamily: T.mono,
+          color: T.text,
+        },
+      }, selectedFile || '文件预览'),
+      h('button', {
+        type: 'button',
+        className: 'remote-files-download remote-file-download',
+        title: selectedFile ? '下载 ' + selectedFile : '先选择一个文件',
+        onClick: downloadSelected,
+        disabled: !selectedFile || downloadBusy,
+        style: { ...smallButtonStyle(!selectedFile || downloadBusy), flex: '0 0 auto', marginLeft: 'auto', height: '28px', padding: '0 10px' },
+      }, downloadBusy ? '下载中…' : '下载'),
+      h('span', { style: { flex: '0 0 auto' } }, previewLoading ? '读取中…' : previewMeta)),
+      h('div', { style: { flex: '1 1 auto', minHeight: 0, overflow: 'auto' } },
+        previewLoading
+          ? h('p', { style: { margin: 0, padding: '8px', fontSize: '11px', color: T.muted } }, '读取中…')
+          : previewError
+            ? h('p', { role: 'alert', style: { margin: 0, padding: '8px', fontSize: '11px', color: T.error, wordBreak: 'break-word' } }, previewError)
+            : preview
+              ? preview.binary
+                ? h('p', { style: { margin: 0, padding: '8px', fontSize: '11px', color: T.muted } }, '二进制文件，不预览')
+                : h('pre', {
+                  style: {
+                    margin: 0,
+                    padding: '8px',
+                    fontFamily: T.mono,
+                    fontSize: '11px',
+                    lineHeight: '16px',
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word',
+                    color: T.text,
+                  },
+                }, preview.content || '（空文件）')
+              : h('p', { style: { margin: 0, padding: '8px', fontSize: '11px', color: T.muted } }, '点上面的文件预览内容，双击文本文件可就地编辑'))),
+      menu
+        ? h('div', {
+          style: { position: 'fixed', inset: 0, zIndex: 40 },
+          onMouseDown: () => setMenu(null),
+          onContextMenu: (event) => { event.preventDefault(); setMenu(null) },
+        },
+        h('div', {
+          style: {
+            position: 'fixed',
+            left: Math.min(menu.x, Math.max(8, (window.innerWidth || 800) - 180)),
+            top: Math.min(menu.y, Math.max(8, (window.innerHeight || 600) - 240)),
+            width: '168px',
+            padding: '4px',
+            borderRadius: 'var(--dsw-radius-sm, 6px)',
+            border: '1px solid ' + T.borderStrong,
+            background: T.surface,
+            boxShadow: '0 6px 18px rgba(0, 0, 0, 0.28)',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '1px',
+          },
+        }, menuItems(menu.entry).map((item) => h('button', {
+          key: item.label,
+          type: 'button',
+          onClick: item.run,
+          style: {
+            appearance: 'none',
+            font: 'inherit',
+            fontSize: '11px',
+            textAlign: 'left',
+            padding: '5px 8px',
+            height: '28px',
+            borderRadius: '4px',
+            border: 'none',
+            cursor: 'pointer',
+            color: item.danger ? T.error : T.text,
+            background: 'transparent',
+          },
+        }, item.label)))))
+        : null,
+      dialogNode)
+    }

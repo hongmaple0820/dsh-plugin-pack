@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Remote hosts",
+    "description": "Run SSH commands, browse and transfer files over SFTP, forward local ports, drive interactive shells, and execute one command across several hosts."
+  }
+}

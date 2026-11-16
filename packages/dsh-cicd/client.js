@@ -1,0 +1,1646 @@
+/**
+ * @local/dsh-cicd · Client 半边。
+ *
+ * 在 layout 的 `main` 槽上注册整页视图「流水线」（入口是左侧栏全局面板行，同时保留会话内 View）：
+ * 顶部工具条（项目切换 / 目标 / 计划 / 干跑 / 运行 / 刷新 / 发布），下面三列
+ * 阶段与目标矩阵 → Run 详情（运行记录 + steps 时间线 + 跟随日志）→ Releases；
+ * 窄屏（<1100px）退化为两列（详情与 Releases 上下叠），「发布」按钮仍可切到整页发布视图。
+ *
+ * 约束：只用 `require('react')`；颜色只用 `--dsw-alias-*` 主题 token；不 iframe、不碰别人的 DOM；
+ * 数据全部走 Host 端路由 `/api/plugins/cicd/*`（全部 GET + `x-dsh-cicd: 1` 头）。
+ */
+window.__ModuleLoader__.load({
+  id: '@local/dsh-cicd',
+  factory(require) {
+    const React = require('react')
+    const h = React.createElement
+    const { useCallback, useEffect, useRef, useState } = React
+
+    const STYLE_ID = '@local/dsh-cicd/page.css'
+    /** 左侧栏全局面板的 id / `main` 槽 key。 */
+    const PANEL_ID = 'cicd'
+    /** Host 路由前缀与鉴权头（Host 端要求带上，避免被当作浏览器随手请求）。 */
+    const API_BASE = '/api/plugins/cicd'
+    const REQUEST_HEADERS = { accept: 'application/json', 'x-dsh-cicd': '1' }
+    /** 有 running / queued 的运行时的轮询间隔。 */
+    const POLL_MS = 2000
+    /** 运行列表默认条数与日志 tail 行数。 */
+    const RUN_LIMIT = 30
+    const LOG_TAIL = 200
+    /** 「运行」与「回滚」的二次确认窗口。 */
+    const CONFIRM_MS = 10000
+    const ROLLBACK_CONFIRM_MS = 8000
+    /** v0.6 B：测试通知是外发动作，按任务书要求 8 秒二次确认。 */
+    const NOTIFY_CONFIRM_MS = 8000
+    /** v0.6 C：审计条数候选（Host 端 limit 允许 1..200）。 */
+    const AUDIT_LIMITS = [50, 100, 200]
+    const AUDIT_DEFAULT_LIMIT = 50
+
+    const CSS = `
+.cicd-page{display:flex;flex-direction:column;box-sizing:border-box;width:100%;height:100%;min-height:0;overflow:hidden;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px}
+.cicd-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:none;padding:10px 16px;border-bottom:.5px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-base)}
+.cicd-toolbar-group{display:flex;align-items:center;gap:8px;min-width:0}
+.cicd-toolbar-spacer{flex:1 1 auto;min-width:0}
+.cicd-label{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;white-space:nowrap}
+.cicd-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.cicd-select{appearance:auto;box-sizing:border-box;height:28px;max-width:190px;padding:0 6px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;line-height:18px;cursor:pointer}
+.cicd-select:disabled{opacity:.55;cursor:default}
+.cicd-button{appearance:none;box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:4px;height:28px;padding:0 10px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;line-height:18px;white-space:nowrap;cursor:pointer}
+.cicd-button:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.cicd-button:disabled{opacity:.55;cursor:default}
+.cicd-button[aria-pressed="true"]{border-color:var(--dsw-alias-border-l4);background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-primary)}
+.cicd-button-primary{border-color:transparent;background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base)}
+.cicd-button-primary:hover{background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base);opacity:.9}
+.cicd-button-danger{color:var(--dsw-alias-state-error-primary)}
+.cicd-button-armed{border-color:var(--dsw-alias-state-error-primary);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-state-error-primary)}
+.cicd-hint{flex:1 1 100%;color:var(--dsw-alias-state-warn-primary);font-size:12px;line-height:18px}
+.cicd-project-select,.cicd-target-select{min-width:124px}
+.cicd-run-now,.cicd-view-releases,.cicd-dry-run{min-width:68px}
+.cicd-plan-open,.cicd-plan-close{min-width:56px}
+.cicd-plan-close{height:24px;padding:0 8px;font-size:11.5px}
+.cicd-refresh{min-width:56px}
+.cicd-step-wrap{display:block}
+.cicd-poll{color:var(--dsw-alias-label-dimmed);font-size:11.5px;line-height:16px;white-space:nowrap}
+.cicd-columns{flex:1 1 auto;min-height:0;display:grid;grid-template-columns:minmax(225px,.95fr) minmax(300px,1.25fr) minmax(235px,.95fr);gap:12px;box-sizing:border-box;padding:12px 16px 14px;overflow:hidden}
+.cicd-col{display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md, 8px);background:var(--dsw-alias-bg-layer-1)}
+.cicd-col-head{flex:none;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-bottom:.5px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2)}
+.cicd-col-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary);font-size:12.5px;font-weight:600;line-height:18px}
+.cicd-col-body{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;display:flex;flex-direction:column;gap:8px;padding:8px}
+.cicd-project{margin:0 0 2px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:17px}
+.cicd-project-path{margin:0 0 4px;color:var(--dsw-alias-label-dimmed);font-size:11.5px;line-height:16px;overflow-wrap:anywhere}
+.cicd-target-row{appearance:none;box-sizing:border-box;display:flex;flex-direction:column;gap:2px;width:100%;padding:7px 9px;border:.5px solid transparent;border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font:inherit;font-size:12.5px;line-height:18px;text-align:left;cursor:pointer}
+.cicd-target-row:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.cicd-target-row.is-active{border-color:var(--dsw-alias-border-l4);background:var(--dsw-alias-bg-layer-3)}
+.cicd-target-name{display:block;font-weight:600}
+.cicd-target-meta{display:block;color:var(--dsw-alias-label-tertiary);font-size:11.5px;line-height:16px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cicd-target-health{display:block;color:var(--dsw-alias-label-dimmed);font-size:11px;line-height:15px}
+.cicd-target-current{display:block;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:15px}
+.cicd-source-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
+.cicd-run-row{appearance:none;box-sizing:border-box;display:flex;flex-direction:column;gap:3px;width:100%;padding:7px 9px;border:.5px solid transparent;border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font:inherit;font-size:12.5px;line-height:18px;text-align:left;cursor:pointer}
+.cicd-run-row:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.cicd-run-row.is-active{border-color:var(--dsw-alias-border-l4);background:var(--dsw-alias-bg-layer-3)}
+.cicd-run-row-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.cicd-run-id{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary);font-size:11.5px}
+.cicd-run-meta{color:var(--dsw-alias-label-tertiary);font-size:11.5px;line-height:16px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cicd-run-error{color:var(--dsw-alias-state-error-primary);font-size:11.5px;line-height:16px;overflow-wrap:anywhere}
+.cicd-status{flex:none;display:inline-flex;align-items:center;height:18px;padding:0 7px;border-radius:var(--dsw-radius-xs, 4px);border:.5px solid var(--dsw-alias-border-l3);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;white-space:nowrap}
+.cicd-status.is-queued{color:var(--dsw-alias-label-secondary)}
+.cicd-status.is-running{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary)}
+.cicd-status.is-success{border-color:var(--dsw-alias-state-success-primary);color:var(--dsw-alias-state-success-primary)}
+.cicd-status.is-failed{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}
+.cicd-status.is-canceled{color:var(--dsw-alias-label-dimmed)}
+.cicd-status.is-skipped{color:var(--dsw-alias-label-dimmed)}
+.cicd-detail{display:flex;flex-direction:column;gap:10px;padding:2px}
+.cicd-detail-meta{display:grid;grid-template-columns:repeat(auto-fit, minmax(120px, 1fr));gap:6px 12px;margin:0;padding:8px 10px;border:.5px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-2)}
+.cicd-detail-meta dt{color:var(--dsw-alias-label-dimmed);font-size:11px;line-height:15px}
+.cicd-detail-meta dd{margin:0;color:var(--dsw-alias-label-primary);font-size:12px;line-height:17px;overflow-wrap:anywhere}
+.cicd-detail-failure{margin:0;padding:8px 10px;border:.5px solid var(--dsw-alias-state-error-primary);border-radius:var(--dsw-radius-sm, 6px);color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:17px;overflow-wrap:anywhere}
+.cicd-section-title{display:flex;align-items:center;justify-content:space-between;gap:8px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;font-weight:600}
+.cicd-stages{display:flex;flex-direction:column;gap:6px}
+.cicd-stage{border:.5px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-2);padding:6px 8px}
+.cicd-stage-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px}
+.cicd-stage-name{color:var(--dsw-alias-label-primary);font-size:12px;line-height:17px;font-weight:600;overflow-wrap:anywhere}
+.cicd-step{display:flex;align-items:baseline;gap:8px;padding:2px 0}
+.cicd-step-index{flex:none;color:var(--dsw-alias-label-dimmed);font-size:11px;line-height:15px}
+.cicd-step-name{flex:1 1 auto;min-width:0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:17px;overflow-wrap:anywhere}
+.cicd-step-cmd{display:block;margin:2px 0 4px 26px;color:var(--dsw-alias-label-tertiary);font-size:11.5px;line-height:16px;white-space:pre-wrap;overflow-wrap:anywhere}
+.cicd-step-flag{flex:none;color:var(--dsw-alias-label-dimmed);font-size:11px;line-height:15px;white-space:nowrap}
+.cicd-log{display:flex;flex-direction:column;gap:1px;margin:0;padding:8px 10px;border:.5px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-2);max-height:320px;overflow:auto;overscroll-behavior:contain}
+.cicd-log-line{margin:0;color:var(--dsw-alias-label-secondary);font-size:11.5px;line-height:16px;white-space:pre-wrap;overflow-wrap:anywhere}
+.cicd-note{margin:0;color:var(--dsw-alias-label-tertiary);font-size:11.5px;line-height:17px}
+.cicd-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:18px 10px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;text-align:center}
+.cicd-loading{display:flex;align-items:center;gap:8px;padding:10px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.cicd-skeleton{width:100%;height:34px;border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-skeleton)}
+.cicd-error{display:flex;flex-direction:column;gap:4px;padding:9px 10px;border:.5px solid var(--dsw-alias-state-error-primary);border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-1)}
+.cicd-error-message{color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:17px;overflow-wrap:anywhere}
+.cicd-error-code{color:var(--dsw-alias-label-dimmed);font-size:11px;line-height:15px}
+.cicd-error-hint{color:var(--dsw-alias-label-secondary);font-size:11.5px;line-height:16px}
+.cicd-error-retry{align-self:flex-start;margin-top:2px}
+.cicd-action{display:flex;align-items:center;gap:8px;padding:8px 10px;border:.5px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:17px;margin:0 16px 10px}
+.cicd-action.is-error{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}
+.cicd-action-body{display:flex;flex-direction:column;gap:2px;min-width:0}
+.cicd-action-message{color:var(--dsw-alias-state-error-primary);overflow-wrap:anywhere}
+.cicd-plan{flex:none;display:flex;flex-direction:column;gap:8px;margin:0;padding:10px 12px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md, 8px);background:var(--dsw-alias-bg-layer-1)}
+.cicd-plan-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.cicd-plan-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary);font-size:12.5px;font-weight:600;line-height:18px}
+.cicd-releases{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;gap:10px;box-sizing:border-box;padding:12px 16px 14px;overflow:hidden}
+.cicd-releases-head{flex:none;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.cicd-table-wrap{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md, 8px);background:var(--dsw-alias-bg-layer-1)}
+.cicd-table{width:100%;border-collapse:collapse;font-size:12px;line-height:18px}
+.cicd-table th{position:sticky;top:0;z-index:1;padding:7px 10px;text-align:left;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:11.5px;font-weight:600;background:var(--dsw-alias-bg-layer-2);border-bottom:.5px solid var(--dsw-alias-border-l1)}
+.cicd-table td{padding:6px 10px;color:var(--dsw-alias-label-secondary);border-bottom:.5px solid var(--dsw-alias-border-l1);overflow-wrap:anywhere}
+.cicd-release-row.is-active td{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
+.cicd-release-cell{white-space:nowrap}
+.cicd-release-cell.cicd-release-id{max-width:200px;overflow:hidden;text-overflow:ellipsis;color:var(--dsw-alias-label-primary)}
+.cicd-release-act{text-align:right}
+.cicd-rollback{appearance:none;box-sizing:border-box;height:24px;padding:0 8px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-xs, 4px);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font:inherit;font-size:11.5px;line-height:16px;white-space:nowrap;cursor:pointer}
+.cicd-rollback:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.cicd-rollback.is-armed{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}
+.cicd-footer{flex:none;padding:0 16px 10px;color:var(--dsw-alias-label-dimmed);font-size:11px;line-height:16px}
+.cicd-project-picker{min-width:124px}
+.cicd-project-static{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary);font-size:12.5px;line-height:18px}
+.cicd-targets{display:flex;flex-direction:column;gap:6px}
+.cicd-target-card{gap:4px}
+.cicd-target-card-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.cicd-target-runtime{flex:none;display:inline-flex;align-items:center;height:17px;padding:0 6px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-xs, 4px);color:var(--dsw-alias-label-tertiary);font-size:10.5px;line-height:15px}
+.cicd-target-hosts{display:flex;flex-wrap:wrap;gap:4px}
+.cicd-host-chip{display:inline-flex;align-items:center;gap:5px;box-sizing:border-box;height:20px;padding:0 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-xs, 4px);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:15px;white-space:nowrap}
+.cicd-host-dot{flex:none;width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-label-dimmed)}
+.cicd-host-dot.is-running{background:var(--dsw-alias-brand-primary)}
+.cicd-host-dot.is-success{background:var(--dsw-alias-state-success-primary)}
+.cicd-host-dot.is-failed{background:var(--dsw-alias-state-error-primary)}
+.cicd-host-dot.is-skipped{background:var(--dsw-alias-label-dimmed)}
+.cicd-target-keep{display:block;color:var(--dsw-alias-label-dimmed);font-size:11px;line-height:15px}
+.cicd-runs{flex:none;display:flex;flex-direction:column;gap:4px;max-height:220px;overflow:auto;overscroll-behavior:contain;padding-bottom:6px;border-bottom:.5px solid var(--dsw-alias-border-l1)}
+.cicd-runs-head{display:flex;align-items:center;justify-content:space-between;gap:8px;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;font-weight:600}
+.cicd-run-row.is-running{box-shadow:inset 2px 0 0 var(--dsw-alias-brand-primary)}
+.cicd-run-row.is-success{box-shadow:inset 2px 0 0 var(--dsw-alias-state-success-primary)}
+.cicd-run-row.is-failed{box-shadow:inset 2px 0 0 var(--dsw-alias-state-error-primary)}
+.cicd-run-row.is-skipped{box-shadow:inset 2px 0 0 var(--dsw-alias-label-dimmed)}
+.cicd-timeline{display:flex;flex-direction:column;gap:1px}
+.cicd-timeline-stage{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:6px 0 2px;color:var(--dsw-alias-label-primary);font-size:12px;font-weight:600;line-height:17px}
+.cicd-timeline-step{display:flex;align-items:flex-start;gap:8px;padding:2px 0 2px 3px}
+.cicd-timeline-dot{flex:none;width:8px;height:8px;margin-top:5px;border-radius:50%;background:var(--dsw-alias-label-dimmed)}
+.cicd-timeline-dot.is-running{background:var(--dsw-alias-brand-primary)}
+.cicd-timeline-dot.is-success{background:var(--dsw-alias-state-success-primary)}
+.cicd-timeline-dot.is-failed{background:var(--dsw-alias-state-error-primary)}
+.cicd-timeline-dot.is-skipped{background:var(--dsw-alias-label-dimmed)}
+.cicd-timeline-main{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:1px}
+.cicd-timeline-name{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:17px;overflow-wrap:anywhere}
+.cicd-timeline-meta{color:var(--dsw-alias-label-dimmed);font-size:11px;line-height:15px}
+.cicd-timeline-summary{color:var(--dsw-alias-label-tertiary);font-size:11.5px;line-height:16px;white-space:pre-wrap;overflow-wrap:anywhere}
+.cicd-timeline-summary.is-failed{color:var(--dsw-alias-state-error-primary)}
+.cicd-log-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+.cicd-log-tools .cicd-button{height:24px;padding:0 8px;font-size:11.5px;line-height:22px}
+.cicd-log-follow[aria-pressed="true"]{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-border-l3)}
+.cicd-action-retry{height:24px;padding:0 8px;font-size:11.5px;line-height:22px}
+.cicd-col-releases .cicd-table td{padding:5px 8px}
+.cicd-target-envs{display:flex;flex-wrap:wrap;align-items:center;gap:4px}
+.cicd-env-chip{flex:none;display:inline-flex;align-items:center;height:16px;padding:0 5px;border:.5px solid var(--dsw-alias-border-l2);border-radius:4px;color:var(--dsw-alias-label-tertiary);font-size:10.5px;line-height:14px}
+.cicd-env-chip.is-prod{color:var(--dsw-alias-state-warn-primary);border-color:var(--dsw-alias-state-warn-primary)}
+.cicd-release-env{margin-left:6px;color:var(--dsw-alias-label-dimmed);font-size:10.5px}
+.cicd-prod-guard{display:flex;flex-direction:column;gap:6px;padding:8px 10px;border:.5px solid var(--dsw-alias-state-warn-primary);border-radius:var(--dsw-radius-sm,6px);background:var(--dsw-alias-bg-layer-1)}
+.cicd-prod-guard-text{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}
+.cicd-prod-guard-hosts{color:var(--dsw-alias-state-warn-primary);font-size:11.5px;line-height:16px;overflow-wrap:anywhere}
+.cicd-prod-guard-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.cicd-prod-confirm{height:24px;padding:0 10px;font-size:11.5px;line-height:22px;color:var(--dsw-alias-state-warn-primary);border-color:var(--dsw-alias-state-warn-primary)}
+/* v0.6 A：灰度分批 */
+.cicd-target-canary{flex:none;display:inline-flex;align-items:center;height:16px;padding:0 5px;border:.5px solid var(--dsw-alias-border-l3);border-radius:4px;color:var(--dsw-alias-label-secondary);font-size:10.5px;line-height:14px}
+.cicd-host-rows{display:flex;flex-direction:column;gap:2px;margin:2px 0 0 16px}
+.cicd-timeline-step-wrap{display:block}
+.cicd-host-row{display:flex;align-items:center;gap:6px;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:15px;overflow-wrap:anywhere}
+.cicd-host-batch{flex:none;color:var(--dsw-alias-label-dimmed);font-size:10.5px;line-height:14px}
+.cicd-host-health{color:var(--dsw-alias-label-dimmed);font-size:10.5px;line-height:14px}
+.cicd-canary-hold{display:flex;align-items:center;gap:6px;padding:5px 8px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm,6px);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font-size:11.5px;line-height:16px}
+.cicd-canary-batches{display:flex;flex-wrap:wrap;align-items:center;gap:6px;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:15px}
+.cicd-canary-batch{display:inline-flex;align-items:center;gap:5px;height:18px;padding:0 6px;border:.5px solid var(--dsw-alias-border-l2);border-radius:4px}
+/* v0.6 B：通知 */
+.cicd-notify-test{min-width:76px}
+.cicd-notify-result{flex:none;color:var(--dsw-alias-label-secondary);font-size:11.5px;line-height:16px;overflow-wrap:anywhere}
+.cicd-notify-result.is-failed{color:var(--dsw-alias-state-error-primary)}
+.cicd-notify-hint{margin:0;color:var(--dsw-alias-label-dimmed);font-size:11px;line-height:15px}
+/* v0.6 C：审计时间线 */
+.cicd-view-audit{min-width:60px}
+.cicd-audit{flex:1 1 auto;display:flex;flex-direction:column;gap:8px;min-height:0;padding:12px 16px 14px;overflow:hidden}
+.cicd-audit-head{flex:none;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.cicd-audit-limit{height:28px;max-width:104px}
+.cicd-audit-row.is-deploy-failed{box-shadow:inset 2px 0 0 var(--dsw-alias-state-error-primary)}
+.cicd-audit-row.is-rollback{box-shadow:inset 2px 0 0 var(--dsw-alias-state-warn-primary)}
+.cicd-audit-row.is-canary-hold{box-shadow:inset 2px 0 0 var(--dsw-alias-brand-primary)}
+.cicd-audit-cell{white-space:nowrap}
+.cicd-audit-cell.cicd-audit-detail{white-space:normal;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:15px}
+.cicd-audit-action{display:inline-flex;align-items:center;height:18px;padding:0 6px;border:.5px solid var(--dsw-alias-border-l2);border-radius:4px;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:14px}
+.cicd-audit-action.is-deploy-failed{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}
+.cicd-audit-action.is-rollback{color:var(--dsw-alias-state-warn-primary);border-color:var(--dsw-alias-state-warn-primary)}
+.cicd-audit-action.is-canary-hold{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-border-l3)}
+@media (max-width:1100px){
+.cicd-columns{grid-template-columns:minmax(200px,.9fr) minmax(0,1.1fr);grid-template-rows:minmax(220px,1.1fr) minmax(180px,.9fr)}
+.cicd-col-overview{grid-row:1 / span 2}
+.cicd-col-releases{grid-column:2;grid-row:2}
+}
+.cicd-panel{display:flex;flex-direction:column;height:100%;min-height:0}
+.cicd-panel>.cicd-page{flex:1 1 auto;min-height:0}
+`
+
+    /** 运行 / 阶段状态 → 中文徽标文案。 */
+    const STATUS_LABELS = {
+      queued: '排队中',
+      running: '运行中',
+      success: '成功',
+      failed: '失败',
+      canceled: '已取消',
+      skipped: '已跳过',
+      pending: '待执行',
+      waiting: '等待中',
+    }
+
+    /** 错误码 → 给人看的中文解释（契约里约定的三个码 + Host 没就绪时的兜底）。 */
+    const CODE_HINTS = {
+      REMOTE_UNAVAILABLE: 'dsh-remote 还没就绪：先在插件页启用并重载 dsh-remote，再回来重试。',
+      HEALTH_FAILED: '部署后的健康检查失败，Host 已自动回滚到上一个版本；先看日志确认服务是否起得来。',
+      PIPE_INVALID: 'pipe.yml 解析失败：按提示的行号修正文件后重试。',
+      NETWORK: '没能连上 Host：确认 DSH 仍在运行，再点重试。',
+      BAD_RESPONSE: 'Host 返回的不是预期的 JSON：对应路由可能还没落地，稍后再试。',
+      PROD_CONFIRM_REQUIRED: '这次发布包含生产主机：读一遍受影响主机，确认后点「确认发布到生产」。',
+      DEPLOY_IN_PROGRESS: '同一个 target 已经有一次发布在跑：等它结束（或看日志）再重试。',
+    }
+
+    /** v0.6 C：审计动作 → 中文标签（Host 的 action 取值见契约）。 */
+    const OPERATION_LABELS = {
+      deploy: '部署',
+      'deploy-failed': '部署失败',
+      rollback: '回滚',
+      'canary-hold': '灰度等待',
+      notify: '通知',
+    }
+    /** 动作 → 行 / 徽标的色调类（与状态类同一套 is-*）。 */
+    const OPERATION_TONES = {
+      deploy: 'success',
+      'deploy-failed': 'failed',
+      rollback: 'running',
+      'canary-hold': 'running',
+      notify: 'skipped',
+    }
+
+    const TIME_FORMAT = new Intl.DateTimeFormat('zh-CN', {
+      timeZone: 'Asia/Shanghai',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    })
+
+    function formatTime(value) {
+      if (!value) return '—'
+      const date = new Date(value)
+      if (Number.isNaN(date.getTime())) return String(value)
+      return TIME_FORMAT.format(date).replace(/\//g, '-')
+    }
+
+    function formatDuration(ms) {
+      if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return '—'
+      if (ms < 1000) return ms + ' ms'
+      const seconds = Math.round(ms / 100) / 10
+      if (seconds < 60) return seconds + ' 秒'
+      const minutes = Math.floor(seconds / 60)
+      const rest = Math.round(seconds % 60)
+      return minutes + ' 分 ' + rest + ' 秒'
+    }
+
+    function shortId(value, edge) {
+      const text = String(value || '')
+      const limit = typeof edge === 'number' ? edge : 18
+      return text.length <= limit ? text : text.slice(0, limit) + '…'
+    }
+
+    /** 项目选择记在 localStorage（`cicd.project`）：下次打开面板直接回到上次的项目。 */
+    const PROJECT_STORE_KEY = 'cicd.project'
+
+    function readStoredProject() {
+      try {
+        if (typeof localStorage === 'undefined' || !localStorage) return ''
+        const value = localStorage.getItem(PROJECT_STORE_KEY)
+        return typeof value === 'string' ? value : ''
+      } catch (error) {
+        return ''
+      }
+    }
+
+    function writeStoredProject(id) {
+      try {
+        if (typeof localStorage === 'undefined' || !localStorage) return
+        localStorage.setItem(PROJECT_STORE_KEY, id)
+      } catch (error) {
+        // 隐私模式 / 存储被禁用时静默跳过：这次选择仍然生效，只是不持久化。
+      }
+    }
+
+    /** 把 stage 树摊平成时间线行：stage 标题行 + 每步一行（状态点 / 耗时 / 一行摘要）。 */
+    function timelineRows(stages) {
+      const rows = []
+      if (!Array.isArray(stages)) return rows
+      stages.forEach((stage, stageIndex) => {
+        const stageKey = stage && stage.id ? stage.id : 'stage-' + stageIndex
+        rows.push({ kind: 'stage', key: stageKey, stage })
+        const steps = Array.isArray(stage && stage.steps) ? stage.steps : []
+        steps.forEach((step, stepIndex) => {
+          rows.push({ kind: 'step', key: stageKey + ':' + (step && step.index !== undefined ? step.index : stepIndex), step })
+        })
+      })
+      return rows
+    }
+
+    /**
+     * Host 的字段名以实际实现为准（`projects[].hasPipe` / `pipe`、`runs[].startedAt/finishedAt`、
+     * `logs.text`、`run` 路由的扁平返回）。这里做一层兼容：缺字段时退回契约里的另一套名字，
+     * 这样 Host 侧以后再改名也不会让面板空着。
+     */
+    function projectHasPipe(project) {
+      if (!project) return false
+      if (typeof project.hasPipe === 'boolean') return project.hasPipe
+      if (typeof project.exists === 'boolean') return project.exists
+      return true
+    }
+
+    function projectPipePath(project) {
+      if (!project) return ''
+      return project.pipe || project.pipePath || project.path || ''
+    }
+
+    function runDurationMs(run) {
+      if (!run) return null
+      if (typeof run.durationMs === 'number' && Number.isFinite(run.durationMs)) return run.durationMs
+      const start = Date.parse(run.startedAt || '')
+      const end = Date.parse(run.finishedAt || '')
+      if (Number.isFinite(start) && Number.isFinite(end) && end >= start) return end - start
+      return null
+    }
+
+    function logLines(payload) {
+      if (!payload) return []
+      if (Array.isArray(payload.lines)) return payload.lines.map((line) => String(line))
+      if (typeof payload.text === 'string') return payload.text.split('\n').map((line) => line.replace(/\r$/, ''))
+      return []
+    }
+
+    function planOf(payload) {
+      if (!payload) return null
+      if (payload.plan && Array.isArray(payload.plan.stages)) return payload.plan
+      if (Array.isArray(payload.stages)) return { name: payload.name || '', stages: payload.stages, target: payload.target, project: payload.project }
+      return null
+    }
+
+    function runOfPayload(payload) {
+      if (!payload) return null
+      if (payload.run && payload.run.id) return payload.run
+      if (payload.runId || payload.status) {
+        return {
+          id: payload.runId || '',
+          status: payload.status || '',
+          target: payload.target || '',
+          dryRun: Boolean(payload.dryRun),
+          canary: payload.canary || null,
+          stages: Array.isArray(payload.stages) ? payload.stages : [],
+        }
+      }
+      return null
+    }
+
+    /** v0.6 A：target 上的灰度配置（`{first, waitSec}`）；没配置或首批 0 台时返回 null。 */
+    function canaryOf(target) {
+      const canary = target && target.canary
+      if (!canary || typeof canary !== 'object') return null
+      const first = Number(canary.first) || 0
+      if (first <= 0) return null
+      return { first, waitSec: Number(canary.waitSec) || 0 }
+    }
+
+    /** v0.6 A：灰度标徽文案，例如「灰度 1/3 · 间隔 30s」。 */
+    function canaryText(canary, hostCount) {
+      if (!canary) return ''
+      const total = Number(hostCount) > 0 ? Number(hostCount) : Math.max(canary.first, 1)
+      const wait = canary.waitSec > 0 ? ' · 间隔 ' + canary.waitSec + 's' : ''
+      return '灰度 ' + canary.first + '/' + total + wait
+    }
+
+    /** v0.6 A：把 step 的 hosts 摊平成主机行（带批次）。 */
+    function hostRowsOf(step) {
+      const list = step && Array.isArray(step.hosts) ? step.hosts : []
+      return list.map((host, index) => ({
+        key: (host && (host.host || host.name)) ? String(host.host || host.name) : 'host-' + index,
+        name: String((host && (host.host || host.name)) || '未知主机'),
+        batch: Number(host && host.batch) > 0 ? Number(host.batch) : 1,
+        ok: Boolean(host && host.ok),
+        health: (host && host.health) || '',
+        restarted: (host && host.restarted) || '',
+        error: (host && host.error) || '',
+        skipped: Boolean(host && host.skipped),
+      }))
+    }
+
+    /** v0.6 A：`canary.batches[]` 里的成功/失败标记 → is-* 状态类。 */
+    function batchTone(batch) {
+      if (!batch) return 'pending'
+      if (batch.ok === true) return 'success'
+      if (batch.ok === false) return 'failed'
+      return 'running'
+    }
+
+    /** v0.6 C：审计动作 → 中文；未知动作原样显示。 */
+    function operationLabel(action) {
+      return OPERATION_LABELS[action] || action || '未知动作'
+    }
+
+    /** Host 路由的错误：带 `code` 与可选 `line`，供 UI 给出中文解释。 */
+    function ApiError(message, code, extra) {
+      const error = new Error(message)
+      error.name = 'ApiError'
+      error.code = code || ''
+      if (extra && extra.line) error.line = extra.line
+      if (extra && extra.status) error.status = extra.status
+      // v0.5 生产护栏：Host 会把受影响的生产主机放在错误体里，UI 要原样列出来。
+      if (extra && Array.isArray(extra.hosts)) error.hosts = extra.hosts
+      return error
+    }
+
+    function buildQuery(params) {
+      const search = new URLSearchParams()
+      Object.keys(params || {}).forEach((key) => {
+        const value = params[key]
+        if (value === undefined || value === null || value === '') return
+        search.set(key, String(value))
+      })
+      const text = search.toString()
+      return text ? '?' + text : ''
+    }
+
+    async function callApi(name, params, signal) {
+      let response
+      try {
+        response = await fetch(API_BASE + '/' + name + buildQuery(params), {
+          method: 'GET',
+          headers: REQUEST_HEADERS,
+          signal,
+        })
+      } catch (error) {
+        if (error && error.name === 'AbortError') throw error
+        throw ApiError('请求 Host 失败：' + ((error && error.message) || '网络错误'), 'NETWORK')
+      }
+      let payload = null
+      try {
+        payload = await response.json()
+      } catch (error) {
+        payload = null
+      }
+      if (!payload || typeof payload !== 'object') {
+        throw ApiError('Host 返回了无法解析的响应（HTTP ' + response.status + '）', 'BAD_RESPONSE', {
+          status: response.status,
+        })
+      }
+      if (payload.ok !== true) {
+        throw ApiError(payload.error || 'Host 拒绝了这次请求', payload.code, {
+          line: payload.line,
+          hosts: payload.hosts,
+          status: response.status,
+        })
+      }
+      return payload
+    }
+
+    function explainError(error) {
+      if (!error) return ''
+      const hint = CODE_HINTS[error.code]
+      if (!hint) return ''
+      if (error.code === 'PIPE_INVALID' && error.line) return 'pipe.yml 第 ' + error.line + ' 行：' + hint
+      return hint
+    }
+
+    function StatusBadge({ status }) {
+      const tone = STATUS_LABELS[status] ? status : 'queued'
+      return h('span', { className: 'cicd-status is-' + tone, title: '状态：' + status }, STATUS_LABELS[status] || status || '未知')
+    }
+
+    function EmptyState({ text }) {
+      return h('div', { className: 'cicd-empty' }, text)
+    }
+
+    function LoadingState({ text }) {
+      return h('div', { className: 'cicd-loading' }, h('span', null, text || '正在加载…'))
+    }
+
+    function ErrorState({ error, onRetry }) {
+      const hint = explainError(error)
+      return h('div', { className: 'cicd-error', role: 'alert' },
+        h('div', { className: 'cicd-error-message' }, (error && error.message) || '未知错误'),
+        error && error.code
+          ? h('div', { className: 'cicd-error-code cicd-mono' }, error.code + (error.line ? ' · 第 ' + error.line + ' 行' : ''))
+          : null,
+        hint ? h('div', { className: 'cicd-error-hint' }, hint) : null,
+        onRetry ? h('button', { className: 'cicd-button cicd-error-retry', type: 'button', onClick: onRetry }, '重试') : null)
+    }
+
+    /** 计划 / 运行的 stage 与 step 树；`showCommand` 打开时逐条显示 `$ 命令`。 */
+    function StageTree({ stages, showCommand }) {
+      if (!Array.isArray(stages) || stages.length === 0) return null
+      return h('div', { className: 'cicd-stages' },
+        stages.map((stage, index) => {
+          const stageKey = stage && stage.id ? stage.id : 'stage-' + index
+          const steps = Array.isArray(stage && stage.steps) ? stage.steps : []
+          return h('div', { className: 'cicd-stage', key: stageKey },
+            h('div', { className: 'cicd-stage-head' },
+              h('span', { className: 'cicd-stage-name' }, (stage && (stage.name || stage.id)) || '未命名阶段'),
+              stage && stage.status ? h(StatusBadge, { status: stage.status }) : null),
+            steps.length === 0
+              ? h('p', { className: 'cicd-note' }, '这个阶段没有步骤。')
+              : steps.map((step, stepIndex) => {
+                const stepKey = stageKey + ':' + (step && step.index !== undefined ? step.index : stepIndex)
+                const flags = []
+                if (step && step.kind && step.kind !== 'run') flags.push(step.kind)
+                if (step && step.when && step.when !== 'always') flags.push('when: ' + step.when)
+                if (step && step.manual) flags.push('手动')
+                return h('div', { className: 'cicd-step-wrap', key: stepKey },
+                  h('div', { className: 'cicd-step' },
+                    h('span', { className: 'cicd-step-index cicd-mono' }, String((step && step.index) !== undefined ? step.index : stepIndex).padStart(2, '0')),
+                    h('span', { className: 'cicd-step-name' }, (step && (step.name || step.command)) || '未命名步骤'),
+                    flags.length ? h('span', { className: 'cicd-step-flag' }, flags.join(' · ')) : null,
+                    step && step.status ? h(StatusBadge, { status: step.status }) : null),
+                  showCommand && step && step.command
+                    ? h('code', { className: 'cicd-step-cmd cicd-mono' }, '$ ' + step.command)
+                    : null)
+              }))
+        }))
+    }
+
+    /** 左列「阶段 / 目标」：项目列表 + 计划（阶段树）+ 目标矩阵。 */
+    function OverviewColumn({ projects, projectId, onSelectProject, plan, onClosePlan, onPlanRetry, targets, targetName, onSelectTarget }) {
+      return h('section', { className: 'cicd-col cicd-col-overview' },
+        h('div', { className: 'cicd-col-head' },
+          h('span', { className: 'cicd-col-title' }, '阶段 / 目标'),
+          projectId ? h('span', { className: 'cicd-poll' }, projectId) : null),
+        h('div', { className: 'cicd-col-body' },
+          h('div', { className: 'cicd-section-title' }, '项目'),
+          projects.status === 'loading' ? h(LoadingState, { text: '正在读取项目…' }) : null,
+          projects.status === 'error' ? h(ErrorState, { error: projects.error, onRetry: projects.retry }) : null,
+          projects.status === 'ready' && projects.items.length === 0
+            ? h(EmptyState, { text: '还没有项目：先在目标机器上放一个 pipe.yml，再点刷新。' })
+            : null,
+          projects.status === 'ready' && projects.items.length > 0
+            ? projects.items.map((project) => h('div', { key: project.id },
+              h('button', {
+                className: 'cicd-target-row' + (project.id === projectId ? ' is-active' : ''),
+                type: 'button',
+                onClick: () => onSelectProject(project.id),
+                title: project.path,
+              },
+              h('span', { className: 'cicd-target-name' }, project.name || project.id),
+              h('span', { className: 'cicd-target-meta' }, projectHasPipe(project) ? projectPipePath(project) : '缺少 pipe.yml：' + (project.error || '文件不存在')),
+              projectHasPipe(project)
+                ? null
+                : h('p', { className: 'cicd-note' }, '这个项目没有可用的 pipe.yml，计划与运行都会被拒绝。'))))
+            : null,
+          h('div', { className: 'cicd-section-title', style: { marginTop: '4px' } }, '阶段'),
+          plan
+            ? h('div', { className: 'cicd-plan' },
+              h('div', { className: 'cicd-plan-head' },
+                h('span', { className: 'cicd-plan-title' },
+                  '计划 · ' + (plan.target || '') + (plan.data && plan.data.name ? ' · ' + plan.data.name : '')),
+                h('button', { className: 'cicd-button cicd-plan-close', type: 'button', onClick: onClosePlan }, '收起')),
+              plan.status === 'loading' ? h(LoadingState, { text: '正在读取计划…' }) : null,
+              plan.status === 'error' ? h(ErrorState, { error: plan.error, onRetry: onPlanRetry }) : null,
+              plan.status === 'ready'
+                ? (plan.data && Array.isArray(plan.data.stages) && plan.data.stages.length > 0
+                  ? h(StageTree, { stages: plan.data.stages, showCommand: true })
+                  : h(EmptyState, { text: 'pipe.yml 里没有可执行的阶段。' }))
+                : null)
+            : h('p', { className: 'cicd-note' }, '点工具条的「计划」预览这次会执行的阶段与步骤。'),
+          h('div', { className: 'cicd-section-title', style: { marginTop: '4px' } }, '目标'),
+          h(TargetsMatrix, { state: targets, targetName, onSelectTarget })))
+    }
+
+    /** 目标矩阵：每个 target 一张卡；hosts 逐台 chip（状态点）、current、keep、runtime 徽标。 */
+    function TargetsMatrix({ state, targetName, onSelectTarget }) {
+      return h('div', { className: 'cicd-targets' },
+        state.status === 'loading' ? h(LoadingState, { text: '正在读取目标…' }) : null,
+        state.status === 'error' ? h(ErrorState, { error: state.error, onRetry: state.retry }) : null,
+        state.status === 'ready' && state.items.length === 0
+          ? h(EmptyState, { text: '这个项目没有配置 targets：在 pipe.yml 里加 targets。' })
+          : null,
+        state.status === 'ready' && state.items.length > 0
+          ? state.items.map((target) => {
+            const hosts = Array.isArray(target.hosts) ? target.hosts : (target.hosts ? [target.hosts] : [])
+            const runtime = (target && target.runtime) || 'static'
+            // v0.5：Host 会把 env:/group:/tag: 选择器展开成具体别名，并标出哪些别名是生产主机。
+            const envs = Array.isArray(target.envs) ? target.envs.filter((name) => typeof name === 'string' && name) : []
+            const prodHosts = Array.isArray(target.prodHosts) ? target.prodHosts.filter((name) => typeof name === 'string' && name) : []
+            // v0.6：灰度分批发布（pipe.yml 里 target.canary = first / waitSec）。
+            const canary = canaryOf(target)
+            const active = target.name === targetName
+            const cardTitle = target.name + ' · ' + (hosts.join(', ') || '无主机') + (target.current ? ' · current ' + target.current : '')
+            return h('button', {
+              key: target.name,
+              className: 'cicd-target-row cicd-target-card' + (active ? ' is-active' : ''),
+              type: 'button',
+              onClick: () => onSelectTarget(target.name),
+              title: cardTitle,
+            },
+            h('span', { className: 'cicd-target-card-head' },
+              h('span', { className: 'cicd-target-name' }, target.name),
+              h('span', { className: 'cicd-target-runtime' }, runtime)),
+            canary
+              ? h('span', {
+                className: 'cicd-target-canary',
+                title: '灰度发布：先发 ' + canary.first + ' 台，等待 ' + canary.waitSec + 's 再发其余主机',
+              }, canaryText(canary, hosts.length))
+              : null,
+            hosts.length > 0
+              ? h('span', { className: 'cicd-target-hosts' },
+                hosts.map((host, hostIndex) => {
+                  const hostName = typeof host === 'string' ? host : String((host && (host.name || host.host)) || '')
+                  const hostStatus = host && typeof host === 'object' && typeof host.status === 'string' ? host.status : ''
+                  return h('span', { key: hostName + ':' + hostIndex, className: 'cicd-host-chip', title: hostName },
+                    h('span', { className: 'cicd-host-dot' + (hostStatus ? ' is-' + hostStatus : '') }),
+                    h('span', { className: 'cicd-host-name' }, hostName))
+                }))
+              : null,
+            prodHosts.length > 0 || envs.length > 0 || target.envsUnknown
+              ? h('span', { className: 'cicd-target-envs' },
+                prodHosts.length > 0
+                  ? h('span', { className: 'cicd-env-chip is-prod', title: '生产主机：' + prodHosts.join('、') }, '生产 ' + prodHosts.length)
+                  : null,
+                envs.filter((name) => name !== 'prod').map((name) => h('span', { key: name, className: 'cicd-env-chip' }, name)),
+                target.envsUnknown
+                  ? h('span', { className: 'cicd-env-chip', title: 'Host 暂时读不到主机环境标签（dsh-remote 未就绪或没配 env）' }, '环境未知')
+                  : null)
+              : null,
+            h('span', { className: 'cicd-target-meta' }, [target.mode, target.path, target.service].filter(Boolean).join(' · ')),
+            target.current ? h('span', { className: 'cicd-target-current cicd-mono' }, '当前 ' + shortId(target.current, 14)) : null,
+            typeof target.keep === 'number' ? h('span', { className: 'cicd-target-keep' }, '保留 ' + target.keep + ' 份') : null,
+            target.health ? h('span', { className: 'cicd-target-health' }, '健康检查：' + target.health) : null)
+          })
+          : null)
+    }
+
+    /** 中列「Run 详情」：上方运行记录（选择器），下方选中运行的 steps 时间线与日志。 */
+    function RunsDetailColumn({ runs, onRefreshRuns, selectedRunId, onSelectRun, run, stages, canary, logState, onReloadLog }) {
+      // v0.6 A：灰度信息只在「刚跑完的这次 run」的返回里，历史运行没有；批次行来自 canary.batches。
+      const batches = canary && Array.isArray(canary.batches) ? canary.batches.filter(Boolean) : []
+      const firstDone = batches.some((batch) => Number(batch.index) === 1 && batch.ok === true)
+      const hostTotal = (Array.isArray(stages) ? stages : [])
+        .flatMap((stage) => (Array.isArray(stage && stage.steps) ? stage.steps : []))
+        .flatMap((step) => (Array.isArray(step && step.hosts) ? step.hosts : [])).length
+      const canaryFirst = canary && Number(canary.first) > 0 ? Number(canary.first) : 0
+      const canaryWait = canary && Number(canary.waitSec) > 0 ? Number(canary.waitSec) : 0
+      const remaining = hostTotal > canaryFirst ? hostTotal - canaryFirst : 0
+      const hold = Boolean(run && run.status === 'running' && canaryFirst > 0 && firstDone)
+      return h('section', { className: 'cicd-col cicd-col-detail' },
+        h('div', { className: 'cicd-col-head' },
+          h('span', { className: 'cicd-col-title' }, run ? 'Run 详情 · ' + shortId(run.id, 20) : 'Run 详情'),
+          run ? h(StatusBadge, { status: run.status }) : null),
+        h('div', { className: 'cicd-col-body' },
+          h('div', { className: 'cicd-runs' },
+            h('div', { className: 'cicd-runs-head' },
+              h('span', null, '运行记录' + (runs.items.length ? '（' + runs.items.length + '）' : ''))),
+            runs.status === 'loading' && runs.items.length === 0 ? h(LoadingState, { text: '正在读取运行记录…' }) : null,
+            runs.status === 'error' ? h(ErrorState, { error: runs.error, onRetry: onRefreshRuns }) : null,
+            runs.status !== 'error' && runs.items.length === 0 && runs.status !== 'loading'
+              ? h(EmptyState, { text: '还没有运行记录：点工具条「运行」或「干跑」开始一次。' })
+              : null,
+            runs.items.map((row) => h('button', {
+              key: row.id,
+              className: 'cicd-run-row' + (STATUS_LABELS[row.status] ? ' is-' + row.status : '') + (row.id === selectedRunId ? ' is-active' : ''),
+              type: 'button',
+              onClick: () => onSelectRun(row.id),
+              title: row.id,
+            },
+            h('div', { className: 'cicd-run-row-head' },
+              h('span', { className: 'cicd-run-id cicd-mono' }, shortId(row.id, 16)),
+              h(StatusBadge, { status: row.status })),
+            h('div', { className: 'cicd-run-meta' },
+              [row.target, formatTime(row.startedAt), row.dryRun ? '干跑' : '', formatDuration(runDurationMs(row))]
+                .filter(Boolean).join(' · ')),
+            row.error ? h('div', { className: 'cicd-run-error' }, row.error) : null))),
+          run
+            ? h('div', { className: 'cicd-detail' },
+              h('dl', { className: 'cicd-detail-meta' },
+                h('dt', null, '目标'), h('dd', null, run.target || '—'),
+                h('dt', null, '开始'), h('dd', null, formatTime(run.startedAt)),
+                h('dt', null, '耗时'), h('dd', null, formatDuration(runDurationMs(run))),
+                h('dt', null, '类型'), h('dd', null, run.dryRun ? '干跑（不执行真实命令）' : '真实运行')),
+              run.error ? h('p', { className: 'cicd-detail-failure' }, '失败原因：' + run.error) : null,
+              // v0.6 B：失败的运行结束后 Host 已按 notify.webhooks 推送过通知。
+              run.status === 'failed' ? h('p', { className: 'cicd-notify-hint' }, '已按配置推送通知（webhooks 可在插件配置的 notify.webhooks 里改）。') : null,
+              // v0.6 A：第一批成功后等候选窗口 → 明确告诉用户「还在等」。
+              hold
+                ? h('div', { className: 'cicd-canary-hold', role: 'status' },
+                  '第一批 ' + canaryFirst + ' 台已成功，等待 ' + canaryWait + 's 后发剩余 ' + remaining + ' 台')
+                : null,
+              batches.length > 0
+                ? h('div', { className: 'cicd-canary-batches' },
+                  h('span', null, '灰度批次'),
+                  batches.map((batch, index) => {
+                    const tone = batchTone(batch)
+                    const hostList = Array.isArray(batch.hosts) ? batch.hosts : []
+                    return h('span', {
+                      key: 'batch-' + (batch.index !== undefined ? batch.index : index),
+                      className: 'cicd-canary-batch',
+                      title: hostList.length > 0 ? hostList.join('、') : '',
+                    },
+                    h('span', { className: 'cicd-host-dot is-' + tone }),
+                    h('span', null, '第 ' + (Number(batch.index) || index + 1) + ' 批 · ' + hostList.length + ' 台'))
+                  }))
+                : null,
+              stages && stages.length > 0
+                ? h('div', null,
+                  h('div', { className: 'cicd-section-title' }, '步骤时间线'),
+                  h(StepsTimeline, { stages }))
+                : h('p', { className: 'cicd-note' }, '运行列表只带状态与时间；这条运行是历史记录，Host 没有单独返回它的 step 明细，日志见下方。'),
+              h(LogView, { runId: run.id, logState, onReloadLog }))
+            : h(EmptyState, { text: '在上方运行记录里选一条，这里显示 steps 时间线与日志。' })))
+    }
+
+    /** steps 时间线：stage 标题行 + 每步一行（状态点 / 耗时 / 一行摘要）。 */
+    function StepsTimeline({ stages }) {
+      const rows = timelineRows(stages)
+      if (rows.length === 0) return null
+      return h('div', { className: 'cicd-timeline' },
+        rows.map((row) => {
+          if (row.kind === 'stage') {
+            return h('div', { className: 'cicd-timeline-stage', key: row.key },
+              h('span', null, (row.stage && (row.stage.name || row.stage.id)) || '未命名阶段'),
+              row.stage && row.stage.status ? h(StatusBadge, { status: row.stage.status }) : null)
+          }
+          const step = row.step
+          const status = step && STATUS_LABELS[step.status] ? step.status : 'pending'
+          const duration = step && typeof step.durationMs === 'number' ? formatDuration(step.durationMs) : ''
+          const exit = step && typeof step.exitCode === 'number' && step.exitCode !== -1 ? 'exit ' + step.exitCode : ''
+          const meta = [duration ? '耗时 ' + duration : '', exit].filter(Boolean).join(' · ')
+          const summary = step && step.error
+            ? step.error
+            : step && step.command
+              ? '$ ' + step.command
+              : (step && step.kind && step.kind !== 'run' ? step.kind : '')
+          const hosts = hostRowsOf(step)
+          // v0.6 A：每台主机一行，标出它属于第几批（灰度时分批发布）。
+          const hostRows = hosts.length > 0
+            ? h('div', { className: 'cicd-host-rows' }, hosts.map((host) => {
+              const tone = host.skipped ? 'skipped' : host.ok ? 'success' : host.error ? 'failed' : 'running'
+              const tail = [host.health, host.error].filter(Boolean).join(' · ')
+              return h('div', { className: 'cicd-host-row', key: host.key, title: host.name + (tail ? ' · ' + tail : '') },
+                h('span', { className: 'cicd-host-dot is-' + tone }),
+                h('span', { className: 'cicd-host-name' }, host.name),
+                h('span', { className: 'cicd-host-batch' }, '第 ' + host.batch + ' 批'),
+                tail ? h('span', { className: 'cicd-host-health' }, tail) : null)
+            }))
+            : null
+          return h('div', { className: 'cicd-timeline-step-wrap', key: row.key },
+            h('div', { className: 'cicd-timeline-step' },
+              h('span', { className: 'cicd-timeline-dot is-' + status, title: '状态：' + ((step && step.status) || 'pending') }),
+              h('span', { className: 'cicd-timeline-main' },
+                h('span', { className: 'cicd-timeline-name' }, (step && (step.name || step.command)) || '未命名步骤'),
+                meta ? h('span', { className: 'cicd-timeline-meta' }, meta) : null,
+                summary ? h('span', { className: 'cicd-timeline-summary' + (step && step.status === 'failed' ? ' is-failed' : '') }, shortId(summary, 120)) : null)),
+            hostRows)
+        }))
+    }
+
+    /** 日志区：跟随末尾（上滚暂停 / 点击恢复）+ 下载 + 重新读取。 */
+    function LogView({ runId, logState, onReloadLog }) {
+      const logRef = useRef(null)
+      const [follow, setFollow] = useState(true)
+      const lines = Array.isArray(logState.lines) ? logState.lines : []
+      const linesCount = lines.length
+
+      // 跟随中且新日志到达（或刚恢复跟随）时滚到末尾；用户上滚后不再打扰。
+      useEffect(() => {
+        if (!follow) return
+        const node = logRef.current
+        if (node) node.scrollTop = node.scrollHeight
+      }, [follow, logState.lines])
+
+      const onScroll = useCallback((event) => {
+        const node = event && event.currentTarget
+        if (!node || typeof node.scrollHeight !== 'number') return
+        const atBottom = node.scrollHeight - node.scrollTop - node.clientHeight <= 40
+        setFollow(atBottom)
+      }, [])
+
+      const resumeFollow = useCallback(() => {
+        setFollow(true)
+        const node = logRef.current
+        if (node) node.scrollTop = node.scrollHeight
+      }, [])
+
+      const onDownload = useCallback(() => {
+        if (linesCount === 0) return
+        try {
+          const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/plain;charset=utf-8' })
+          const url = URL.createObjectURL(blob)
+          const anchor = document.createElement('a')
+          anchor.href = url
+          anchor.download = (runId || 'run') + '.log'
+          if (document.body && typeof document.body.appendChild === 'function') {
+            document.body.appendChild(anchor)
+            anchor.click()
+            anchor.remove()
+          }
+          setTimeout(() => URL.revokeObjectURL(url), 1000)
+        } catch (error) {
+          // 环境不支持 Blob / DOM 下载时静默：日志仍可在线查看。
+        }
+      }, [lines, linesCount, runId])
+
+      return h('div', { className: 'cicd-log-section' },
+        h('div', { className: 'cicd-section-title' },
+          h('span', { className: 'cicd-log-tools' },
+            h('button', {
+              className: 'cicd-button cicd-log-follow',
+              type: 'button',
+              'aria-pressed': follow,
+              onClick: resumeFollow,
+              title: follow ? '新日志到达时自动滚到末尾；上滚会暂停' : '已暂停跟随：点击恢复滚动到末尾',
+            }, follow ? '跟随末尾' : '恢复跟随'),
+            h('button', { className: 'cicd-button cicd-log-download', type: 'button', onClick: onDownload, disabled: linesCount === 0 }, '下载日志'),
+            h('button', { className: 'cicd-button', type: 'button', onClick: onReloadLog, disabled: logState.status === 'loading' }, logState.status === 'loading' ? '读取…中' : '重新读取')),
+          h('span', null, '日志 tail（' + linesCount + ' 行）')),
+        logState.status === 'error'
+          ? h(ErrorState, { error: logState.error, onRetry: onReloadLog })
+          : linesCount === 0
+            ? h(EmptyState, { text: '这个运行还没有日志输出。' })
+            : h('div', { className: 'cicd-log', ref: logRef, onScroll },
+              lines.map((line, index) => h('p', { className: 'cicd-log-line cicd-mono', key: index }, line))))
+    }
+
+    /** 发布记录表格（列：版本 / 目标 / 主机 / 部署时间 / 状态 / 操作），整页视图与右列共用。 */
+    function ReleaseTable({ items, rollbackId, onRollback, busy }) {
+      return h('div', { className: 'cicd-table-wrap' },
+        h('table', { className: 'cicd-table' },
+          h('thead', null, h('tr', null,
+            ['版本', '目标', '主机', '部署时间', '状态', '操作']
+              .map((label) => h('th', { key: label }, label)))),
+          h('tbody', null, items.map((release) => {
+            const active = Boolean(release.activatedAt) || release.status === 'active'
+            const armed = rollbackId === release.id
+            return h('tr', { key: release.id, className: 'cicd-release-row' + (active ? ' is-active' : '') },
+              h('td', { className: 'cicd-release-cell cicd-release-id cicd-mono', title: release.id }, shortId(release.id, 24)),
+              h('td', { className: 'cicd-release-cell' }, release.target || '—'),
+              h('td', { className: 'cicd-release-cell' },
+                release.host || '—',
+                release.env ? h('span', { className: 'cicd-release-env', title: '部署环境：' + release.env }, release.env) : null),
+              h('td', { className: 'cicd-release-cell' }, formatTime(release.createdAt)),
+              h('td', { className: 'cicd-release-cell' }, active
+                ? h('span', { className: 'cicd-status is-success' }, '已激活')
+                : h('span', { className: 'cicd-status' }, STATUS_LABELS[release.status] || release.status || '历史版本')),
+              h('td', { className: 'cicd-release-cell cicd-release-act' },
+                h('button', {
+                  className: 'cicd-rollback' + (armed ? ' is-armed' : ''),
+                  type: 'button',
+                  onClick: () => onRollback(release),
+                  disabled: Boolean(busy),
+                  title: armed ? '再点一次确认回滚到这个版本' : '把 current 切回这个版本',
+                }, busy ? '回滚…中' : armed ? '确认回滚' : '回滚到此版本')))
+          }))))
+    }
+
+    /** 「发布」整页视图（工具条开关切换）。 */
+    function ReleasesView({ state, targetName, onRefresh, rollbackId, onRollback, busy }) {
+      return h('div', { className: 'cicd-releases' },
+        h('div', { className: 'cicd-releases-head' },
+          h('span', { className: 'cicd-col-title' }, '发布记录' + (targetName ? ' · ' + targetName : '')),
+          h('button', { className: 'cicd-button', type: 'button', onClick: onRefresh, disabled: state.status === 'loading' }, state.status === 'loading' ? '刷新…中' : '刷新')),
+        state.status === 'loading' ? h(LoadingState, { text: '正在读取发布记录…' }) : null,
+        state.status === 'error' ? h(ErrorState, { error: state.error, onRetry: onRefresh }) : null,
+        state.status !== 'error' && state.items.length === 0 && state.status !== 'loading'
+          ? h(EmptyState, { text: '还没有发布记录：先运行一次带部署的流水线。' })
+          : null,
+        state.items.length > 0
+          ? h(ReleaseTable, { items: state.items, rollbackId, onRollback, busy })
+          : null)
+    }
+
+    /** 右列「Releases」：三列布局里的发布记录（窄屏时叠到详情下方）。 */
+    function ReleasesColumn({ state, targetName, onRefresh, rollbackId, onRollback, busy }) {
+      return h('section', { className: 'cicd-col cicd-col-releases' },
+        h('div', { className: 'cicd-col-head' },
+          h('span', { className: 'cicd-col-title' }, 'Releases' + (targetName ? ' · ' + targetName : '')),
+          h('button', {
+            className: 'cicd-button cicd-releases-refresh',
+            type: 'button',
+            onClick: onRefresh,
+            disabled: state.status === 'loading' || !targetName,
+          }, state.status === 'loading' ? '刷新…中' : '刷新')),
+        h('div', { className: 'cicd-col-body' },
+          state.status === 'loading' && state.items.length === 0 ? h(LoadingState, { text: '正在读取发布记录…' }) : null,
+          state.status === 'error' ? h(ErrorState, { error: state.error, onRetry: onRefresh }) : null,
+          state.status !== 'error' && state.items.length === 0 && state.status !== 'loading'
+            ? h(EmptyState, { text: '还没有发布记录：运行一次带部署的流水线后，这里会列出可回滚的版本。' })
+            : null,
+          state.items.length > 0
+            ? h(ReleaseTable, { items: state.items, rollbackId, onRollback, busy })
+            : null))
+    }
+
+    /** v0.6 C：审计时间线（整页视图）：时间 / 动作 / 目标 / 主机 / 版本 / 状态。 */
+    function AuditView({ state, limit, onLimit, onRefresh }) {
+      const items = Array.isArray(state.items) ? state.items : []
+      const unsupported = Boolean(state.unsupported)
+      const loading = state.status === 'loading'
+      return h('div', { className: 'cicd-audit' },
+        h('div', { className: 'cicd-audit-head' },
+          h('span', { className: 'cicd-col-title' }, '操作审计' + (items.length > 0 ? '（' + items.length + '）' : '')),
+          h('select', {
+            className: 'cicd-select cicd-audit-limit',
+            value: String(limit),
+            onChange: (event) => onLimit(Number(event.currentTarget.value) || AUDIT_DEFAULT_LIMIT),
+            'aria-label': '审计条数',
+          }, AUDIT_LIMITS.map((value) => h('option', { key: value, value: String(value) }, '最近 ' + value + ' 条'))),
+          h('button', {
+            className: 'cicd-button cicd-audit-refresh',
+            type: 'button',
+            onClick: onRefresh,
+            disabled: loading,
+          }, loading ? '刷新…中' : '刷新')),
+        // 旧 Host 没有 /operations：这不是错误，只是还没升级。
+        unsupported ? h(EmptyState, { text: 'Host 还不支持审计（升级到 v0.6 后可用）' }) : null,
+        !unsupported && loading ? h(LoadingState, { text: '正在读取操作记录…' }) : null,
+        !unsupported && state.status === 'error' ? h(ErrorState, { error: state.error, onRetry: onRefresh }) : null,
+        !unsupported && !loading && state.status !== 'error' && items.length === 0
+          ? h(EmptyState, { text: '还没有操作记录' })
+          : null,
+        items.length > 0
+          ? h('div', { className: 'cicd-table-wrap' },
+            h('table', { className: 'cicd-table cicd-audit-table' },
+              h('thead', null, h('tr', null,
+                ['时间', '动作', '目标', '主机', '版本', '状态'].map((label) => h('th', { key: label }, label)))),
+              h('tbody', null, items.map((operation, index) => {
+                const action = (operation && operation.action) || ''
+                const tone = OPERATION_TONES[action] || ''
+                const status = operation && operation.status ? String(operation.status) : ''
+                const detail = operation && operation.detail ? String(operation.detail) : ''
+                return h('tr', {
+                  key: (operation && operation.id !== undefined ? 'op-' + operation.id : 'op-' + index),
+                  className: 'cicd-audit-row' + (tone ? ' is-' + action : ''),
+                  title: [operation && operation.runId ? 'run ' + operation.runId : '', detail].filter(Boolean).join(' · '),
+                  'data-dsh-cicd-action': action,
+                },
+                h('td', { className: 'cicd-audit-cell cicd-audit-time cicd-mono' }, formatTime(operation && operation.at)),
+                h('td', { className: 'cicd-audit-cell' },
+                  h('span', { className: 'cicd-audit-action' + (tone ? ' is-' + action : '') }, operationLabel(action))),
+                h('td', { className: 'cicd-audit-cell cicd-audit-target' }, (operation && operation.target) || '—'),
+                h('td', { className: 'cicd-audit-cell cicd-audit-host' }, (operation && operation.host) || '—'),
+                h('td', { className: 'cicd-audit-cell cicd-audit-release cicd-mono' }, operation && operation.releaseId ? shortId(operation.releaseId, 20) : '—'),
+                h('td', { className: 'cicd-audit-cell' }, status
+                  ? h('span', { className: 'cicd-status is-' + (STATUS_LABELS[status] ? status : 'queued') }, STATUS_LABELS[status] || status)
+                  : '—'))
+              }))))
+          : null)
+    }
+
+    function CicdPage() {
+      const [projects, setProjects] = useState({ status: 'loading', items: [], error: null })
+      const [projectId, setProjectId] = useState('')
+      const [targets, setTargets] = useState({ status: 'idle', items: [], error: null })
+      const [targetName, setTargetName] = useState('')
+      const [runs, setRuns] = useState({ status: 'idle', items: [], error: null })
+      const [selectedRunId, setSelectedRunId] = useState('')
+      const [log, setLog] = useState({ status: 'idle', lines: [], error: null })
+      /** /run 的返回里带 stage 树，留着给刚启动的这次运行显示明细。 */
+      const [runDetail, setRunDetail] = useState(null)
+      const [plan, setPlan] = useState(null)
+      const [releases, setReleases] = useState({ status: 'idle', items: [], error: null })
+      const [view, setView] = useState('run')
+      const [action, setAction] = useState({ status: 'idle', message: '', error: null })
+      const [busy, setBusy] = useState(false)
+      const [armed, setArmed] = useState(false)
+      const [rollbackId, setRollbackId] = useState('')
+      /** v0.5 生产护栏：Host 返回 409 PROD_CONFIRM_REQUIRED 时挂在这里，用户点确认后才带 confirm=prod 重发。 */
+      const [prodGuard, setProdGuard] = useState(null)
+      /** v0.6 C：审计视图数据（404 时置 unsupported，不当错误处理）。 */
+      const [audit, setAudit] = useState({ status: 'idle', items: [], error: null, unsupported: false })
+      const [auditLimit, setAuditLimit] = useState(AUDIT_DEFAULT_LIMIT)
+      /** v0.6 B：测试通知的内联结果（不弹窗）。 */
+      const [notify, setNotify] = useState({ status: 'idle', message: '', failed: false })
+      const [notifyArmed, setNotifyArmed] = useState(false)
+
+      /** 每类请求各自一个 controller：轮询时 runs 与 log 一起发，不能互相 abort。 */
+      const aborters = useRef({})
+      const armTimer = useRef(null)
+      const rollbackTimer = useRef(null)
+      const notifyTimer = useRef(null)
+
+      /** 同一个 slot 的新请求会掐掉上一笔，避免旧响应盖掉新状态。 */
+      const freshSignal = useCallback((slot) => {
+        const map = aborters.current
+        const key = slot || 'misc'
+        if (map[key]) {
+          try { map[key].abort() } catch (error) { /* ignore */ }
+        }
+        const controller = new AbortController()
+        map[key] = controller
+        return controller.signal
+      }, [])
+
+      useEffect(() => () => {
+        const map = aborters.current
+        Object.keys(map).forEach((key) => {
+          try { map[key].abort() } catch (error) { /* ignore */ }
+        })
+        if (armTimer.current) clearTimeout(armTimer.current)
+        if (rollbackTimer.current) clearTimeout(rollbackTimer.current)
+        if (notifyTimer.current) clearTimeout(notifyTimer.current)
+      }, [])
+
+      const loadProjects = useCallback(async () => {
+        setProjects({ status: 'loading', items: [], error: null })
+        try {
+          const payload = await callApi('projects', {}, freshSignal('projects'))
+          const items = Array.isArray(payload.projects) ? payload.projects : []
+          setProjects({ status: 'ready', items, error: null })
+          setProjectId((current) => {
+            if (current && items.some((project) => project.id === current)) return current
+            // 记住上次选的项目；失效或没有记录时退到第一个有 pipe.yml 的项目。
+            const stored = readStoredProject()
+            if (stored && items.some((project) => project.id === stored)) return stored
+            const usable = items.find((project) => projectHasPipe(project)) || items[0]
+            return usable ? usable.id : ''
+          })
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          setProjects({ status: 'error', items: [], error })
+        }
+      }, [freshSignal])
+
+      const loadTargets = useCallback(async (id) => {
+        if (!id) {
+          setTargets({ status: 'idle', items: [], error: null })
+          setTargetName('')
+          return
+        }
+        setTargets({ status: 'loading', items: [], error: null })
+        try {
+          const payload = await callApi('targets', { project: id }, freshSignal('targets'))
+          const items = Array.isArray(payload.targets) ? payload.targets : []
+          setTargets({ status: 'ready', items, error: null })
+          setTargetName((current) => (current && items.some((target) => target.name === current) ? current : (items[0] ? items[0].name : '')))
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          setTargets({ status: 'error', items: [], error })
+        }
+      }, [freshSignal])
+
+      const loadRuns = useCallback(async (id, quiet) => {
+        if (!id) return
+        if (!quiet) setRuns((prev) => ({ status: 'loading', items: prev.items, error: null }))
+        try {
+          const payload = await callApi('runs', { project: id, limit: RUN_LIMIT }, freshSignal('runs'))
+          setRuns({ status: 'ready', items: Array.isArray(payload.runs) ? payload.runs : [], error: null })
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          if (!quiet) setRuns({ status: 'error', items: [], error })
+        }
+      }, [freshSignal])
+
+      const loadLog = useCallback(async (runId, quiet) => {
+        if (!runId) {
+          setLog({ status: 'idle', lines: [], error: null })
+          return
+        }
+        if (!quiet) setLog({ status: 'loading', lines: [], error: null })
+        try {
+          const payload = await callApi('log', { runId, tail: LOG_TAIL }, freshSignal('log'))
+          setLog({ status: 'ready', lines: logLines(payload), error: null })
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          if (!quiet) setLog({ status: 'error', lines: [], error })
+        }
+      }, [freshSignal])
+
+      const loadReleases = useCallback(async (target) => {
+        if (!target) {
+          setReleases({ status: 'idle', items: [], error: null })
+          return
+        }
+        setReleases({ status: 'loading', items: [], error: null })
+        try {
+          const payload = await callApi('releases', { target, limit: 50 }, freshSignal('releases'))
+          setReleases({ status: 'ready', items: Array.isArray(payload.releases) ? payload.releases : [], error: null })
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          setReleases({ status: 'error', items: [], error })
+        }
+      }, [freshSignal])
+
+      /** v0.6 C：审计时间线。Host 没有 /operations 时按「未升级」处理，不显示成红色错误。 */
+      const loadAudit = useCallback(async (limit) => {
+        if (!projectId) {
+          setAudit({ status: 'idle', items: [], error: null, unsupported: false })
+          return
+        }
+        setAudit((prev) => ({ status: 'loading', items: prev.items, error: null, unsupported: false }))
+        try {
+          const payload = await callApi('operations', { project: projectId, limit: limit || AUDIT_DEFAULT_LIMIT }, freshSignal('audit'))
+          setAudit({ status: 'ready', items: Array.isArray(payload.operations) ? payload.operations : [], error: null, unsupported: false })
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          if (error && (error.status === 404 || error.code === 'NOT_FOUND')) {
+            setAudit({ status: 'ready', items: [], error: null, unsupported: true })
+            return
+          }
+          setAudit({ status: 'error', items: [], error, unsupported: false })
+        }
+      }, [freshSignal, projectId])
+
+      useEffect(() => { void loadProjects() }, [loadProjects])
+      useEffect(() => { void loadTargets(projectId) }, [projectId, loadTargets])
+      useEffect(() => { void loadRuns(projectId, false) }, [projectId, loadRuns])
+      // 右列 Releases 常驻，切目标或切项目都要重新拉这一份。
+      useEffect(() => {
+        if (targetName) void loadReleases(targetName)
+      }, [targetName, projectId, loadReleases])
+
+      // v0.6 C：进审计视图或改条数时拉一次 /operations。
+      useEffect(() => {
+        if (view !== 'audit') return
+        void loadAudit(auditLimit)
+      }, [view, auditLimit, loadAudit])
+
+      // 选中项：列表变化时保持选中，失效则回落到第一条。
+      useEffect(() => {
+        if (selectedRunId && runs.items.some((run) => run.id === selectedRunId)) return
+        const first = runs.items[0]
+        setSelectedRunId(first ? first.id : '')
+      }, [runs.items, selectedRunId])
+
+      useEffect(() => { void loadLog(selectedRunId, false) }, [selectedRunId, loadLog])
+
+      const selectedRun = runs.items.find((run) => run.id === selectedRunId) || null
+      const isRunning = runs.items.some((run) => run.status === 'running' || run.status === 'queued')
+
+      // 只有存在未结束的运行才轮询；离开视图 / 卸载时清掉 timer。
+      useEffect(() => {
+        if (view !== 'run' || !projectId || !isRunning) return undefined
+        const timer = setInterval(() => {
+          void loadRuns(projectId, true)
+          if (selectedRunId) void loadLog(selectedRunId, true)
+        }, POLL_MS)
+        return () => clearInterval(timer)
+      }, [view, projectId, isRunning, selectedRunId, loadRuns, loadLog])
+
+      const clearArmed = useCallback(() => {
+        if (armTimer.current) {
+          clearTimeout(armTimer.current)
+          armTimer.current = null
+        }
+        setArmed(false)
+      }, [])
+
+      const clearRollback = useCallback(() => {
+        if (rollbackTimer.current) {
+          clearTimeout(rollbackTimer.current)
+          rollbackTimer.current = null
+        }
+        setRollbackId('')
+      }, [])
+
+      const runPlan = useCallback(async () => {
+        if (!projectId || !targetName) return
+        setPlan({ status: 'loading', data: null, error: null, target: targetName })
+        try {
+          const payload = await callApi('plan', { project: projectId, target: targetName }, freshSignal('plan'))
+          setPlan({ status: 'ready', data: planOf(payload), error: null, target: targetName })
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          setPlan({ status: 'error', data: null, error, target: targetName })
+        }
+      }, [projectId, targetName, freshSignal])
+
+      const startRun = useCallback(async (dryRun, confirmProd = false) => {
+        if (!projectId || !targetName) return
+        setBusy(true)
+        setProdGuard(null)
+        setAction({
+          status: 'running',
+          message: dryRun ? '正在启动干跑…' : confirmProd ? '正在发布到生产…' : '正在启动运行…',
+          error: null,
+        })
+        try {
+          // Host 的 /run 是写路由：即便干跑也要 confirm=1，否则一律 400「写操作需要 confirm=1」。
+          // v0.5：目标展开后含 env=prod 的主机时，Host 只认 confirm=prod（409 PROD_CONFIRM_REQUIRED）。
+          const params = { project: projectId, target: targetName, confirm: confirmProd ? 'prod' : 1, dryRun: dryRun ? 1 : 0 }
+          const payload = await callApi('run', params, freshSignal('run'))
+          const run = runOfPayload(payload)
+          setAction({
+            status: 'done',
+            message: (dryRun ? '干跑' : '运行') + (run && run.id ? '已记录：' + shortId(run.id, 20) + '（' + (run.status || 'queued') + '）' : '请求已提交') + '。',
+            error: null,
+          })
+          if (run && run.id) {
+            setRunDetail({ id: run.id, stages: Array.isArray(run.stages) ? run.stages : [], canary: run.canary || null })
+            setSelectedRunId(run.id)
+          }
+          await loadRuns(projectId, true)
+          if (run && run.id) await loadLog(run.id, false)
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          // 生产护栏：Host 拒绝并要求二次确认时把受影响主机摆出来，等用户点「确认发布到生产」。
+          if (error && error.code === 'PROD_CONFIRM_REQUIRED') {
+            setProdGuard({ kind: 'run', dryRun, hosts: Array.isArray(error.hosts) ? error.hosts : [], error })
+            setAction({ status: 'error', message: '', error, retry: null })
+            return
+          }
+          setAction({ status: 'error', message: '', error, retry: () => void startRun(dryRun, confirmProd) })
+        } finally {
+          setBusy(false)
+        }
+      }, [projectId, targetName, freshSignal, loadRuns, loadLog])
+
+      const requestRun = useCallback(() => {
+        if (armed) {
+          clearArmed()
+          void startRun(false)
+          return
+        }
+        setArmed(true)
+        if (armTimer.current) clearTimeout(armTimer.current)
+        armTimer.current = setTimeout(() => {
+          armTimer.current = null
+          setArmed(false)
+        }, CONFIRM_MS)
+      }, [armed, clearArmed, startRun])
+
+      /** 真正执行回滚（确认已在 requestRollback 里做过）。 */
+      const rollbackTo = useCallback(async (release, confirmProd = false) => {
+        if (!targetName) return
+        setBusy(true)
+        setProdGuard(null)
+        setAction({ status: 'running', message: '正在回滚到 ' + release.id + '…', error: null })
+        try {
+          // 回滚也是写路由：目标展开后含生产主机时同样只认 confirm=prod。
+          const payload = await callApi('rollback', {
+            target: targetName,
+            releaseId: release.id,
+            confirm: confirmProd ? 'prod' : 1,
+          }, freshSignal('rollback'))
+          const released = payload.released || payload
+          const where = released && (released.host || released.target) ? '（' + [released.target, released.host].filter(Boolean).join(' · ') + '）' : ''
+          setAction({ status: 'done', message: '已回滚到 ' + ((released && (released.releaseId || released.id || released.commit)) || release.id) + where + '。', error: null })
+          await loadReleases(targetName)
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          if (error && error.code === 'PROD_CONFIRM_REQUIRED') {
+            setProdGuard({ kind: 'rollback', release, hosts: Array.isArray(error.hosts) ? error.hosts : [], error })
+            setAction({ status: 'error', message: '', error, retry: null })
+            return
+          }
+          setAction({ status: 'error', message: '', error, retry: () => void rollbackTo(release, confirmProd) })
+        } finally {
+          setBusy(false)
+        }
+      }, [targetName, freshSignal, loadReleases])
+
+      const requestRollback = useCallback((release) => {
+        if (rollbackId !== release.id) {
+          setRollbackId(release.id)
+          if (rollbackTimer.current) clearTimeout(rollbackTimer.current)
+          rollbackTimer.current = setTimeout(() => {
+            rollbackTimer.current = null
+            setRollbackId('')
+          }, ROLLBACK_CONFIRM_MS)
+          return
+        }
+        clearRollback()
+        void rollbackTo(release)
+      }, [rollbackId, clearRollback, rollbackTo])
+
+      const refreshAll = useCallback(() => {
+        clearArmed()
+        clearRollback()
+        setAction({ status: 'idle', message: '', error: null })
+        void loadProjects()
+        if (projectId) {
+          void loadTargets(projectId)
+          void loadRuns(projectId, false)
+        }
+        if (targetName) void loadReleases(targetName)
+        if (view === 'audit') void loadAudit(auditLimit)
+      }, [clearArmed, clearRollback, loadProjects, loadTargets, loadRuns, loadReleases, projectId, targetName, view, loadAudit, auditLimit])
+
+      const toggleReleases = useCallback(() => {
+        clearRollback()
+        setView((current) => {
+          const next = current === 'releases' ? 'run' : 'releases'
+          if (next === 'releases' && targetName) void loadReleases(targetName)
+          if (next === 'run' && projectId) void loadRuns(projectId, false)
+          return next
+        })
+      }, [clearRollback, targetName, projectId, loadReleases, loadRuns])
+
+      /** v0.6 C：审计视图开关（与「发布」同级，互斥）。 */
+      const toggleAudit = useCallback(() => {
+        clearRollback()
+        setView((current) => (current === 'audit' ? 'run' : 'audit'))
+      }, [clearRollback])
+
+      const clearNotifyArmed = useCallback(() => {
+        if (notifyTimer.current) {
+          clearTimeout(notifyTimer.current)
+          notifyTimer.current = null
+        }
+        setNotifyArmed(false)
+      }, [])
+
+      /** v0.6 B：真正发测试通知（确认已在 requestNotify 里做过）。 */
+      const runNotifyTest = useCallback(async () => {
+        setNotify({ status: 'running', message: '正在发送测试通知…', failed: false })
+        try {
+          // 写路由：与 /run 一样要 confirm=1。
+          const payload = await callApi('notify-test', { confirm: 1 }, freshSignal('notify'))
+          const configured = Number(payload.configured) || 0
+          const webhooks = Array.isArray(payload.webhooks) ? payload.webhooks : []
+          if (configured === 0) {
+            setNotify({ status: 'empty', message: '还没有配置 webhook（在 dsh-cicd 插件配置里加 notify.webhooks）', failed: false })
+            return
+          }
+          const okCount = webhooks.filter((item) => item && item.ok).length
+          const failCount = webhooks.length - okCount
+          setNotify({
+            status: 'done',
+            message: configured + ' 个 webhook：成功 ' + okCount + ' / 失败 ' + failCount,
+            failed: failCount > 0,
+          })
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          setNotify({
+            status: 'error',
+            message: '测试通知失败：' + ((error && error.message) || '未知错误'),
+            failed: true,
+          })
+        }
+      }, [freshSignal])
+
+      /** v0.6 B：测试通知是外发动作 → 8 秒内再点一次才真发。 */
+      const requestNotify = useCallback(() => {
+        if (notifyArmed) {
+          clearNotifyArmed()
+          void runNotifyTest()
+          return
+        }
+        setNotify({ status: 'idle', message: '', failed: false })
+        setNotifyArmed(true)
+        if (notifyTimer.current) clearTimeout(notifyTimer.current)
+        notifyTimer.current = setTimeout(() => {
+          notifyTimer.current = null
+          setNotifyArmed(false)
+        }, NOTIFY_CONFIRM_MS)
+      }, [notifyArmed, clearNotifyArmed, runNotifyTest])
+
+      const onSelectProject = useCallback((id) => {
+        clearArmed()
+        clearRollback()
+        if (id) writeStoredProject(id)
+        setProjectId(id)
+        setPlan(null)
+        setRunDetail(null)
+        setAction({ status: 'idle', message: '', error: null })
+      }, [clearArmed, clearRollback])
+
+      const onSelectTarget = useCallback((name) => {
+        clearRollback()
+        setPlan(null)
+        setTargetName(name)
+      }, [clearRollback])
+
+      const actionBar = action.status === 'idle'
+        ? null
+        : h('div', {
+          className: 'cicd-action' + (action.status === 'error' ? ' is-error' : ''),
+          role: action.status === 'error' ? 'alert' : 'status',
+        },
+        action.status === 'error'
+          ? h('div', { className: 'cicd-action-body' },
+            h('span', { className: 'cicd-action-message' }, (action.error && action.error.message) || '操作失败'),
+            action.error && action.error.code
+              ? h('span', { className: 'cicd-error-code cicd-mono' }, action.error.code + (action.error.line ? ' · 第 ' + action.error.line + ' 行' : ''))
+              : null,
+            explainError(action.error)
+              ? h('span', { className: 'cicd-error-hint' }, explainError(action.error))
+              : null,
+            action.retry
+              ? h('button', { className: 'cicd-button cicd-action-retry', type: 'button', onClick: action.retry, disabled: busy }, '重试')
+              : null)
+          : h('span', null, action.message))
+
+      // v0.5 生产护栏：Host 拒绝过一次，这里列出受影响主机；用户点确认才带 confirm=prod 重发。
+      const prodGuardBar = !prodGuard
+        ? null
+        : h('div', { className: 'cicd-prod-guard', role: 'alert', 'data-dsh-cicd-prod-guard': prodGuard.kind },
+          h('span', { className: 'cicd-prod-guard-text' },
+            (prodGuard.kind === 'rollback' ? '这个回滚' : '这次发布') + '会动到生产主机，确认后才真正执行。'),
+          h('span', { className: 'cicd-prod-guard-hosts' },
+            '受影响主机：' + (prodGuard.hosts.length > 0 ? prodGuard.hosts.join('、') : '（Host 没有列出具体主机）')),
+          h('div', { className: 'cicd-prod-guard-actions' },
+            h('button', {
+              className: 'cicd-button cicd-prod-confirm',
+              type: 'button',
+              disabled: busy,
+              onClick: () => {
+                const pending = prodGuard
+                setProdGuard(null)
+                if (pending.kind === 'rollback' && pending.release) void rollbackTo(pending.release, true)
+                else void startRun(Boolean(pending.dryRun), true)
+              },
+            }, busy ? '发布…中' : prodGuard.kind === 'rollback' ? '确认回滚（生产）' : '确认发布到生产'),
+            h('button', {
+              className: 'cicd-button cicd-prod-cancel',
+              type: 'button',
+              disabled: busy,
+              onClick: () => setProdGuard(null),
+            }, '取消')))
+
+      const toolbar = h('div', { className: 'cicd-toolbar' },
+        h('div', { className: 'cicd-toolbar-group' },
+          h('span', { className: 'cicd-label' }, '项目'),
+          // 单项目时不占位置：退化成静态文本；多项目才给选择器（选中记在 localStorage）。
+          projects.status === 'ready' && projects.items.length === 1
+            ? h('span', { className: 'cicd-project-static', title: projects.items[0].path || projects.items[0].id }, projects.items[0].name || projects.items[0].id)
+            : h('select', {
+              className: 'cicd-select cicd-project-select cicd-project-picker',
+              value: projectId,
+              disabled: projects.status !== 'ready' || projects.items.length === 0,
+              onChange: (event) => onSelectProject(event.currentTarget.value),
+              'aria-label': '选择项目',
+            }, projects.items.length === 0
+              ? h('option', { value: '' }, '（没有项目）')
+              : projects.items.map((project) => h('option', { key: project.id, value: project.id }, project.name || project.id)))),
+        h('div', { className: 'cicd-toolbar-group' },
+          h('span', { className: 'cicd-label' }, '目标'),
+          h('select', {
+            className: 'cicd-select cicd-target-select',
+            value: targetName,
+            disabled: targets.status !== 'ready' || targets.items.length === 0,
+            onChange: (event) => onSelectTarget(event.currentTarget.value),
+            'aria-label': '选择部署目标',
+          }, targets.items.length === 0
+            ? h('option', { value: '' }, '（没有目标）')
+            : targets.items.map((target) => h('option', { key: target.name, value: target.name }, target.name)))),
+        h('div', { className: 'cicd-toolbar-group' },
+          h('button', { className: 'cicd-button cicd-plan-open', type: 'button', onClick: runPlan, disabled: busy || !targetName || Boolean(plan && plan.status === 'loading') }, plan && plan.status === 'loading' ? '计划…中' : '计划'),
+          h('button', { className: 'cicd-button cicd-dry-run', type: 'button', onClick: () => void startRun(true), disabled: busy || !targetName }, busy ? '干跑…中' : '干跑'),
+          h('button', {
+            className: 'cicd-button cicd-run-now' + (armed ? ' cicd-button-armed' : ''),
+            type: 'button',
+            'aria-pressed': armed,
+            onClick: requestRun,
+            disabled: busy || !targetName,
+          }, busy ? '运行…中' : armed ? '确认运行' : '运行'),
+          h('button', {
+            className: 'cicd-button cicd-view-releases',
+            type: 'button',
+            'aria-pressed': view === 'releases',
+            onClick: toggleReleases,
+          }, view === 'releases' ? '回到运行' : '发布'),
+          h('button', {
+            className: 'cicd-button cicd-view-audit',
+            type: 'button',
+            'aria-pressed': view === 'audit',
+            onClick: toggleAudit,
+          }, view === 'audit' ? '回到运行' : '审计'),
+          h('button', {
+            className: 'cicd-button cicd-notify-test' + (notifyArmed ? ' cicd-button-armed' : ''),
+            type: 'button',
+            'aria-pressed': notifyArmed,
+            onClick: requestNotify,
+            disabled: busy || notify.status === 'running',
+            title: notifyArmed ? '8 秒内再点一次才真的发出去' : '向配置的 webhook 发一条测试消息',
+          }, notify.status === 'running' ? '测试…中' : notifyArmed ? '确认测试' : '测试通知'),
+          h('button', { className: 'cicd-button cicd-refresh', type: 'button', onClick: refreshAll, disabled: projects.status === 'loading' }, projects.status === 'loading' ? '刷新…中' : '刷新')),
+        h('div', { className: 'cicd-toolbar-spacer' }),
+        isRunning && view === 'run' ? h('span', { className: 'cicd-poll' }, '运行中 · 每 2 秒刷新') : null,
+        // v0.6 B：测试通知的结果内联在工具条尾部，不弹窗、不占整页。
+        notify.status === 'idle' || notify.status === 'running'
+          ? null
+          : h('span', {
+            className: 'cicd-notify-result' + (notify.failed ? ' is-failed' : ''),
+            role: notify.failed ? 'alert' : 'status',
+          }, notify.message),
+        notifyArmed
+          ? h('span', { className: 'cicd-hint' }, '点「确认测试」会真的向配置的 webhook 发一条测试消息（8 秒内有效）。')
+          : null,
+        armed
+          ? h('span', { className: 'cicd-hint' }, '会真的执行本地命令并部署到 ' + targetName + '，继续？10 秒内再点一次「确认运行」。')
+          : null)
+
+      const body = view === 'audit'
+        ? h(AuditView, {
+          state: audit,
+          limit: auditLimit,
+          onLimit: (value) => setAuditLimit(value),
+          onRefresh: () => void loadAudit(auditLimit),
+        })
+        : view === 'releases'
+        ? h(ReleasesView, {
+          state: releases,
+          targetName,
+          onRefresh: () => void loadReleases(targetName),
+          rollbackId,
+          onRollback: (release) => void requestRollback(release),
+          busy,
+        })
+        : h('div', { className: 'cicd-columns' },
+          h(OverviewColumn, {
+            projects: { ...projects, retry: () => void loadProjects() },
+            projectId,
+            onSelectProject,
+            plan,
+            onClosePlan: () => setPlan(null),
+            onPlanRetry: () => void runPlan(),
+            targets: { ...targets, retry: () => void loadTargets(projectId) },
+            targetName,
+            onSelectTarget,
+          }),
+          h(RunsDetailColumn, {
+            runs: { ...runs, retry: () => void loadRuns(projectId, false) },
+            onRefreshRuns: () => void loadRuns(projectId, false),
+            selectedRunId,
+            onSelectRun: setSelectedRunId,
+            run: selectedRun,
+            stages: runDetail && selectedRun && runDetail.id === selectedRun.id ? runDetail.stages : (selectedRun && Array.isArray(selectedRun.stages) ? selectedRun.stages : []),
+            canary: runDetail && selectedRun && runDetail.id === selectedRun.id ? runDetail.canary : null,
+            logState: log,
+            onReloadLog: () => void loadLog(selectedRunId, false),
+          }),
+          h(ReleasesColumn, {
+            state: releases,
+            targetName,
+            onRefresh: () => void loadReleases(targetName),
+            rollbackId,
+            onRollback: (release) => void requestRollback(release),
+            busy,
+          }))
+
+      return h('div', { className: 'cicd-page', 'data-dsh-cicd-page': '' },
+        toolbar,
+        actionBar,
+        prodGuardBar,
+        body,
+        h('div', { className: 'cicd-footer' },
+          '数据来自 Host 的 /api/plugins/cicd/*；命令在 Host 本机执行，部署经 dsh-remote 的 SSH 通道送达目标机。'))
+    }
+
+    /** 左侧栏全局面板页（`main` 槽的 keyed 页面）。 */
+    function CicdPanelPage() {
+      return h('div', { className: 'cicd-panel', 'data-dsh-panel-view': PANEL_ID }, h(CicdPage))
+    }
+
+    /** 左侧栏字形：把 packages/dsh-cicd/icon.svg 的环状节点造型重画成 16×16。 */
+    function CicdPanelIcon({ size }) {
+      const edge = typeof size === 'number' && Number.isFinite(size) ? size : 16
+      return h('svg', {
+        'data-dsh-panel-entry': PANEL_ID,
+        viewBox: '0 0 16 16',
+        width: edge,
+        height: edge,
+        fill: 'none',
+        stroke: 'currentColor',
+        strokeWidth: 1.4,
+        strokeLinecap: 'round',
+        strokeLinejoin: 'round',
+        'aria-hidden': 'true',
+        style: { display: 'block' },
+      },
+      h('circle', { cx: 3.6, cy: 8, r: 1.9 }),
+      h('circle', { cx: 8, cy: 3.4, r: 1.6 }),
+      h('circle', { cx: 8, cy: 12.6, r: 1.6 }),
+      h('circle', { cx: 12.4, cy: 8, r: 1.9 }),
+      h('path', { d: 'M5.2 7.1 6.9 4.6' }),
+      h('path', { d: 'M5.2 8.9 6.9 11.4' }),
+      h('path', { d: 'M9.1 4.6 10.8 7.1' }),
+      h('path', { d: 'M9.1 11.4 10.8 8.9' }),
+      h('path', { d: 'M5.5 8h5' }))
+    }
+
+    /** 视图页自己管理样式：apply 里注册，卸载时删除。 */
+    function installStyles() {
+      if (typeof document === 'undefined') return () => {}
+      const existing = document.querySelector(`style[data-plugin-css="${STYLE_ID}"]`)
+      if (existing) return () => {}
+      const tag = document.createElement('style')
+      tag.dataset.plugin = '@local/dsh-cicd'
+      tag.dataset.pluginCss = STYLE_ID
+      tag.textContent = CSS
+      document.head.appendChild(tag)
+      return () => {
+        tag.remove()
+      }
+    }
+
+    return {
+      inject: ['slots'],
+      apply(ctx) {
+        ctx.effect(() => installStyles(), 'dsh-cicd: page styles')
+
+        // 会话内视图：沿用 remote / aihot 的既有入口形态。
+        ctx.effect(() => ctx.slots.inject('conversation.view', () => ctx.slots.register({
+          name: 'conversation.view',
+          id: PANEL_ID,
+          order: 70,
+          label: () => '流水线',
+        }, CicdPage)), 'dsh-cicd: conversation view')
+
+        // 左侧栏全局面板行：只提供字形，行框 / label / 高亮 / 折叠都属于 shell。
+        ctx.effect(() => ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
+          name: 'sidebar.panellist',
+          id: PANEL_ID,
+          order: 70,
+          label: () => '流水线',
+        }, CicdPanelIcon)), 'dsh-cicd: pipeline sidebar row')
+
+        // 中心列页面本体：`main` 槽按 key 选面板，只有选中时才挂载。
+        ctx.effect(() => ctx.slots.inject('main', () => ctx.slots.register({
+          name: 'main',
+          key: PANEL_ID,
+        }, CicdPanelPage)), 'dsh-cicd: pipeline panel page')
+      },
+    }
+  },
+})

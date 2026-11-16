@@ -1,0 +1,5 @@
+- insert:
+    - id: user-data-backup
+      name: '@deepseek-ai/dsh-user-data-backup'
+    - id: ui-settings-user-data
+      name: '@deepseek-ai/dsh-client-ui-settings-user-data'

@@ -1,0 +1,4 @@
+Vendored noVNC 1.7.0 (https://github.com/novnc/noVNC, MPL-2.0).
+Built from @novnc/novnc@1.7.0 core/rfb.js with esbuild --bundle --format=esm --target=es2022 --minify.
+Entry wrapper: import RFB from '@novnc/novnc/core/rfb.js'; globalThis.DSHNoVNC = { RFB }.
+Do not edit by hand; rebuild with the same command when upgrading.

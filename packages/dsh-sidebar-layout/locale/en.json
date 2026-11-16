@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Sidebar layout",
+    "description": "Split the left sidebar's panel navigation and workspace sessions into two independently scrolling regions, plus a one-click collapse toggle for the workspace."
+  }
+}

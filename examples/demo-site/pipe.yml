@@ -1,0 +1,37 @@
+version: 1
+name: dsh-demo-site
+
+vars:
+  APP: dsh-demo-site
+  PORT: "8099"
+
+targets:
+  demo:
+    hosts: [linux26]
+    mode: release
+    path: /srv/dsh-demo
+    # 注意：别用 pkill -f 带端口/命令名去杀自己——这条命令自身的命令行也含同样的字符串，会被一起杀掉（exit 空）
+    restart: "fuser -k 8099/tcp >/dev/null 2>&1 || true; cd /srv/dsh-demo/current && setsid -f python3 -m http.server 8099 >/tmp/dsh-demo.log 2>&1 </dev/null; sleep 0.6"
+    health:
+      http: http://127.0.0.1:8099/
+      tries: 5
+      interval: 1s
+    keep: 3
+
+stages:
+  - id: build
+    steps:
+      - name: render
+        run: node scripts/build.mjs
+      - name: package
+        run: tar -czf dist/app-${{RELEASE_ID}}.tgz -C dist index.html
+        artifact: dist/*.tgz
+
+  - id: deploy
+    needs: [build]
+    steps:
+      - deploy:
+          target: demo
+          artifacts: [dist/*.tgz]
+          activate: symlink
+          keep: 3

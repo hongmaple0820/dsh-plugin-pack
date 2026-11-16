@@ -1,0 +1,558 @@
+/**
+ * `pipe.yml` parser and planner.
+ *
+ * Deliberately a restricted YAML subset: two-space indentation, maps, sequences, scalars,
+ * comments, inline arrays and quoted strings. Anchors, block scalars, flow maps and
+ * multi-document streams are rejected with a Chinese error that names the line.
+ */
+
+export class PipeError extends Error {
+  constructor(message, { line = 0, code = 'PIPE_INVALID' } = {}) {
+    super(line > 0 ? `第 ${line} 行：${message}` : message)
+    this.name = 'PipeError'
+    this.code = code
+    this.line = line
+  }
+}
+
+export const RUNTIME_VALUES = ['static', 'node', 'python', 'go', 'php', 'docker']
+const RUNTIME_SET = new Set(RUNTIME_VALUES)
+const APP_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._@:/-]*$/
+const HOST_FAILURE_VALUES = new Set(['stop', 'continue'])
+
+function quote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`
+}
+
+/**
+ * Runtime presets are only used when a target has neither `restart` nor `service`.
+ * Every generated command ends with `|| true` so a restart failure is reported by the
+ * health check / logs instead of aborting a half-applied multi-host release.
+ */
+export function defaultRestartCommand(runtime, app = '', fallbackName = '') {
+  const name = String(app || fallbackName || '').trim()
+  const q = name ? quote(name) : ''
+  if (runtime === 'node') {
+    return `pm2 restart ${q} || systemctl --user restart ${q} || sudo -n systemctl restart ${q} || true`
+  }
+  if (runtime === 'python' || runtime === 'go' || runtime === 'php') {
+    return `systemctl --user restart ${q} || sudo -n systemctl restart ${q} || true`
+  }
+  if (runtime === 'docker') {
+    return name
+      ? `docker restart ${q} || docker compose up -d --no-build || true`
+      : 'docker compose up -d --no-build || true'
+  }
+  return ''
+}
+
+const UNSUPPORTED_START = new Map([
+  ['&', '锚点（&）'],
+  ['*', '锚点引用（*）'],
+  ['|', '多行块（|）'],
+  ['>', '折叠块（>）'],
+  ['{', '流式 map（{…}）'],
+])
+
+function stripComment(text) {
+  let quote = null
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]
+    if (quote) {
+      if (ch === quote && text[i - 1] !== '\\') quote = null
+      continue
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue }
+    if (ch === '#' && (i === 0 || /\s/.test(text[i - 1]))) return text.slice(0, i).trimEnd()
+  }
+  return text.trimEnd()
+}
+
+function prepare(source) {
+  const rawLines = String(source).replace(/\r\n?/g, '\n').split('\n')
+  const lines = []
+  for (let index = 0; index < rawLines.length; index += 1) {
+    const withoutComment = stripComment(rawLines[index])
+    if (!withoutComment.trim()) continue
+    if (withoutComment.includes('\t')) throw new PipeError('缩进不能用制表符，请使用 2 个空格', { line: index + 1 })
+    const indent = withoutComment.length - withoutComment.trimStart().length
+    if (indent % 2 !== 0) throw new PipeError('缩进必须是 2 个空格的倍数', { line: index + 1 })
+    lines.push({ number: index + 1, indent, text: withoutComment.trim() })
+  }
+  return lines
+}
+
+function splitKeyValue(text, line) {
+  let quote = null
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]
+    if (quote) {
+      if (ch === quote && text[i - 1] !== '\\') quote = null
+      continue
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue }
+    if (ch === ':') {
+      if (i + 1 < text.length && text[i + 1] !== ' ') {
+        if (!/^[A-Za-z_]\w*$/.test(text.slice(0, i).trim())) continue
+      }
+      const key = text.slice(0, i).trim()
+      if (!key) throw new PipeError('缺少键名', { line })
+      if (!/^[A-Za-z_][\w-]*$/.test(key)) {
+        throw new PipeError(`不支持的键名 “${key}”（只允许字母、数字、下划线、短横线）`, { line })
+      }
+      return { key, rest: text.slice(i + 1).trim() }
+    }
+  }
+  return null
+}
+
+function parseQuoted(text, line) {
+  const quote = text[0]
+  if (text[text.length - 1] !== quote || text.length < 2) throw new PipeError('引号没有闭合', { line })
+  const body = text.slice(1, -1)
+  if (quote === "'") return body.replace(/''/g, "'")
+  try { return JSON.parse(`"${body.replace(/\\/g, '\\\\').replace(/\\"/g, '"').replace(/\\\\"/g, '\\"')}"`) } catch {
+    throw new PipeError('双引号字符串包含无法解析的转义', { line })
+  }
+}
+
+function splitInline(body, line) {
+  const parts = []
+  let quote = null
+  let start = 0
+  for (let i = 0; i < body.length; i += 1) {
+    const ch = body[i]
+    if (quote) {
+      if (ch === quote && body[i - 1] !== '\\') quote = null
+      continue
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue }
+    if (ch === ',') { parts.push(body.slice(start, i).trim()); start = i + 1 }
+  }
+  parts.push(body.slice(start).trim())
+  if (parts.some((part) => part === '')) throw new PipeError('内联数组里有空项', { line })
+  return parts
+}
+
+function parseScalar(text, line) {
+  const value = text.trim()
+  if (!value) return ''
+  const first = value[0]
+  if (first === '\'' || first === '"') {
+    if (value.length > 1 && value[value.length - 1] === first) return parseQuoted(value, line)
+    throw new PipeError('引号没有闭合', { line })
+  }
+  if (first === '[') {
+    if (value[value.length - 1] !== ']') throw new PipeError('内联数组缺少 ]', { line })
+    const body = value.slice(1, -1).trim()
+    return body ? splitInline(body, line).map((part) => parseScalar(part, line)) : []
+  }
+  if (UNSUPPORTED_START.has(first)) throw new PipeError(`暂不支持 ${UNSUPPORTED_START.get(first)}`, { line })
+  if (/^(true|True|TRUE)$/.test(value)) return true
+  if (/^(false|False|FALSE)$/.test(value)) return false
+  if (/^(null|Null|NULL|~)$/.test(value)) return null
+  if (/^-?\d+$/.test(value)) return Number(value)
+  if (/^-?\d+\.\d+$/.test(value)) return Number(value)
+  return value
+}
+
+function parseBlock(lines, index, indent) {
+  if (index >= lines.length) return { value: null, next: index }
+  const line = lines[index]
+  if (line.indent !== indent) throw new PipeError(`缩进不一致（预期 ${indent} 个空格）`, { line: line.number })
+  return line.text === '-' || line.text.startsWith('- ') ? parseSequence(lines, index, indent) : parseMap(lines, index, indent)
+}
+
+function parseMap(lines, index, indent, firstPair = null) {
+  const result = {}
+  let i = index
+  if (firstPair) {
+    const { key, rest, line } = firstPair
+    const nextLine = lines[i + 1]
+    if (!rest && nextLine && nextLine.indent > indent) {
+      const child = parseBlock(lines, i + 1, nextLine.indent)
+      result[key] = child.value
+      i = child.next
+    } else {
+      result[key] = rest ? parseScalar(rest, line) : null
+      i += 1
+    }
+  }
+  while (i < lines.length) {
+    const line = lines[i]
+    if (line.indent < indent) break
+    if (line.indent > indent) throw new PipeError(`缩进比同级多 ${line.indent - indent} 个空格`, { line: line.number })
+    if (line.text === '-' || line.text.startsWith('- ')) break
+    const pair = splitKeyValue(line.text, line.number)
+    if (!pair) throw new PipeError('这里应该是 “键: 值”', { line: line.number })
+    const { key, rest } = pair
+    if (Object.prototype.hasOwnProperty.call(result, key)) throw new PipeError(`重复的键 “${key}”`, { line: line.number })
+    const nextLine = lines[i + 1]
+    if (!rest && nextLine && nextLine.indent > indent) {
+      const child = parseBlock(lines, i + 1, nextLine.indent)
+      result[key] = child.value
+      i = child.next
+      continue
+    }
+    result[key] = rest ? parseScalar(rest, line.number) : null
+    i += 1
+  }
+  return { value: result, next: i }
+}
+
+function parseSequence(lines, index, indent) {
+  const list = []
+  let i = index
+  while (i < lines.length) {
+    const line = lines[i]
+    if (line.indent < indent) break
+    if (line.indent !== indent) throw new PipeError('序列项的缩进不一致', { line: line.number })
+    if (!(line.text === '-' || line.text.startsWith('- '))) break
+    const content = line.text === '-' ? '' : line.text.slice(2).trim()
+    if (!content) {
+      const nextLine = lines[i + 1]
+      if (nextLine && nextLine.indent > indent) {
+        const child = parseBlock(lines, i + 1, nextLine.indent)
+        list.push(child.value)
+        i = child.next
+      } else {
+        list.push(null)
+        i += 1
+      }
+      continue
+    }
+    const pair = splitKeyValue(content, line.number)
+    if (pair) {
+      const child = parseMap(lines, i, indent + 2, { ...pair, line: line.number })
+      list.push(child.value)
+      i = child.next
+      continue
+    }
+    list.push(parseScalar(content, line.number))
+    i += 1
+  }
+  return { value: list, next: i }
+}
+
+function asArray(value, label) {
+  if (value === undefined || value === null || value === '') return []
+  if (Array.isArray(value)) return value
+  if (typeof value === 'string') return [value]
+  throw new PipeError(`${label} 必须是数组`)
+}
+
+/** 主机选择器：`env:prod` / `group:api` / `tag:canary`（v0.5）。 */
+export const HOST_SELECTOR_RE = /^(env|group|tag):([a-z0-9._-]{1,32})$/
+const SELECTOR_PREFIX_RE = /^(env|group|tag):/
+
+/** 判断一个 hosts 条目是不是选择器（只做语法形状判断，不展开）。 */
+export function isHostSelector(value) {
+  return typeof value === 'string' && HOST_SELECTOR_RE.test(value.trim())
+}
+
+/** 拆选择器为 `{kind, name}`；不是合法选择器时返回 null。 */
+export function parseHostSelector(value) {
+  if (typeof value !== 'string') return null
+  const match = HOST_SELECTOR_RE.exec(value.trim())
+  return match ? { kind: match[1], name: match[2] } : null
+}
+
+/** 把 target.hosts 拆成 `{hosts, selectors}`（保持原顺序）。 */
+export function splitTargetHosts(hosts) {
+  const list = Array.isArray(hosts) ? hosts.map((host) => String(host).trim()).filter(Boolean) : []
+  return {
+    selectors: list.filter((host) => HOST_SELECTOR_RE.test(host)),
+    hostAliases: list.filter((host) => !HOST_SELECTOR_RE.test(host)),
+    entries: list,
+  }
+}
+
+function normalizeTarget(targetName, target) {
+  if (!target || typeof target !== 'object' || Array.isArray(target)) throw new PipeError(`target ${targetName} 必须是 map`)
+  const hosts = asArray(target.hosts, `target ${targetName} 的 hosts`).map((host) => {
+    if (typeof host !== 'string' || !host.trim()) throw new PipeError(`target ${targetName} 的 hosts 必须是非空字符串`)
+    const value = host.trim()
+    // 选择器只能校验语法：真正展开要等 dsh-remote 运行时（部署前）才知道主机清单。
+    if (HOST_SELECTOR_RE.test(value)) return value
+    if (SELECTOR_PREFIX_RE.test(value)) {
+      const [, kind] = SELECTOR_PREFIX_RE.exec(value)
+      throw new PipeError(`target ${targetName} 的 hosts 选择器 “${value}” 不合法（${kind}: 后只允许 1-32 位小写字母、数字、点、下划线、连字符）`)
+    }
+    return value
+  })
+  if (hosts.length === 0) throw new PipeError(`target ${targetName} 的 hosts 不能为空`)
+  if (new Set(hosts).size !== hosts.length) throw new PipeError(`target ${targetName} 的 hosts 有重复项`)
+
+  const runtime = target.runtime === undefined || target.runtime === null || target.runtime === ''
+    ? 'static'
+    : String(target.runtime).trim()
+  if (!RUNTIME_SET.has(runtime)) {
+    throw new PipeError(`target ${targetName} 的 runtime “${runtime}” 不支持（可用 ${RUNTIME_VALUES.join('、')}）`)
+  }
+  const app = target.app === undefined || target.app === null ? '' : String(target.app).trim()
+  if (app && !APP_PATTERN.test(app)) {
+    throw new PipeError(`target ${targetName} 的 app “${app}” 不合法（只允许字母、数字、点、下划线、@、:、/、-）`)
+  }
+  if ((runtime === 'node' || runtime === 'python' || runtime === 'php') && !app) {
+    throw new PipeError(`target ${targetName} 的 runtime ${runtime} 需要 app（服务名）`)
+  }
+
+  if (target.service !== undefined && (typeof target.service !== 'string' || !target.service.trim())) {
+    throw new PipeError(`target ${targetName} 的 service 必须是非空字符串`)
+  }
+  if (target.restart !== undefined && (typeof target.restart !== 'string' || !target.restart.trim())) {
+    throw new PipeError(`target ${targetName} 的 restart 必须是非空字符串`)
+  }
+  if (target.service && target.restart) throw new PipeError(`target ${targetName} 不能同时配置 service 与 restart`)
+
+  if (target.onHostFailure !== undefined && !HOST_FAILURE_VALUES.has(String(target.onHostFailure))) {
+    throw new PipeError(`target ${targetName} 的 onHostFailure 只有 stop 或 continue（收到 “${target.onHostFailure}”）`)
+  }
+  const onHostFailure = target.onHostFailure === 'continue' ? 'continue' : 'stop'
+
+  const path = target.path === undefined || target.path === null ? '' : String(target.path)
+  if (path && !path.startsWith('/')) throw new PipeError(`target ${targetName} 的 path 必须是绝对路径`)
+  const keep = target.keep === undefined || target.keep === null ? 5 : target.keep
+  if (!Number.isInteger(keep) || keep < 1) throw new PipeError(`target ${targetName} 的 keep 必须是正整数`)
+
+  if (target.health !== undefined && (typeof target.health !== 'object' || Array.isArray(target.health))) {
+    throw new PipeError(`target ${targetName} 的 health 必须是 map`)
+  }
+  if (target.health?.http !== undefined && typeof target.health.http !== 'string') {
+    throw new PipeError(`target ${targetName} 的 health.http 必须是字符串`)
+  }
+  if (target.health?.tries !== undefined && (!Number.isInteger(target.health.tries) || target.health.tries < 1)) {
+    throw new PipeError(`target ${targetName} 的 health.tries 必须是正整数`)
+  }
+  if (target.health?.interval !== undefined && !['string', 'number'].includes(typeof target.health.interval)) {
+    throw new PipeError(`target ${targetName} 的 health.interval 必须是字符串或数字`)
+  }
+
+  let canary = null
+  if (target.canary !== undefined && target.canary !== null && target.canary !== '') {
+    if (typeof target.canary !== 'object' || Array.isArray(target.canary)) {
+      throw new PipeError(`target ${targetName} 的 canary 必须是 map`)
+    }
+    const first = target.canary.first === undefined || target.canary.first === null ? 1 : target.canary.first
+    if (!Number.isInteger(first) || first < 1 || first > hosts.length) {
+      throw new PipeError(`target ${targetName} 的 canary.first 必须是 1-${hosts.length} 的整数`)
+    }
+    const waitSec = target.canary.waitSec === undefined || target.canary.waitSec === null ? 30 : target.canary.waitSec
+    if (!Number.isInteger(waitSec) || waitSec < 0 || waitSec > 3600) {
+      throw new PipeError(`target ${targetName} 的 canary.waitSec 必须是 0-3600 的整数`)
+    }
+    canary = { first, waitSec }
+  }
+
+  const restartCommand = target.restart || target.service ? '' : defaultRestartCommand(runtime, app, targetName)
+  return {
+    ...target,
+    hosts,
+    runtime,
+    app,
+    onHostFailure,
+    keep,
+    path,
+    restartCommand,
+    canary,
+  }
+}
+
+export function parsePipe(source, { path = 'pipe.yml' } = {}) {
+  if (typeof source !== 'string') throw new PipeError(`${path} 的内容必须是字符串`)
+  const lines = prepare(source)
+  if (lines.length === 0) throw new PipeError(`${path} 是空文件`)
+  const root = parseBlock(lines, 0, lines[0].indent).value
+  if (!root || typeof root !== 'object' || Array.isArray(root)) throw new PipeError('pipe 根节点必须是 map')
+
+  const version = root.version ?? 1
+  if (version !== 1) throw new PipeError(`不支持的 pipe 版本 ${version}（目前只支持 version: 1）`)
+  const name = typeof root.name === 'string' && root.name.trim() ? root.name.trim() : path
+  const vars = root.vars ?? {}
+  if (vars !== null && (typeof vars !== 'object' || Array.isArray(vars))) throw new PipeError('vars 必须是 map')
+  const targets = root.targets ?? {}
+  if (targets === null || typeof targets !== 'object' || Array.isArray(targets)) throw new PipeError('targets 必须是 map')
+  const stages = root.stages
+  if (!Array.isArray(stages) || stages.length === 0) throw new PipeError('stages 必须是非空数组')
+
+  const targetNames = new Set()
+  const normalizedTargets = {}
+  for (const [targetName, target] of Object.entries(targets)) {
+    normalizedTargets[targetName] = normalizeTarget(targetName, target)
+    targetNames.add(targetName)
+  }
+
+  const stageIds = new Set()
+  const normalizedStages = []
+  for (let stageIndex = 0; stageIndex < stages.length; stageIndex += 1) {
+    const stage = stages[stageIndex]
+    if (!stage || typeof stage !== 'object' || Array.isArray(stage)) throw new PipeError(`第 ${stageIndex + 1} 个 stage 必须是 map`)
+    const id = typeof stage.id === 'string' ? stage.id.trim() : ''
+    if (!id) throw new PipeError(`第 ${stageIndex + 1} 个 stage 缺少 id`)
+    if (stageIds.has(id)) throw new PipeError(`stage id “${id}” 重复`)
+    stageIds.add(id)
+    const needs = asArray(stage.needs, `stage ${id} 的 needs`).map((need) => {
+      if (typeof need !== 'string' || !need.trim()) throw new PipeError(`stage ${id} 的 needs 必须是非空字符串`)
+      return need.trim()
+    })
+    if (needs.includes(id)) throw new PipeError(`stage ${id} 的 needs 不能包含自己`)
+    const steps = stage.steps
+    if (!Array.isArray(steps) || steps.length === 0) throw new PipeError(`stage ${id} 的 steps 必须是非空数组`)
+    const normalizedSteps = steps.map((step, stepIndex) => {
+      if (!step || typeof step !== 'object' || Array.isArray(step)) throw new PipeError(`stage ${id} 的第 ${stepIndex + 1} 个 step 必须是 map`)
+      const hasRun = typeof step.run === 'string' && step.run.trim() !== ''
+      const hasDeploy = step.deploy !== undefined
+      if (!hasRun && !hasDeploy) throw new PipeError(`stage ${id} 的第 ${stepIndex + 1} 个 step 必须有 run 或 deploy`)
+      if (hasRun && hasDeploy) throw new PipeError(`stage ${id} 的第 ${stepIndex + 1} 个 step 不能同时有 run 与 deploy`)
+      if (hasDeploy) {
+        if (!step.deploy || typeof step.deploy !== 'object' || Array.isArray(step.deploy)) throw new PipeError(`stage ${id} 的第 ${stepIndex + 1} 个 deploy 必须是 map`)
+        if (typeof step.deploy.target !== 'string' || !step.deploy.target.trim()) throw new PipeError(`stage ${id} 的第 ${stepIndex + 1} 个 deploy 缺少 target`)
+        if (!targetNames.has(step.deploy.target.trim())) throw new PipeError(`stage ${id} 的第 ${stepIndex + 1} 个 deploy.target “${step.deploy.target}” 未定义`)
+        if (step.deploy.artifacts !== undefined) asArray(step.deploy.artifacts, `stage ${id} 第 ${stepIndex + 1} 个 deploy 的 artifacts`)
+      }
+      return step
+    })
+    normalizedStages.push({ ...stage, id, needs, steps: normalizedSteps })
+  }
+  for (const stage of normalizedStages) {
+    for (const need of stage.needs) if (!stageIds.has(need)) throw new PipeError(`stage ${stage.id} 的 needs 指向不存在的 stage “${need}”`)
+  }
+
+  return { version, name, vars: vars || {}, targets: normalizedTargets, stages: normalizedStages, path }
+}
+
+const VAR_PATTERN = /\$\{\{\s*([A-Za-z_]\w*)\s*\}\}/g
+
+export function interpolate(text, vars = {}) {
+  if (typeof text !== 'string') return text
+  return text.replace(VAR_PATTERN, (_match, name) => {
+    if (!Object.prototype.hasOwnProperty.call(vars, name)) throw new PipeError(`未定义变量 ${name}`, { code: 'PIPE_VAR' })
+    return String(vars[name] ?? '')
+  })
+}
+
+export function matchArtifacts(patterns, files) {
+  const list = Array.isArray(patterns) ? patterns : patterns === undefined || patterns === null ? [] : [patterns]
+  const candidates = (Array.isArray(files) ? files : []).map((file) => String(file).replace(/\\/g, '/').replace(/^\.\//, ''))
+  const regexes = list.map((pattern) => {
+    const source = String(pattern).replace(/\\/g, '/').replace(/^\.\//, '')
+    let regex = ''
+    for (let i = 0; i < source.length; i += 1) {
+      const ch = source[i]
+      if (ch === '*' && source[i + 1] === '*') {
+        if (source[i + 2] === '/') { regex += '(?:.*/)?'; i += 2 } else { regex += '.*'; i += 1 }
+      } else if (ch === '*') regex += '[^/]*'
+      else if (ch === '?') regex += '[^/]'
+      else regex += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    }
+    return new RegExp(`^${regex}$`)
+  })
+  return [...new Set(candidates.filter((file) => regexes.some((regex) => regex.test(file))))]
+}
+
+function parseDuration(value, fallbackSec = 600) {
+  if (value === undefined || value === null || value === '') return fallbackSec
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return Math.floor(value)
+  if (typeof value === 'string') {
+    const text = value.trim()
+    if (/^\d+$/.test(text)) return Number(text)
+    const match = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h)?$/.exec(text)
+    if (match) {
+      const factor = match[2] === 'ms' ? 0.001 : match[2] === 'm' ? 60 : match[2] === 'h' ? 3600 : 1
+      return Math.max(1, Math.floor(Number(match[1]) * factor))
+    }
+  }
+  throw new PipeError(`时长 “${value}” 无法解析（支持 30、30s、5m、1h）`)
+}
+
+function parseStageWhen(when) {
+  if (when === undefined || when === null || when === '') return null
+  if (typeof when !== 'string') throw new PipeError('when 必须是字符串', { code: 'PIPE_WHEN' })
+  const text = when.trim()
+  const match = /^(branch|tag|env|changed)\s*(==|!=)\s*(['"])(.*?)\3$/.exec(text)
+  if (match) return { kind: 'eq', field: match[1], operator: match[2], value: match[4] }
+  const changed = /^changed\s*:\s*(\S+)$/.exec(text)
+  if (changed) return { kind: 'changed', pattern: changed[1] }
+  throw new PipeError(`when 只支持 branch == 'x'、tag == 'x'、env == 'x'、changed == 'x' 或 changed: path/**（收到 “${text}”）`, { code: 'PIPE_WHEN' })
+}
+
+function evaluateWhen(condition, context) {
+  if (!condition) return true
+  if (condition.kind === 'changed') return matchArtifacts([condition.pattern], context.changed).length > 0
+  const equal = condition.field === 'changed'
+    ? matchArtifacts([condition.value], context.changed).length > 0
+    : String(context[condition.field] ?? '') === condition.value
+  return condition.operator === '!=' ? !equal : equal
+}
+
+function topological(stages) {
+  const byId = new Map(stages.map((stage) => [stage.id, stage]))
+  const result = []
+  const state = new Map()
+  const visit = (stage, trail) => {
+    if (state.get(stage.id) === 'done') return
+    if (state.get(stage.id) === 'visiting') throw new PipeError(`stage 依赖出现环：${[...trail, stage.id].join(' → ')}`)
+    state.set(stage.id, 'visiting')
+    for (const need of stage.needs) visit(byId.get(need), [...trail, stage.id])
+    state.set(stage.id, 'done')
+    result.push(stage)
+  }
+  for (const stage of stages) visit(stage, [])
+  return result
+}
+
+export function planPipeline(pipe, { project, target, env = {} } = {}) {
+  if (!pipe || !Array.isArray(pipe.stages)) throw new PipeError('planPipeline 需要 parsePipe 的结果')
+  const projectId = typeof project === 'string' ? project : project?.id || ''
+  const envContext = {
+    branch: env.branch ?? env.BRANCH ?? '',
+    tag: env.tag ?? env.TAG ?? '',
+    env: env.name ?? env.env ?? env.ENV ?? '',
+    changed: env.changed ?? [],
+  }
+  const vars = {
+    CI: '1',
+    PROJECT: projectId,
+    TARGET: target ?? env.target ?? '',
+    BRANCH: envContext.branch,
+    COMMIT: env.commit ?? env.COMMIT ?? '',
+    RELEASE_ID: env.releaseId ?? env.RELEASE_ID ?? '',
+    ...(pipe.vars || {}),
+    ...(env.vars || {}),
+  }
+  const included = new Set()
+  const result = []
+  for (const stage of topological(pipe.stages)) {
+    if (stage.needs.some((need) => !included.has(need))) continue
+    if (!evaluateWhen(parseStageWhen(stage.when), envContext)) continue
+    const steps = []
+    for (let index = 0; index < stage.steps.length; index += 1) {
+      const step = stage.steps[index]
+      if (!evaluateWhen(parseStageWhen(step.when), envContext)) continue
+      const kind = step.deploy !== undefined ? 'deploy' : 'run'
+      const deploy = step.deploy || null
+      const deployTarget = deploy?.target ? deploy.target.trim() : target
+      steps.push({
+        index,
+        name: typeof step.name === 'string' && step.name.trim() ? step.name.trim() : (kind === 'deploy' ? `部署 ${deployTarget || ''}` : `第 ${index + 1} 步`),
+        command: kind === 'deploy' ? `deploy:${deployTarget || ''}` : interpolate(step.run, vars),
+        kind,
+        when: typeof step.when === 'string' ? step.when : '',
+        manual: Boolean(step.manual ?? stage.manual),
+        timeoutSec: parseDuration(step.timeout),
+        retries: Number.isInteger(step.retries) && step.retries >= 0 ? step.retries : 0,
+        allowFailure: Boolean(step.allow_failure ?? step.allowFailure),
+        deploy: deploy ? {
+          target: deployTarget,
+          artifacts: asArray(deploy.artifacts, 'deploy.artifacts'),
+          activate: deploy.activate || 'symlink',
+          keep: Number.isInteger(deploy.keep) && deploy.keep > 0 ? deploy.keep : 5,
+        } : null,
+        source: step,
+      })
+    }
+    result.push({ id: stage.id, needs: stage.needs, manual: Boolean(stage.manual), steps })
+    included.add(stage.id)
+  }
+  return { name: pipe.name, vars, stages: result }
+}

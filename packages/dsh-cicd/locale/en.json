@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Pipelines",
+    "description": "Local-first lightweight CI/CD: read pipe.yml, build locally, ship to servers through dsh-remote, with rollback and run history"
+  }
+}

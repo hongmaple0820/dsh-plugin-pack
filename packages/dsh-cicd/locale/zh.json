@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "流水线",
+    "description": "本地优先的轻量 CI/CD：读 pipe.yml、本地构建、经 dsh-remote 发布到服务器、可回滚、有运行记录"
+  }
+}
