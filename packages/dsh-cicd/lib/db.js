@@ -13,8 +13,10 @@ export const DB_FILE_NAME = 'cicd.db'
  * 1 — 初始结构（runs/steps/artifacts/releases/operations）。
  * 2 — v0.5：releases 增加 env 列（记录发布落到哪个环境，便于按 env 过滤与审计）。
  * 3 — v0.6：operations 增加 action/project/target/host/release_id/status，支撑审计时间线。
+ * 4 — v2.0-M0：新增 projects 表（向导创建的项目持久化，独立于启动配置）；运行前从 git 回填 branch/commit_sha。
+ * 5 — v2.0-M2：steps 增加 runner_id 列（记录这一步在哪个执行面跑的：本地 local 或远端 runnerId）。
  */
-export const SCHEMA_VERSION = 3
+export const SCHEMA_VERSION = 5
 
 const DDL = [
   `CREATE TABLE IF NOT EXISTS runs (
@@ -92,6 +94,18 @@ const DDL = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_operations_run ON operations (run_id, id DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_operations_at ON operations (at DESC)`,
+  `CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    source_type TEXT NOT NULL DEFAULT 'local',
+    repo_url TEXT NOT NULL DEFAULT '',
+    default_branch TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
+    pipe_path TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_projects_name ON projects (name)`,
 ]
 
 const OPERATION_COLUMNS = [
@@ -121,6 +135,10 @@ function migrate(db) {
     if (!hasColumn(db, 'operations', name)) {
       db.exec(`ALTER TABLE operations ADD COLUMN ${name} ${definition}`)
     }
+  }
+  // v4 → v5：老库的 steps 没有 runner_id 列，CREATE TABLE IF NOT EXISTS 不会补，这里显式加。
+  if (!hasColumn(db, 'steps', 'runner_id')) {
+    db.exec(`ALTER TABLE steps ADD COLUMN runner_id TEXT NOT NULL DEFAULT ''`)
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_operations_at ON operations (at DESC)`)
   db.exec(`UPDATE operations SET action = kind WHERE action = '' AND kind <> ''`)

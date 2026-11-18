@@ -36,9 +36,9 @@ function healthSeconds(value, fallback = 2) {
 }
 
 // 不要 unref：健康检查的重试等待如果被 unref，脚本/短命进程会在等待期间把事件循环跑空
-const delay = (ms) => new Promise((resolve) => { setTimeout(resolve, ms) })
+export const delay = (ms) => new Promise((resolve) => { setTimeout(resolve, ms) })
 
-function logLine(onLog, line) {
+export function logLine(onLog, line) {
   try { onLog?.(line) } catch { /* observers must not break a deploy */ }
 }
 
@@ -115,7 +115,7 @@ async function cleanupReleases({ remote, host, targetPath, keep }) {
   return true
 }
 
-async function deployOne({
+export async function deployOne({
   remote,
   target,
   host,
@@ -313,7 +313,7 @@ export async function deployRelease({
   }
 }
 
-async function rollbackOne({ remote, target, host, releaseId, commit, onLog }) {
+export async function rollbackOne({ remote, target, host, releaseId, commit, onLog }) {
   const targetPath = String(target.path).replace(/\/+$/, '')
   const currentLink = `${targetPath}/current`
   let wanted = releaseId

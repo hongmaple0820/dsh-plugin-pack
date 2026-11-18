@@ -220,6 +220,37 @@ window.__ModuleLoader__.load({
 }
 .cicd-panel{display:flex;flex-direction:column;height:100%;min-height:0}
 .cicd-panel>.cicd-page{flex:1 1 auto;min-height:0}
+/* v2-M0：项目卡 git meta */
+.cicd-project-git{display:block;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cicd-project-git.is-dirty{color:var(--dsw-alias-state-warn-primary)}
+.cicd-view-editor,.cicd-view-create{min-width:56px}
+/* v2-M0：pipe.yml 编辑器 */
+.cicd-editor{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;gap:10px;box-sizing:border-box;padding:12px 16px 14px;overflow:hidden}
+.cicd-editor-head{flex:none;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.cicd-editor-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:var(--dsw-alias-label-tertiary);font-size:11.5px;line-height:16px}
+.cicd-editor-body{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;gap:8px}
+.cicd-editor-textarea{flex:1 1 auto;min-height:0;box-sizing:border-box;width:100%;padding:10px 12px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md, 8px);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;line-height:19px;resize:none;outline:none}
+.cicd-editor-textarea:focus{border-color:var(--dsw-alias-border-l4)}
+.cicd-editor-actions{flex:none;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.cicd-editor-status{flex:none;color:var(--dsw-alias-label-secondary);font-size:11.5px;line-height:16px;overflow-wrap:anywhere}
+.cicd-editor-status.is-error{color:var(--dsw-alias-state-error-primary)}
+.cicd-editor-status.is-ok{color:var(--dsw-alias-state-success-primary)}
+.cicd-editor-result{flex:none;margin:0;padding:8px 10px;border:.5px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:11.5px;line-height:17px;overflow-wrap:anywhere}
+.cicd-editor-result.is-error{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}
+/* v2-M0：新建向导 */
+.cicd-create{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;box-sizing:border-box;padding:12px 16px 14px}
+.cicd-create-form{display:flex;flex-direction:column;gap:14px;max-width:560px}
+.cicd-form-field{display:flex;flex-direction:column;gap:4px}
+.cicd-form-label{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;font-weight:600}
+.cicd-form-hint{margin:0;color:var(--dsw-alias-label-dimmed);font-size:11px;line-height:15px}
+.cicd-form-input{box-sizing:border-box;width:100%;height:28px;padding:0 8px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:12.5px;line-height:18px;outline:none}
+.cicd-form-input:focus{border-color:var(--dsw-alias-border-l4)}
+.cicd-form-radio-group{display:flex;gap:8px;flex-wrap:wrap}
+.cicd-form-radio{appearance:none;box-sizing:border-box;display:inline-flex;align-items:center;height:28px;padding:0 12px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;line-height:18px;cursor:pointer}
+.cicd-form-radio:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.cicd-form-radio[aria-pressed="true"]{border-color:var(--dsw-alias-border-l4);background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-primary)}
+.cicd-create-kinds{display:flex;gap:8px;flex-wrap:wrap}
+.cicd-create-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:2px}
 `
 
     /** 运行 / 阶段状态 → 中文徽标文案。 */
@@ -261,6 +292,15 @@ window.__ModuleLoader__.load({
       'canary-hold': 'running',
       notify: 'skipped',
     }
+
+    /** v2-M0：新建向导的脚手架模板清单（与 Host 端 lib/scaffold.js 的 SCAFFOLD_KINDS 一一对应）。 */
+    const SCAFFOLD_KINDS = [
+      { id: 'static', name: '静态站点', description: '打包成 tgz 上传，不重启服务' },
+      { id: 'node', name: 'Node.js', description: 'npm 构建 + pm2 重启' },
+      { id: 'python', name: 'Python', description: 'pip 安装 + systemd --user 重启' },
+      { id: 'go', name: 'Go', description: 'go build 出二进制' },
+      { id: 'bare', name: '空白模板', description: '只有一段 echo，改造成自己的流程' },
+    ]
 
     const TIME_FORMAT = new Intl.DateTimeFormat('zh-CN', {
       timeZone: 'Asia/Shanghai',
@@ -314,6 +354,20 @@ window.__ModuleLoader__.load({
       } catch (error) {
         // 隐私模式 / 存储被禁用时静默跳过：这次选择仍然生效，只是不持久化。
       }
+    }
+
+    /** v2-M0：从 /project-meta 的返回里拼出项目卡上的 git 元信息行（分支 · 提交 · tag · 是否脏）。 */
+    function projectGitMeta(meta) {
+      if (!meta || meta.status !== 'ready' || !meta.data) return { text: '', dirty: false, isRepo: false }
+      const data = meta.data
+      const parts = []
+      if (data.isRepo) {
+        if (data.branch) parts.push(data.branch)
+        if (data.commitShort || data.commit) parts.push(data.commitShort || data.commit)
+        if (data.tag) parts.push('tag ' + data.tag)
+      }
+      if (data.dirty) parts.push('已改动')
+      return { text: parts.join(' · '), dirty: Boolean(data.dirty), isRepo: Boolean(data.isRepo) }
     }
 
     /** 把 stage 树摊平成时间线行：stage 标题行 + 每步一行（状态点 / 耗时 / 一行摘要）。 */
@@ -553,7 +607,7 @@ window.__ModuleLoader__.load({
     }
 
     /** 左列「阶段 / 目标」：项目列表 + 计划（阶段树）+ 目标矩阵。 */
-    function OverviewColumn({ projects, projectId, onSelectProject, plan, onClosePlan, onPlanRetry, targets, targetName, onSelectTarget }) {
+    function OverviewColumn({ projects, projectId, projectMetas, onSelectProject, plan, onClosePlan, onPlanRetry, targets, targetName, onSelectTarget }) {
       return h('section', { className: 'cicd-col cicd-col-overview' },
         h('div', { className: 'cicd-col-head' },
           h('span', { className: 'cicd-col-title' }, '阶段 / 目标'),
@@ -566,18 +620,24 @@ window.__ModuleLoader__.load({
             ? h(EmptyState, { text: '还没有项目：先在目标机器上放一个 pipe.yml，再点刷新。' })
             : null,
           projects.status === 'ready' && projects.items.length > 0
-            ? projects.items.map((project) => h('div', { key: project.id },
-              h('button', {
-                className: 'cicd-target-row' + (project.id === projectId ? ' is-active' : ''),
-                type: 'button',
-                onClick: () => onSelectProject(project.id),
-                title: project.path,
-              },
-              h('span', { className: 'cicd-target-name' }, project.name || project.id),
-              h('span', { className: 'cicd-target-meta' }, projectHasPipe(project) ? projectPipePath(project) : '缺少 pipe.yml：' + (project.error || '文件不存在')),
-              projectHasPipe(project)
-                ? null
-                : h('p', { className: 'cicd-note' }, '这个项目没有可用的 pipe.yml，计划与运行都会被拒绝。'))))
+            ? projects.items.map((project) => {
+              const git = projectGitMeta(projectMetas && projectMetas[project.id])
+              return h('div', { key: project.id },
+                h('button', {
+                  className: 'cicd-target-row' + (project.id === projectId ? ' is-active' : ''),
+                  type: 'button',
+                  onClick: () => onSelectProject(project.id),
+                  title: project.path,
+                },
+                h('span', { className: 'cicd-target-name' }, project.name || project.id),
+                h('span', { className: 'cicd-target-meta' }, projectHasPipe(project) ? projectPipePath(project) : '缺少 pipe.yml：' + (project.error || '文件不存在')),
+                git.text
+                  ? h('span', { className: 'cicd-project-git' + (git.dirty ? ' is-dirty' : ''), title: 'git：' + git.text }, git.text)
+                  : null,
+                projectHasPipe(project)
+                  ? null
+                  : h('p', { className: 'cicd-note' }, '这个项目没有可用的 pipe.yml，计划与运行都会被拒绝。')))
+            })
             : null,
           h('div', { className: 'cicd-section-title', style: { marginTop: '4px' } }, '阶段'),
           plan
@@ -976,6 +1036,123 @@ window.__ModuleLoader__.load({
           : null)
     }
 
+    /** v2-M0：pipe.yml 校验 / 保存的结果（成功显示 name/version/targets/stages，失败显示错误码与行号）。 */
+    function PipeValidateResult({ state }) {
+      if (!state || state.status === 'loading') return null
+      if (state.status === 'error') {
+        const error = state.error
+        return h('p', { className: 'cicd-editor-result is-error', role: 'alert' },
+          (error && error.message) || '校验失败',
+          error && error.code ? ' · ' + error.code : '',
+          error && error.line ? ' · 第 ' + error.line + ' 行' : '')
+      }
+      const data = state.data || {}
+      const targets = Array.isArray(data.targets) ? data.targets : []
+      const stages = Array.isArray(data.stages) ? data.stages : []
+      return h('p', { className: 'cicd-editor-result', role: 'status' },
+        '校验通过 · ' + (data.name || '未命名') +
+        (data.version ? ' · version ' + data.version : '') +
+        ' · ' + targets.length + ' 个目标 · ' + stages.length + ' 个阶段')
+    }
+
+    /** v2-M0：pipe.yml 编辑器视图。 */
+    function EditorView({ editor, editorValidate, editorSave, projectId, busy, hasTarget, onReload, onChange, onValidate, onSave, onDryRun }) {
+      const loading = editor.status === 'loading'
+      const source = editor.source || ''
+      return h('div', { className: 'cicd-editor' },
+        h('div', { className: 'cicd-editor-head' },
+          h('span', { className: 'cicd-col-title' }, '编辑器' + (projectId ? ' · ' + projectId : '')),
+          h('span', { className: 'cicd-editor-meta' },
+            editor.dirty ? h('span', { className: 'cicd-status is-running' }, '未保存') : null,
+            h('button', { className: 'cicd-button', type: 'button', onClick: onReload, disabled: loading || busy }, loading ? '读取…中' : '重新读取'))),
+        editor.status === 'error' ? h(ErrorState, { error: editor.error, onRetry: onReload }) : null,
+        loading ? h(LoadingState, { text: '正在读取 pipe.yml…' }) : null,
+        editor.status !== 'error' && !loading
+          ? h('div', { className: 'cicd-editor-body' },
+            h('textarea', {
+              className: 'cicd-editor-textarea',
+              value: source,
+              onChange: (event) => onChange(event.currentTarget.value),
+              spellCheck: false,
+              'aria-label': 'pipe.yml 源码',
+              placeholder: '在这里编辑 pipe.yml…',
+            }),
+            h('div', { className: 'cicd-editor-actions' },
+              h('button', { className: 'cicd-button', type: 'button', onClick: onValidate, disabled: busy || loading }, '校验'),
+              h('button', { className: 'cicd-button cicd-button-primary', type: 'button', onClick: onSave, disabled: busy || loading || !editor.dirty }, '保存'),
+              h('button', { className: 'cicd-button cicd-dry-run', type: 'button', onClick: onDryRun, disabled: busy || !hasTarget, title: hasTarget ? '用上方选中的目标做一次干跑' : '先在上方选择目标' }, '干跑')),
+            editorSave && editorSave.status === 'done'
+              ? h('span', { className: 'cicd-editor-status is-ok', role: 'status' }, editorSave.message)
+              : null,
+            editorSave && editorSave.status === 'error'
+              ? h('span', { className: 'cicd-editor-status is-error', role: 'alert' }, editorSave.message)
+              : null,
+            h(PipeValidateResult, { state: editorValidate }))
+          : null)
+    }
+
+    /** v2-M0：新建项目向导（来源二选一 + 脚手架模板）。 */
+    function CreateView({ state, busy, onSubmit }) {
+      const [sourceType, setSourceType] = useState('local')
+      const [name, setName] = useState('')
+      const [path, setPath] = useState('')
+      const [repoUrl, setRepoUrl] = useState('')
+      const [branch, setBranch] = useState('')
+      const [kind, setKind] = useState('static')
+
+      const canSubmit = sourceType === 'local'
+        ? (name.trim() !== '' || path.trim() !== '')
+        : repoUrl.trim() !== ''
+
+      const submit = useCallback(() => {
+        onSubmit({ sourceType, name: name.trim(), path: path.trim(), repoUrl: repoUrl.trim(), branch: branch.trim(), kind })
+      }, [sourceType, name, path, repoUrl, branch, kind, onSubmit])
+
+      return h('div', { className: 'cicd-create' },
+        h('div', { className: 'cicd-create-form' },
+          h('div', { className: 'cicd-section-title' }, '新建项目'),
+          h('div', { className: 'cicd-form-field' },
+            h('span', { className: 'cicd-form-label' }, '来源'),
+            h('div', { className: 'cicd-form-radio-group' },
+              h('button', { className: 'cicd-form-radio', type: 'button', 'aria-pressed': sourceType === 'local', onClick: () => setSourceType('local') }, '本地目录'),
+              h('button', { className: 'cicd-form-radio', type: 'button', 'aria-pressed': sourceType === 'git', onClick: () => setSourceType('git') }, 'Git 仓库'))),
+          h('div', { className: 'cicd-form-field' },
+            h('span', { className: 'cicd-form-label' }, '项目名'),
+            h('input', { className: 'cicd-form-input', value: name, onChange: (event) => setName(event.currentTarget.value), placeholder: '例如 my-app（缺省用目录名 / 仓库名）' })),
+          sourceType === 'local'
+            ? h('div', { className: 'cicd-form-field' },
+              h('span', { className: 'cicd-form-label' }, '本地目录'),
+              h('input', { className: 'cicd-form-input', value: path, onChange: (event) => setPath(event.currentTarget.value), placeholder: '例如 D:/work/my-app（会在这里生成 pipe.yml）' }),
+              h('p', { className: 'cicd-form-hint' }, '目录不存在会自动创建；已登记过的目录也可以重新选。'))
+            : h('div', { className: 'cicd-form-field' },
+              h('span', { className: 'cicd-form-label' }, 'Git 仓库地址'),
+              h('input', { className: 'cicd-form-input', value: repoUrl, onChange: (event) => setRepoUrl(event.currentTarget.value), placeholder: 'git@github.com:you/repo.git 或 https://…' }),
+              h('span', { className: 'cicd-form-label', style: { marginTop: '6px' } }, '分支（可选）'),
+              h('input', { className: 'cicd-form-input', value: branch, onChange: (event) => setBranch(event.currentTarget.value), placeholder: '缺省用仓库默认分支' })),
+          h('div', { className: 'cicd-form-field' },
+            h('span', { className: 'cicd-form-label' }, '脚手架模板'),
+            h('div', { className: 'cicd-create-kinds' },
+              SCAFFOLD_KINDS.map((item) => h('button', {
+                key: item.id,
+                className: 'cicd-form-radio',
+                type: 'button',
+                'aria-pressed': kind === item.id,
+                onClick: () => setKind(item.id),
+                title: item.description || '',
+              }, item.name)))),
+          h('div', { className: 'cicd-create-actions' },
+            h('button', { className: 'cicd-button cicd-button-primary', type: 'button', onClick: submit, disabled: busy || !canSubmit }, busy ? '创建…中' : '创建并登记'),
+            state.status === 'done' && state.result
+              ? h('span', { className: 'cicd-editor-status is-ok', role: 'status' }, '已创建 ' + (state.result.name || state.result.id))
+              : null,
+            state.status === 'error' && state.error
+              ? h('span', { className: 'cicd-editor-status is-error', role: 'alert' }, (state.error.message || '创建失败'))
+              : null),
+          state.status === 'error' && state.error && state.error.code
+            ? h('p', { className: 'cicd-editor-result is-error' }, state.error.code + (state.error.line ? ' · 第 ' + state.error.line + ' 行' : ''))
+            : null))
+    }
+
     function CicdPage() {
       const [projects, setProjects] = useState({ status: 'loading', items: [], error: null })
       const [projectId, setProjectId] = useState('')
@@ -1001,6 +1178,17 @@ window.__ModuleLoader__.load({
       /** v0.6 B：测试通知的内联结果（不弹窗）。 */
       const [notify, setNotify] = useState({ status: 'idle', message: '', failed: false })
       const [notifyArmed, setNotifyArmed] = useState(false)
+      /** v2-M0：项目卡上的 git meta（{ [projectId]: { status, data | error } }）。 */
+      const [projectMetas, setProjectMetas] = useState({})
+      /** v2-M0：编辑器状态（source / dirty / status / error）。 */
+      const [editor, setEditor] = useState({ status: 'idle', source: '', loaded: false, dirty: false, error: null })
+      const [editorValidate, setEditorValidate] = useState(null)
+      const [editorSave, setEditorSave] = useState(null)
+      /** v2-M0：新建向导的提交结果。 */
+      const [create, setCreate] = useState({ status: 'idle', error: null, result: null })
+      /** v2-M2：构建主机（runner）下拉。 */
+      const [runners, setRunners] = useState({ status: 'idle', items: [], error: null })
+      const [runnerId, setRunnerId] = useState('')
 
       /** 每类请求各自一个 controller：轮询时 runs 与 log 一起发，不能互相 abort。 */
       const aborters = useRef({})
@@ -1030,6 +1218,22 @@ window.__ModuleLoader__.load({
         if (notifyTimer.current) clearTimeout(notifyTimer.current)
       }, [])
 
+      /** v2-M0：并行拉每个项目的 /project-meta，喂给项目卡（分支 · 提交 · tag · 是否脏）。 */
+      const loadProjectMetas = useCallback(async (items) => {
+        const list = Array.isArray(items) ? items : []
+        await Promise.all(list.map(async (project) => {
+          const id = project && project.id
+          if (!id) return
+          try {
+            const payload = await callApi('project-meta', { project: id }, freshSignal('meta:' + id))
+            setProjectMetas((prev) => ({ ...prev, [id]: { status: 'ready', data: payload } }))
+          } catch (error) {
+            if (error && error.name === 'AbortError') return
+            setProjectMetas((prev) => ({ ...prev, [id]: { status: 'error', error } }))
+          }
+        }))
+      }, [freshSignal])
+
       const loadProjects = useCallback(async () => {
         setProjects({ status: 'loading', items: [], error: null })
         try {
@@ -1044,11 +1248,13 @@ window.__ModuleLoader__.load({
             const usable = items.find((project) => projectHasPipe(project)) || items[0]
             return usable ? usable.id : ''
           })
+          // v2-M0：项目列表就绪后并行拉 git meta，喂给项目卡。
+          void loadProjectMetas(items)
         } catch (error) {
           if (error && error.name === 'AbortError') return
           setProjects({ status: 'error', items: [], error })
         }
-      }, [freshSignal])
+      }, [freshSignal, loadProjectMetas])
 
       const loadTargets = useCallback(async (id) => {
         if (!id) {
@@ -1130,9 +1336,28 @@ window.__ModuleLoader__.load({
         }
       }, [freshSignal, projectId])
 
+      /** v2-M2：构建主机（runner）列表。Host 没有 /runners 时按「未升级」处理，UI 仍可选本机。 */
+      const loadRunners = useCallback(async () => {
+        setRunners((prev) => ({ status: 'loading', items: prev.items, error: null }))
+        try {
+          const payload = await callApi('runners', {}, freshSignal('runners'))
+          const items = Array.isArray(payload.runners) ? payload.runners : []
+          setRunners({ status: 'ready', items, error: null })
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          if (error && (error.status === 404 || error.code === 'NOT_FOUND')) {
+            setRunners({ status: 'idle', items: [], error: null, unsupported: true })
+            return
+          }
+          setRunners({ status: 'error', items: [], error })
+        }
+      }, [freshSignal])
+
       useEffect(() => { void loadProjects() }, [loadProjects])
       useEffect(() => { void loadTargets(projectId) }, [projectId, loadTargets])
       useEffect(() => { void loadRuns(projectId, false) }, [projectId, loadRuns])
+      // v2-M2：构建主机下拉，进页面拉一次；失败（404）时 UI 退回本机执行。
+      useEffect(() => { void loadRunners() }, [loadRunners])
       // 右列 Releases 常驻，切目标或切项目都要重新拉这一份。
       useEffect(() => {
         if (targetName) void loadReleases(targetName)
@@ -1206,7 +1431,9 @@ window.__ModuleLoader__.load({
         try {
           // Host 的 /run 是写路由：即便干跑也要 confirm=1，否则一律 400「写操作需要 confirm=1」。
           // v0.5：目标展开后含 env=prod 的主机时，Host 只认 confirm=prod（409 PROD_CONFIRM_REQUIRED）。
+          // v2-M2：选了构建主机时带 runner=<id>，Host 走拉取式 runner 执行；不选则本机。
           const params = { project: projectId, target: targetName, confirm: confirmProd ? 'prod' : 1, dryRun: dryRun ? 1 : 0 }
+          if (runnerId) params.runner = runnerId
           const payload = await callApi('run', params, freshSignal('run'))
           const run = runOfPayload(payload)
           setAction({
@@ -1232,7 +1459,7 @@ window.__ModuleLoader__.load({
         } finally {
           setBusy(false)
         }
-      }, [projectId, targetName, freshSignal, loadRuns, loadLog])
+      }, [projectId, targetName, runnerId, freshSignal, loadRuns, loadLog])
 
       const requestRun = useCallback(() => {
         if (armed) {
@@ -1320,6 +1547,92 @@ window.__ModuleLoader__.load({
         clearRollback()
         setView((current) => (current === 'audit' ? 'run' : 'audit'))
       }, [clearRollback])
+
+      /** v2-M0：编辑器视图开关（与「发布」「审计」互斥）。 */
+      const toggleEditor = useCallback(() => {
+        clearRollback()
+        setView((current) => (current === 'editor' ? 'run' : 'editor'))
+      }, [clearRollback])
+
+      /** v2-M0：新建向导视图开关（与「发布」「审计」「编辑」互斥）。 */
+      const toggleCreate = useCallback(() => {
+        clearRollback()
+        setView((current) => (current === 'create' ? 'run' : 'create'))
+      }, [clearRollback])
+
+      /** v2-M0：进入编辑器时从 /project-meta 拉 pipeSource。 */
+      const loadEditor = useCallback(async (id) => {
+        if (!id) {
+          setEditor({ status: 'idle', source: '', loaded: false, dirty: false, error: null })
+          setEditorValidate(null)
+          setEditorSave(null)
+          return
+        }
+        setEditor({ status: 'loading', source: '', loaded: false, dirty: false, error: null })
+        setEditorValidate(null)
+        setEditorSave(null)
+        try {
+          const payload = await callApi('project-meta', { project: id }, freshSignal('editor'))
+          setEditor({ status: 'ready', source: payload.pipeSource || '', loaded: true, dirty: false, error: null })
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          setEditor({ status: 'error', source: '', loaded: false, dirty: false, error })
+        }
+      }, [freshSignal])
+
+      /** v2-M0：校验当前 textarea 内容（/validate?source=）。校验失败会抛 ApiError（带 code/line）。 */
+      const runEditorValidate = useCallback(async () => {
+        setEditorValidate({ status: 'loading' })
+        try {
+          const payload = await callApi('validate', { source: editor.source || '' }, freshSignal('validate'))
+          setEditorValidate({ status: 'ok', data: payload })
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          setEditorValidate({ status: 'error', error })
+        }
+      }, [editor.source, freshSignal])
+
+      /** v2-M0：保存 pipe.yml（/pipe-save confirm=1），成功后刷新目标与计划。 */
+      const runEditorSave = useCallback(async () => {
+        setEditorSave({ status: 'running', message: '' })
+        try {
+          const payload = await callApi('pipe-save', { project: projectId, source: editor.source || '', confirm: 1 }, freshSignal('pipe-save'))
+          setEditorSave({ status: 'done', message: '已保存 ' + (payload.path || 'pipe.yml') })
+          setEditor((prev) => ({ ...prev, dirty: false }))
+          setEditorValidate({ status: 'ok', data: payload })
+          // pipe 变了，目标可能跟着变：刷新目标并清掉旧计划。
+          setPlan(null)
+          if (projectId) void loadTargets(projectId)
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          setEditorSave({ status: 'error', message: '保存失败：' + ((error && error.message) || '未知错误') })
+        }
+      }, [editor.source, projectId, freshSignal, loadTargets])
+
+      /** v2-M0：提交新建项目（/project-create confirm=1），成功后选中新项目并回到运行视图。 */
+      const submitCreate = useCallback(async (form) => {
+        setCreate({ status: 'running', error: null, result: null })
+        try {
+          const payload = await callApi('project-create', { ...form, confirm: 1 }, freshSignal('project-create'))
+          setCreate({ status: 'done', error: null, result: payload })
+          // 记住并选中新项目；loadProjects 会把它带进列表并保留当前选中。
+          if (payload && payload.id) writeStoredProject(payload.id)
+          if (payload && payload.id) setProjectId(payload.id)
+          setPlan(null)
+          setRunDetail(null)
+          setTargetName('')
+          setView('run')
+          void loadProjects()
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          setCreate({ status: 'error', error, result: null })
+        }
+      }, [freshSignal, loadProjects])
+
+      useEffect(() => {
+        if (view !== 'editor') return
+        void loadEditor(projectId)
+      }, [view, projectId, loadEditor])
 
       const clearNotifyArmed = useCallback(() => {
         if (notifyTimer.current) {
@@ -1464,6 +1777,17 @@ window.__ModuleLoader__.load({
             ? h('option', { value: '' }, '（没有目标）')
             : targets.items.map((target) => h('option', { key: target.name, value: target.name }, target.name)))),
         h('div', { className: 'cicd-toolbar-group' },
+          h('span', { className: 'cicd-label' }, '构建主机'),
+          h('select', {
+            className: 'cicd-select cicd-runner-select',
+            value: runnerId,
+            disabled: runners.status === 'error',
+            onChange: (event) => setRunnerId(event.currentTarget.value),
+            'aria-label': '选择构建主机（执行面）',
+          },
+            h('option', { value: '' }, '本机（Host）'),
+            runners.items.map((runner) => h('option', { key: runner.runnerId, value: runner.runnerId }, runner.runnerId + (runner.status === 'offline' ? '（离线）' : '')))),
+        h('div', { className: 'cicd-toolbar-group' },
           h('button', { className: 'cicd-button cicd-plan-open', type: 'button', onClick: runPlan, disabled: busy || !targetName || Boolean(plan && plan.status === 'loading') }, plan && plan.status === 'loading' ? '计划…中' : '计划'),
           h('button', { className: 'cicd-button cicd-dry-run', type: 'button', onClick: () => void startRun(true), disabled: busy || !targetName }, busy ? '干跑…中' : '干跑'),
           h('button', {
@@ -1486,6 +1810,18 @@ window.__ModuleLoader__.load({
             onClick: toggleAudit,
           }, view === 'audit' ? '回到运行' : '审计'),
           h('button', {
+            className: 'cicd-button cicd-view-editor',
+            type: 'button',
+            'aria-pressed': view === 'editor',
+            onClick: toggleEditor,
+          }, view === 'editor' ? '回到运行' : '编辑'),
+          h('button', {
+            className: 'cicd-button cicd-view-create',
+            type: 'button',
+            'aria-pressed': view === 'create',
+            onClick: toggleCreate,
+          }, view === 'create' ? '回到运行' : '新建'),
+          h('button', {
             className: 'cicd-button cicd-notify-test' + (notifyArmed ? ' cicd-button-armed' : ''),
             type: 'button',
             'aria-pressed': notifyArmed,
@@ -1507,8 +1843,9 @@ window.__ModuleLoader__.load({
           ? h('span', { className: 'cicd-hint' }, '点「确认测试」会真的向配置的 webhook 发一条测试消息（8 秒内有效）。')
           : null,
         armed
-          ? h('span', { className: 'cicd-hint' }, '会真的执行本地命令并部署到 ' + targetName + '，继续？10 秒内再点一次「确认运行」。')
-          : null)
+          ? h('span', { className: 'cicd-hint' }, '会真的执行本地命令并部署到 ' + targetName + (runnerId ? '（构建主机：' + runnerId + '）' : '') + '，继续？10 秒内再点一次「确认运行」。')
+          : null
+      ))
 
       const body = view === 'audit'
         ? h(AuditView, {
@@ -1526,10 +1863,31 @@ window.__ModuleLoader__.load({
           onRollback: (release) => void requestRollback(release),
           busy,
         })
+        : view === 'editor'
+        ? h(EditorView, {
+          editor,
+          editorValidate,
+          editorSave,
+          projectId,
+          busy,
+          hasTarget: Boolean(targetName),
+          onReload: () => void loadEditor(projectId),
+          onChange: (source) => { setEditor((prev) => ({ ...prev, source, dirty: true })); setEditorValidate(null); setEditorSave(null) },
+          onValidate: () => void runEditorValidate(),
+          onSave: () => void runEditorSave(),
+          onDryRun: () => void startRun(true),
+        })
+        : view === 'create'
+        ? h(CreateView, {
+          state: create,
+          busy: create.status === 'running',
+          onSubmit: (form) => void submitCreate(form),
+        })
         : h('div', { className: 'cicd-columns' },
           h(OverviewColumn, {
             projects: { ...projects, retry: () => void loadProjects() },
             projectId,
+            projectMetas,
             onSelectProject,
             plan,
             onClosePlan: () => setPlan(null),

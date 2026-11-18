@@ -3,10 +3,10 @@
  * stage DAG serially. M1 has no parallelism by design.
  */
 
-import { spawn } from 'node:child_process'
 import { appendFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { planPipeline } from './pipe.js'
+import { createLocalExecutor } from './executors.js'
 
 export function makeRunId(now = new Date(), random = Math.random) {
   const pad = (value) => String(value).padStart(2, '0')
@@ -15,84 +15,12 @@ export function makeRunId(now = new Date(), random = Math.random) {
   return `${stamp}-${suffix}`
 }
 
-function killTree(child) {
-  if (!child?.pid) return
-  if (process.platform === 'win32') {
-    try { spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }) } catch { /* best effort */ }
-    return
-  }
-  try { process.kill(-child.pid, 'SIGTERM') } catch { try { child.kill('SIGTERM') } catch { /* gone */ } }
-  setTimeout(() => {
-    try { process.kill(-child.pid, 'SIGKILL') } catch { /* gone */ }
-  }, 2000).unref?.()
-}
-
-function createLineSplitter(emit) {
-  let rest = ''
-  return {
-    push(chunk) {
-      rest += chunk
-      let index
-      while ((index = rest.indexOf('\n')) >= 0) {
-        const line = rest.slice(0, index).replace(/\r$/, '')
-        rest = rest.slice(index + 1)
-        emit(line)
-      }
-    },
-    flush() {
-      if (rest) emit(rest.replace(/\r$/, ''))
-      rest = ''
-    },
-  }
-}
-
-function spawnStep({ command, cwd, env, timeoutMs, onLine }) {
-  return new Promise((resolve) => {
-    const startedAt = Date.now()
-    let child
-    try {
-      child = spawn(command, {
-        shell: true,
-        cwd,
-        env,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        detached: process.platform !== 'win32',
-        windowsHide: true,
-      })
-    } catch (error) {
-      resolve({ status: 'failed', exitCode: -1, durationMs: 0, timedOut: false, error: error.message })
-      return
-    }
-    let timedOut = false
-    let settled = false
-    let timer = null
-    const stdout = createLineSplitter(onLine)
-    const stderr = createLineSplitter(onLine)
-    const finish = (result) => {
-      if (settled) return
-      settled = true
-      if (timer) clearTimeout(timer)
-      stdout.flush()
-      stderr.flush()
-      resolve({ ...result, durationMs: Date.now() - startedAt, timedOut })
-    }
-    if (timeoutMs > 0) {
-      timer = setTimeout(() => {
-        timedOut = true
-        killTree(child)
-      }, timeoutMs)
-    }
-    child.stdout?.setEncoding('utf8')
-    child.stderr?.setEncoding('utf8')
-    child.stdout?.on('data', (chunk) => stdout.push(chunk))
-    child.stderr?.on('data', (chunk) => stderr.push(chunk))
-    child.on('error', (error) => finish({ status: 'failed', exitCode: -1, error: error.message }))
-    child.on('close', (code, signal) => {
-      const exitCode = Number.isInteger(code) ? code : -1
-      const status = !timedOut && exitCode === 0 ? 'success' : 'failed'
-      finish({ status, exitCode, signal: signal || '', error: timedOut ? `步骤超时（${Math.round(timeoutMs / 1000)}s）` : '' })
-    })
-  })
+/**
+ * 默认本地执行面：spawn 子进程（V2-M2 把执行面抽成 Executor，runner.js 只依赖 execute/kill/active）。
+ * 宿主（index.js）可用 createRemoteExecutor 替换：远端 runner 领任务 → 本地 spawn → 回报 log/result。
+ */
+function createDefaultExecutor() {
+  return createLocalExecutor()
 }
 
 function selectedStages(plan, stage) {
@@ -127,9 +55,15 @@ export async function runPipeline({
   stepTimeoutSec = 0,
   now = new Date(),
   random = Math.random,
+  hub = null,
+  signal = null,
+  runId: runIdOverride = '',
+  executor = null,
+  extraVars = null,
 } = {}) {
-  // runId 先生成：RELEASE_ID 在 plan 阶段就要能插值，否则产物文件名会是空的
-  const runId = makeRunId(now, random)
+  // runId 先生成：RELEASE_ID 在 plan 阶段就要能插值，否则产物文件名会是空的。
+  // V2-M1：宿主要提前注册 activeRuns（取消要能找到 runId），所以允许传入。
+  const runId = runIdOverride || makeRunId(now, random)
   const plan = planPipeline(pipe, {
     project,
     target,
@@ -140,6 +74,7 @@ export async function runPipeline({
       commit: project?.commit ?? '',
       changed: project?.changed ?? [],
       releaseId: releaseId || runId,
+      ...(extraVars || {}),
     },
   })
   const stages = selectedStages(plan, stage)
@@ -157,6 +92,10 @@ export async function runPipeline({
     return { runId: '', status: 'planned', stages: planned, plan }
   }
 
+  // V2-M2：执行面可迁移——宿主传入 executor（本地 createLocalExecutor / 远端 createRemoteExecutor），
+  // 缺省本地 spawn，行为与旧 spawnStep 一致。
+  const activeExecutor = executor || createDefaultExecutor()
+
   if (stepTimeoutSec > 0) {
     for (const item of stages) {
       for (const step of item.steps) if (!step.source?.timeout) step.timeoutSec = stepTimeoutSec
@@ -173,6 +112,9 @@ export async function runPipeline({
       try { appendFileSync(logFile, `${line}\n`, 'utf8') } catch { /* logging must not kill the run */ }
     }
     try { onLog({ runId, stageId: entry.stageId, index: entry.index, line }) } catch { /* observer errors are not run errors */ }
+    if (hub) {
+      try { hub.append(runId, { stageId: entry.stageId, index: entry.index, line }) } catch { /* hub errors must not kill the run */ }
+    }
   }
 
   const startedAt = new Date().toISOString()
@@ -197,6 +139,12 @@ export async function runPipeline({
   const vars = plan.vars
 
   for (const item of stages) {
+    if (signal?.aborted) {
+      const canceledStatus = 'canceled'
+      if (hub) hub.end(runId, canceledStatus)
+      store?.appendRun({ ...runRecord, finished_at: new Date().toISOString(), status: canceledStatus, error: '已取消' })
+      return { runId, status: canceledStatus, stages: stageResults, plan }
+    }
     const blocked = item.needs.some((need) => failedStages.has(need))
     if (blocked) {
       const skipped = { id: item.id, status: 'skipped', durationMs: 0, steps: item.steps.map((step) => ({ ...step, status: 'skipped', durationMs: 0, exitCode: -1 })) }
@@ -209,6 +157,12 @@ export async function runPipeline({
     const stepResults = []
     let stageFailed = false
     for (const step of item.steps) {
+      if (signal?.aborted) {
+        const canceledStatus = 'canceled'
+        if (hub) hub.end(runId, canceledStatus)
+        store?.appendRun({ ...runRecord, finished_at: new Date().toISOString(), status: canceledStatus, error: '已取消' })
+        return { runId, status: canceledStatus, stages: stageResults, plan }
+      }
       if (step.kind === 'deploy') {
         if (!executeDeploy) {
           stepResults.push({ ...step, status: 'skipped', durationMs: 0, exitCode: 0 })
@@ -238,14 +192,47 @@ export async function runPipeline({
       while (attempt < maxAttempts) {
         attempt += 1
         log({ stageId: item.id, index: step.index }, `$ ${command}${maxAttempts > 1 ? `（第 ${attempt}/${maxAttempts} 次）` : ''}`)
-        result = await spawnStep({
-          command,
-          cwd: project?.path || process.cwd(),
-          env,
-          timeoutMs: step.timeoutSec * 1000,
-          onLine: (line) => log({ stageId: item.id, index: step.index }, line),
-        })
+        result = await activeExecutor.execute(
+          { command, timeoutSec: step.timeoutSec },
+          {
+            cwd: project?.path || process.cwd(),
+            env,
+            onLine: (line) => log({ stageId: item.id, index: step.index }, line),
+            signal,
+            taskId: `run-${runId}-step-${item.id}-${step.index}`,
+            runId,
+            stepIndex: step.index,
+            stageId: item.id,
+          },
+        )
         if (result.status === 'success') break
+        if (result.status === 'canceled' || signal?.aborted) break
+      }
+      // 步骤被取消打断：写一条 canceled 的 step 记录后整轮结束（后面的步骤不再跑）。
+      if (result?.status === 'canceled' || signal?.aborted) {
+        log({ stageId: item.id, index: step.index }, '已取消')
+        try {
+          store?.appendStep({
+            run_id: runId,
+            stage_id: item.id,
+            idx: step.index,
+            name: step.name,
+            command,
+            exit_code: -1,
+            started_at: new Date().toISOString(),
+            finished_at: new Date().toISOString(),
+            status: 'canceled',
+            log_path: logFile,
+            timeout_s: step.timeoutSec,
+            attempts: attempt,
+            runner_id: activeExecutor?.runnerId || '',
+          })
+        } catch { /* step rows are best effort */ }
+        stepResults.push({ ...step, status: 'canceled', durationMs: result?.durationMs || 0, exitCode: -1, error: '已取消' })
+        stageResults.push({ id: item.id, status: 'canceled', durationMs: Date.now() - stageStarted, steps: stepResults })
+        if (hub) hub.end(runId, 'canceled')
+        store?.appendRun({ ...runRecord, finished_at: new Date().toISOString(), status: 'canceled', error: '已取消' })
+        return { runId, status: 'canceled', stages: stageResults, plan }
       }
       const status = result.status
       const stepRecord = {
@@ -261,6 +248,7 @@ export async function runPipeline({
         log_path: logFile,
         timeout_s: step.timeoutSec,
         attempts: attempt,
+        runner_id: activeExecutor?.runnerId || '',
       }
       store?.appendStep(stepRecord)
       stepResults.push({ ...step, status, durationMs: result.durationMs, exitCode: result.exitCode, error: result.error || '' })
@@ -276,6 +264,7 @@ export async function runPipeline({
   }
 
   const status = stageResults.some((item) => item.status === 'failed') ? 'failed' : 'success'
+  if (hub) hub.end(runId, status)
   store?.appendRun({ ...runRecord, finished_at: new Date().toISOString(), status, error: status === 'failed' ? '有 stage 失败' : '' })
   return { runId, status, stages: stageResults, plan }
 }

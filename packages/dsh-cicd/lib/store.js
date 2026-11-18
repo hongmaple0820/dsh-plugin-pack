@@ -12,6 +12,37 @@ export const DEFAULT_WORK_DIR = join(homedir(), '.dsh-cicd')
 
 const RUN_COLUMNS = ['id', 'project_id', 'pipeline_name', 'trigger', 'branch', 'commit_sha', 'target', 'status', 'dry_run', 'error', 'started_at', 'finished_at', 'updated_at']
 
+const PROJECT_COLUMNS = ['id', 'name', 'source_type', 'repo_url', 'default_branch', 'path', 'pipe_path', 'created_at', 'updated_at']
+
+function projectRow(project = {}) {
+  const now = new Date().toISOString()
+  return {
+    id: text(project.id),
+    name: text(project.name || project.id),
+    source_type: text(project.source_type ?? project.sourceType) || 'local',
+    repo_url: text(project.repo_url ?? project.repoUrl),
+    default_branch: text(project.default_branch ?? project.defaultBranch),
+    path: text(project.path),
+    pipe_path: text(project.pipe_path ?? project.pipePath ?? project.pipe),
+    created_at: text(project.created_at ?? project.createdAt) || now,
+    updated_at: now,
+  }
+}
+
+function projectOut(row) {
+  return row ? {
+    id: text(row.id),
+    name: text(row.name),
+    sourceType: text(row.source_type),
+    repoUrl: text(row.repo_url),
+    defaultBranch: text(row.default_branch),
+    path: text(row.path),
+    pipePath: text(row.pipe_path),
+    createdAt: text(row.created_at),
+    updatedAt: text(row.updated_at),
+  } : null
+}
+
 function runRow(run = {}) {
   return {
     id: text(run.id),
@@ -43,11 +74,12 @@ export function createStore({ dir = DEFAULT_WORK_DIR, file = '' } = {}) {
       ON CONFLICT(id) DO UPDATE SET ${RUN_COLUMNS.filter((column) => column !== 'id').map((column) => `${column} = excluded.${column}`).join(', ')}`),
     selectRuns: db.prepare('SELECT * FROM runs WHERE (? = \'\' OR project_id = ?) ORDER BY started_at DESC LIMIT ?'),
     selectRun: db.prepare('SELECT * FROM runs WHERE id = ?'),
-    upsertStep: db.prepare(`INSERT INTO steps (run_id, stage_id, idx, name, command, status, exit_code, duration_ms, attempts, timeout_s, log_path, started_at, finished_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    upsertStep: db.prepare(`INSERT INTO steps (run_id, stage_id, idx, name, command, status, exit_code, duration_ms, attempts, timeout_s, log_path, started_at, finished_at, runner_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(run_id, stage_id, idx) DO UPDATE SET name = excluded.name, command = excluded.command, status = excluded.status,
         exit_code = excluded.exit_code, duration_ms = excluded.duration_ms, attempts = excluded.attempts, timeout_s = excluded.timeout_s,
-        log_path = excluded.log_path, started_at = excluded.started_at, finished_at = excluded.finished_at`),
+        log_path = excluded.log_path, started_at = excluded.started_at, finished_at = excluded.finished_at,
+        runner_id = excluded.runner_id`),
     selectSteps: db.prepare('SELECT * FROM steps WHERE run_id = ? ORDER BY started_at ASC, idx ASC'),
     insertArtifact: db.prepare('INSERT INTO artifacts (run_id, path, bytes, sha256, created_at) VALUES (?, ?, ?, ?, ?)'),
     selectArtifacts: db.prepare('SELECT * FROM artifacts WHERE run_id = ? ORDER BY id ASC'),
@@ -66,6 +98,10 @@ export function createStore({ dir = DEFAULT_WORK_DIR, file = '' } = {}) {
     selectOperations: db.prepare(`SELECT * FROM operations
       WHERE (? = '' OR project = ?) AND (? = '' OR run_id = ?)
       ORDER BY at DESC, id DESC LIMIT ?`),
+    upsertProject: db.prepare(`INSERT INTO projects (${PROJECT_COLUMNS.join(', ')}) VALUES (${PROJECT_COLUMNS.map(() => '?').join(', ')})
+      ON CONFLICT(id) DO UPDATE SET ${PROJECT_COLUMNS.filter((column) => column !== 'id').map((column) => `${column} = excluded.${column}`).join(', ')}`),
+    selectProjects: db.prepare('SELECT * FROM projects ORDER BY name ASC, created_at DESC'),
+    selectProject: db.prepare('SELECT * FROM projects WHERE id = ?'),
   }
 
   function guard() {
@@ -127,6 +163,7 @@ export function createStore({ dir = DEFAULT_WORK_DIR, file = '' } = {}) {
         text(step.log_path ?? step.logPath),
         text(step.started_at ?? step.startedAt),
         text(step.finished_at ?? step.finishedAt),
+        text(step.runner_id ?? step.runnerId),
       )
       return step
     },
@@ -238,6 +275,23 @@ export function createStore({ dir = DEFAULT_WORK_DIR, file = '' } = {}) {
           status: text(row.status),
           detail: text(row.detail),
         }))
+    },
+
+    projects() {
+      guard()
+      return statements.selectProjects.all().map(projectOut)
+    },
+
+    project(id) {
+      guard()
+      return projectOut(statements.selectProject.get(text(id)))
+    },
+
+    upsertProject(project = {}) {
+      guard()
+      const row = projectRow(project)
+      statements.upsertProject.run(...PROJECT_COLUMNS.map((column) => row[column]))
+      return row
     },
 
     logPath(runId) {

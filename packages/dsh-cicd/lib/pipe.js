@@ -15,6 +15,8 @@ export class PipeError extends Error {
   }
 }
 
+import { normalizeTriggers } from './triggers.js'
+
 export const RUNTIME_VALUES = ['static', 'node', 'python', 'go', 'php', 'docker']
 const RUNTIME_SET = new Set(RUNTIME_VALUES)
 const APP_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._@:/-]*$/
@@ -344,6 +346,28 @@ function normalizeTarget(targetName, target) {
     canary = { first, waitSec }
   }
 
+  let strategy = null
+  if (target.strategy !== undefined && target.strategy !== null && target.strategy !== '') {
+    if (typeof target.strategy !== 'object' || Array.isArray(target.strategy)) {
+      throw new PipeError(`target ${targetName} 的 strategy 必须是 map`)
+    }
+    const sType = String(target.strategy.type || 'serial').toLowerCase()
+    if (!['serial', 'parallel', 'rolling', 'canary', 'blue-green'].includes(sType)) {
+      throw new PipeError(`target ${targetName} 的 strategy.type 只有 serial/parallel/rolling/canary/blue-green（收到 "${target.strategy.type}"）`)
+    }
+    strategy = {
+      type: sType,
+      batch: target.strategy.batch,
+      waitSec: target.strategy.waitSec,
+      first: target.strategy.first,
+      onHostFailure: target.strategy.onHostFailure,
+    }
+  }
+
+  // 环境（environment）升格：target 自动映射，带保护/审批标志
+  const protected_ = targetName.toLowerCase() === 'prod' || target.protected === true
+  const approvalRequired = targetName.toLowerCase() === 'prod' || target.approvalRequired === true
+
   const restartCommand = target.restart || target.service ? '' : defaultRestartCommand(runtime, app, targetName)
   return {
     ...target,
@@ -355,6 +379,9 @@ function normalizeTarget(targetName, target) {
     path,
     restartCommand,
     canary,
+    strategy,
+    protected: protected_,
+    approvalRequired,
   }
 }
 
@@ -418,7 +445,8 @@ export function parsePipe(source, { path = 'pipe.yml' } = {}) {
     for (const need of stage.needs) if (!stageIds.has(need)) throw new PipeError(`stage ${stage.id} 的 needs 指向不存在的 stage “${need}”`)
   }
 
-  return { version, name, vars: vars || {}, targets: normalizedTargets, stages: normalizedStages, path }
+  const triggers = normalizeTriggers(root)
+  return { version, name, vars: vars || {}, targets: normalizedTargets, stages: normalizedStages, triggers, path }
 }
 
 const VAR_PATTERN = /\$\{\{\s*([A-Za-z_]\w*)\s*\}\}/g
