@@ -123,6 +123,10 @@ window.__ModuleLoader__.load({
 .cicd-plan{flex:none;display:flex;flex-direction:column;gap:8px;margin:0;padding:10px 12px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md, 8px);background:var(--dsw-alias-bg-layer-1)}
 .cicd-plan-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .cicd-plan-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary);font-size:12.5px;font-weight:600;line-height:18px}
+.cicd-host-chip.is-prod{border-color:var(--dsw-alias-state-warn-primary)}
+.cicd-host-prod-icon{font-size:10px;line-height:14px}
+.cicd-host-count{flex:none;display:inline-flex;align-items:center;height:20px;padding:0 6px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-xs,4px);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-tertiary);font-size:10.5px;line-height:14px;white-space:nowrap}
+.cicd-target-strategy{flex:none;display:inline-flex;align-items:center;height:16px;padding:0 5px;border:.5px solid var(--dsw-alias-border-l3);border-radius:4px;color:var(--dsw-alias-label-secondary);font-size:10.5px;line-height:14px}
 .cicd-releases{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;gap:10px;box-sizing:border-box;padding:12px 16px 14px;overflow:hidden}
 .cicd-releases-head{flex:none;display:flex;align-items:center;justify-content:space-between;gap:8px}
 .cicd-table-wrap{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md, 8px);background:var(--dsw-alias-bg-layer-1)}
@@ -251,6 +255,26 @@ window.__ModuleLoader__.load({
 .cicd-form-radio[aria-pressed="true"]{border-color:var(--dsw-alias-border-l4);background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-primary)}
 .cicd-create-kinds{display:flex;gap:8px;flex-wrap:wrap}
 .cicd-create-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:2px}
+/* P1：审批门视图 */
+.cicd-view-approvals,.cicd-view-rbac,.cicd-view-secrets,.cicd-view-runners{min-width:56px}
+.cicd-approvals,.cicd-rbac,.cicd-secrets,.cicd-runners{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;box-sizing:border-box;padding:12px 16px 14px;display:flex;flex-direction:column;gap:10px}
+.cicd-approvals-head,.cicd-rbac-head,.cicd-secrets-head,.cicd-runners-head{flex:none;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.cicd-approvals-list{display:flex;flex-direction:column;gap:6px}
+.cicd-approval-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm,6px);background:var(--dsw-alias-bg-layer-1)}
+.cicd-approval-row.is-resolved{opacity:.7}
+.cicd-approval-info{display:flex;flex-direction:column;gap:2px;min-width:0}
+.cicd-approval-runid{color:var(--dsw-alias-label-primary);font-size:12px}
+.cicd-approval-meta{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:15px;overflow-wrap:anywhere}
+.cicd-approval-actions{display:flex;align-items:center;gap:6px;flex:none}
+.cicd-button-danger{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}
+.cicd-button-danger:hover{background:var(--dsw-alias-state-error-bg,rgba(255,59,48,.08))}
+.cicd-approvals-resolved,.cicd-rbac-body,.cicd-secrets-body,.cicd-rbac-audit{display:flex;flex-direction:column;gap:6px}
+/* P1：RBAC 视图 */
+.cicd-rbac-verify{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.cicd-rbac-verify .cicd-form-input{flex:1 1 200px;max-width:400px}
+/* P1：Secrets 视图 */
+.cicd-secrets-form{display:flex;flex-direction:column;gap:8px;max-width:480px}
+.cicd-secrets-form .cicd-button{align-self:flex-start}
 `
 
     /** 运行 / 阶段状态 → 中文徽标文案。 */
@@ -693,14 +717,20 @@ window.__ModuleLoader__.load({
                 title: '灰度发布：先发 ' + canary.first + ' 台，等待 ' + canary.waitSec + 's 再发其余主机',
               }, canaryText(canary, hosts.length))
               : null,
+            target.strategy
+              ? h('span', { className: 'cicd-target-strategy', title: '发布策略：' + (target.strategy.type || 'serial') }, '策略 ' + (target.strategy.type || 'serial'))
+              : null,
             hosts.length > 0
               ? h('span', { className: 'cicd-target-hosts' },
+                h('span', { className: 'cicd-host-count', title: hosts.length + ' 台主机' }, hosts.length + ' 台'),
                 hosts.map((host, hostIndex) => {
                   const hostName = typeof host === 'string' ? host : String((host && (host.name || host.host)) || '')
                   const hostStatus = host && typeof host === 'object' && typeof host.status === 'string' ? host.status : ''
-                  return h('span', { key: hostName + ':' + hostIndex, className: 'cicd-host-chip', title: hostName },
+                  const isProd = prodHosts.includes(hostName)
+                  return h('span', { key: hostName + ':' + hostIndex, className: 'cicd-host-chip' + (isProd ? ' is-prod' : ''), title: hostName + (isProd ? '（生产）' : '') },
                     h('span', { className: 'cicd-host-dot' + (hostStatus ? ' is-' + hostStatus : '') }),
-                    h('span', { className: 'cicd-host-name' }, hostName))
+                    h('span', { className: 'cicd-host-name' }, hostName),
+                    isProd ? h('span', { className: 'cicd-host-prod-icon', title: '生产主机' }, '🔒') : null)
                 }))
               : null,
             prodHosts.length > 0 || envs.length > 0 || target.envsUnknown
@@ -1153,6 +1183,162 @@ window.__ModuleLoader__.load({
             : null))
     }
 
+    /** P1：审批门视图（列出待审批 run + 通过/拒绝按钮）。 */
+    function ApprovalsView({ state, onRefresh, onApprove, onReject, busy }) {
+      const items = Array.isArray(state.items) ? state.items : []
+      const pending = items.filter((item) => item.status === 'pending' || !item.status)
+      const resolved = items.filter((item) => item.status && item.status !== 'pending')
+      return h('div', { className: 'cicd-approvals' },
+        h('div', { className: 'cicd-approvals-head' },
+          h('span', { className: 'cicd-col-title' }, '审批门 · ' + pending.length + ' 条待审批'),
+          h('button', { className: 'cicd-button', type: 'button', onClick: onRefresh, disabled: state.status === 'loading' }, state.status === 'loading' ? '刷新…中' : '刷新')),
+        state.status === 'loading' ? h(LoadingState, { text: '正在读取审批记录…' }) : null,
+        state.status === 'error' ? h(ErrorState, { error: state.error, onRetry: onRefresh }) : null,
+        state.status === 'ready' && pending.length === 0
+          ? h(EmptyState, { text: '没有待审批的部署。prod 环境默认停在「待审批」，点「运行」后在这里通过或拒绝。' })
+          : null,
+        pending.length > 0
+          ? h('div', { className: 'cicd-approvals-list' },
+            pending.map((item) => h('div', { key: item.runId, className: 'cicd-approval-row' },
+              h('div', { className: 'cicd-approval-info' },
+                h('span', { className: 'cicd-approval-runid cicd-mono' }, item.runId),
+                h('span', { className: 'cicd-approval-meta' }, [item.project, item.target, item.requestedAt, item.requestedBy].filter(Boolean).join(' · '))),
+              h('div', { className: 'cicd-approval-actions' },
+                h('button', { className: 'cicd-button cicd-button-primary', type: 'button', onClick: () => onApprove(item.runId), disabled: busy }, '通过'),
+                h('button', { className: 'cicd-button cicd-button-danger', type: 'button', onClick: () => onReject(item.runId), disabled: busy }, '拒绝')))))
+          : null,
+        resolved.length > 0
+          ? h('div', { className: 'cicd-approvals-resolved' },
+            h('div', { className: 'cicd-section-title' }, '已处理（最近 ' + Math.min(resolved.length, 10) + ' 条）'),
+            resolved.slice(0, 10).reverse().map((item) => h('div', { key: item.runId + item.status, className: 'cicd-approval-row is-resolved' },
+              h('div', { className: 'cicd-approval-info' },
+                h('span', { className: 'cicd-approval-runid cicd-mono' }, item.runId),
+                h('span', { className: 'cicd-approval-meta' }, [item.project, item.target, item.status, item.resolvedAt].filter(Boolean).join(' · '))))))
+          : null)
+    }
+
+    /** P1：RBAC 管理视图（用户列表 + 校验 token + 审计时间线）。 */
+    function RbacView({ state, onRefresh, onRevoke, onVerify, busy }) {
+      const [tokenInput, setTokenInput] = useState('')
+      const users = Array.isArray(state.users) ? state.users : []
+      const audit = Array.isArray(state.audit) ? state.audit : []
+      return h('div', { className: 'cicd-rbac' },
+        h('div', { className: 'cicd-rbac-head' },
+          h('span', { className: 'cicd-col-title' }, 'RBAC · ' + users.length + ' 个用户'),
+          h('button', { className: 'cicd-button', type: 'button', onClick: onRefresh, disabled: state.status === 'loading' }, state.status === 'loading' ? '刷新…中' : '刷新')),
+        state.status === 'loading' ? h(LoadingState, { text: '正在读取 RBAC…' }) : null,
+        state.status === 'error' ? h(ErrorState, { error: state.error, onRetry: onRefresh }) : null,
+        state.status === 'ready'
+          ? h('div', { className: 'cicd-rbac-body' },
+            h('div', { className: 'cicd-section-title' }, '用户'),
+            users.length === 0
+              ? h(EmptyState, { text: '还没有用户。用 cicd_rbac 工具签发 token（user / role / projects / ttlSec）。' })
+              : h('div', { className: 'cicd-table-wrap' },
+                h('table', { className: 'cicd-table' },
+                  h('thead', null, h('tr', null,
+                    h('th', null, '用户'), h('th', null, '角色'), h('th', null, '项目范围'), h('th', null, '过期时间'), h('th', { className: 'cicd-release-act' }, '操作'))),
+                  h('tbody', null, users.map((user) => h('tr', { key: user.user },
+                    h('td', null, user.user),
+                    h('td', null, user.role),
+                    h('td', null, (user.projects || []).join(', ') || '*'),
+                    h('td', null, user.expiresAt || '—'),
+                    h('td', { className: 'cicd-release-act' },
+                      h('button', { className: 'cicd-rollback', type: 'button', onClick: () => onRevoke(user.user), disabled: busy }, '吊销'))))))),
+            h('div', { className: 'cicd-section-title', style: { marginTop: '12px' } }, '校验 token'),
+            h('div', { className: 'cicd-rbac-verify' },
+              h('input', { className: 'cicd-form-input', value: tokenInput, onChange: (event) => setTokenInput(event.currentTarget.value), placeholder: '粘贴 token 校验' }),
+              h('button', { className: 'cicd-button', type: 'button', onClick: () => onVerify(tokenInput.trim()), disabled: !tokenInput.trim() || busy }, '校验')),
+            state.verifyResult && state.verifyResult.status === 'ready'
+              ? h('span', { className: 'cicd-editor-status is-ok' }, '校验结果：' + state.verifyResult.message)
+              : null,
+            state.verifyResult && state.verifyResult.status === 'error'
+              ? h('span', { className: 'cicd-editor-status is-error' }, '校验失败：' + state.verifyResult.message)
+              : null,
+            audit.length > 0
+              ? h('div', { className: 'cicd-rbac-audit' },
+                h('div', { className: 'cicd-section-title', style: { marginTop: '12px' } }, '审计（最近 ' + Math.min(audit.length, 20) + ' 条）'),
+                h('div', { className: 'cicd-table-wrap' },
+                  h('table', { className: 'cicd-table' },
+                    h('thead', null, h('tr', null,
+                      h('th', null, '时间'), h('th', null, '用户'), h('th', null, '操作'), h('th', null, '项目'), h('th', null, '状态'))),
+                    h('tbody', null, audit.slice(-20).reverse().map((item, index) => h('tr', { key: item.at + index },
+                      h('td', null, item.at), h('td', null, item.user), h('td', null, item.action), h('td', null, item.project || '—'), h('td', null, item.status)))))))
+              : null)
+          : null)
+    }
+
+    /** P1：Secrets 管理视图（列出 + 设置 secret）。 */
+    function SecretsView({ state, project, onRefresh, onSet, busy }) {
+      const [scope, setScope] = useState('global')
+      const [name, setName] = useState('')
+      const [value, setValue] = useState('')
+      const items = Array.isArray(state.items) ? state.items : []
+      return h('div', { className: 'cicd-secrets' },
+        h('div', { className: 'cicd-secrets-head' },
+          h('span', { className: 'cicd-col-title' }, 'Secrets · ' + (project || '全局') + ' · ' + items.length + ' 条'),
+          h('button', { className: 'cicd-button', type: 'button', onClick: onRefresh, disabled: state.status === 'loading' }, state.status === 'loading' ? '刷新…中' : '刷新')),
+        state.status === 'loading' ? h(LoadingState, { text: '正在读取 secrets…' }) : null,
+        state.status === 'error' ? h(ErrorState, { error: state.error, onRetry: onRefresh }) : null,
+        state.status === 'ready'
+          ? h('div', { className: 'cicd-secrets-body' },
+            items.length === 0
+              ? h(EmptyState, { text: '还没有 secret。pipe.yml 里用 ${{SECRET_NAME}} 引用；载荷落 workDir/.secrets.json（0600），DB 只存 ref。' })
+              : h('div', { className: 'cicd-table-wrap' },
+                h('table', { className: 'cicd-table' },
+                  h('thead', null, h('tr', null,
+                    h('th', null, 'ref'), h('th', null, 'scope'), h('th', null, 'name'), h('th', null, '创建时间'))),
+                  h('tbody', null, items.map((item, index) => h('tr', { key: item.ref || index },
+                    h('td', { className: 'cicd-mono' }, item.ref), h('td', null, item.scope || 'global'), h('td', null, item.name), h('td', null, item.createdAt || '—')))))),
+            h('div', { className: 'cicd-section-title', style: { marginTop: '12px' } }, '设置 secret'),
+            h('div', { className: 'cicd-secrets-form' },
+              h('div', { className: 'cicd-form-field' },
+                h('span', { className: 'cicd-form-label' }, 'scope'),
+                h('input', { className: 'cicd-form-input', value: scope, onChange: (event) => setScope(event.currentTarget.value), placeholder: 'global / target:prod 等' })),
+              h('div', { className: 'cicd-form-field' },
+                h('span', { className: 'cicd-form-label' }, 'name'),
+                h('input', { className: 'cicd-form-input', value: name, onChange: (event) => setName(event.currentTarget.value), placeholder: '例如 DB_PASSWORD' })),
+              h('div', { className: 'cicd-form-field' },
+                h('span', { className: 'cicd-form-label' }, 'value'),
+                h('input', { className: 'cicd-form-input', type: 'password', value: value, onChange: (event) => setValue(event.currentTarget.value), placeholder: 'secret 值（不落明文到日志/DB）' })),
+              h('button', { className: 'cicd-button cicd-button-primary', type: 'button', onClick: () => { onSet(scope, name.trim(), value); setName(''); setValue('') }, disabled: busy || !name.trim() || !value }, busy ? '设置…中' : '设置')),
+            state.setResult && state.setResult.status === 'ready'
+              ? h('span', { className: 'cicd-editor-status is-ok' }, state.setResult.message)
+              : null,
+            state.setResult && state.setResult.status === 'error'
+              ? h('span', { className: 'cicd-editor-status is-error' }, state.setResult.message)
+              : null)
+          : null)
+    }
+
+    /** P1：Runner 管理视图（列出已注册构建主机）。 */
+    function RunnersView({ state, onRefresh }) {
+      const items = Array.isArray(state.items) ? state.items : []
+      return h('div', { className: 'cicd-runners' },
+        h('div', { className: 'cicd-runners-head' },
+          h('span', { className: 'cicd-col-title' }, '构建主机 · ' + items.length + ' 台'),
+          h('button', { className: 'cicd-button', type: 'button', onClick: onRefresh, disabled: state.status === 'loading' }, state.status === 'loading' ? '刷新…中' : '刷新')),
+        state.status === 'loading' ? h(LoadingState, { text: '正在读取 runner…' }) : null,
+        state.status === 'error' ? h(ErrorState, { error: state.error, onRetry: onRefresh }) : null,
+        state.unsupported
+          ? h(EmptyState, { text: 'Runner 管理不可用（/runners 路由未启用）。用 bin/runner.mjs 注册远端构建主机。' })
+          : null,
+        state.status === 'ready' && items.length === 0
+          ? h(EmptyState, { text: '还没有注册 runner。在目标机运行：node bin/runner.mjs --host=<host> --token=<token>（拉取式协议 + journal 幂等 + 自签 TLS）。' })
+          : null,
+        state.status === 'ready' && items.length > 0
+          ? h('div', { className: 'cicd-table-wrap' },
+            h('table', { className: 'cicd-table' },
+              h('thead', null, h('tr', null,
+                h('th', null, 'runner id'), h('th', null, 'labels'), h('th', null, '容量'), h('th', null, '状态'), h('th', null, '在跑任务'))),
+              h('tbody', null, items.map((item) => h('tr', { key: item.runnerId, className: item.status === 'offline' ? 'is-offline' : '' },
+                h('td', { className: 'cicd-mono' }, item.runnerId),
+                h('td', null, (item.labels || []).join(', ') || '—'),
+                h('td', null, String(item.capacity || '—')),
+                h('td', null, item.status === 'offline' ? '离线' : '在线'),
+                h('td', null, String(item.activeTasks || 0)))))))
+          : null)
+    }
+
     function CicdPage() {
       const [projects, setProjects] = useState({ status: 'loading', items: [], error: null })
       const [projectId, setProjectId] = useState('')
@@ -1189,6 +1375,13 @@ window.__ModuleLoader__.load({
       /** v2-M2：构建主机（runner）下拉。 */
       const [runners, setRunners] = useState({ status: 'idle', items: [], error: null })
       const [runnerId, setRunnerId] = useState('')
+      /** P1：审批视图数据。 */
+      const [approvals, setApprovals] = useState({ status: 'idle', items: [], error: null })
+      /** P1：RBAC 视图数据。 */
+      const [rbac, setRbac] = useState({ status: 'idle', users: [], audit: [], error: null, verifyResult: null })
+      /** P1：Secrets 视图数据。 */
+      const [secrets, setSecrets] = useState({ status: 'idle', items: [], error: null, setResult: null })
+      /** P1：Runner 管理视图数据（复用 runners 状态）。 */
 
       /** 每类请求各自一个 controller：轮询时 runs 与 log 一起发，不能互相 abort。 */
       const aborters = useRef({})
@@ -1519,6 +1712,101 @@ window.__ModuleLoader__.load({
         void rollbackTo(release)
       }, [rollbackId, clearRollback, rollbackTo])
 
+      /** P1：审批视图数据加载。 */
+      const loadApprovals = useCallback(async () => {
+        setApprovals((prev) => ({ status: 'loading', items: prev.items, error: null }))
+        try {
+          const payload = await callApi('approvals', { project: projectId || '' }, freshSignal('approvals'))
+          const items = Array.isArray(payload.approvals) ? payload.approvals : []
+          setApprovals({ status: 'ready', items, error: null })
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          setApprovals({ status: 'error', items: [], error })
+        }
+      }, [freshSignal, projectId])
+
+      /** P1：审批操作（approve/reject）。 */
+      const resolveApproval = useCallback(async (runId, decision) => {
+        try {
+          await callApi('approve', { runId, decision, confirm: 1 }, freshSignal('approve'))
+          void loadApprovals()
+        } catch (error) {
+          if (error && error.name !== 'AbortError') {
+            setApprovals((prev) => ({ ...prev, error }))
+          }
+        }
+      }, [callApi, freshSignal, loadApprovals])
+
+      /** P1：RBAC 视图数据加载。 */
+      const loadRbac = useCallback(async () => {
+        setRbac((prev) => ({ status: 'loading', users: prev.users, audit: prev.audit, error: null, verifyResult: null }))
+        try {
+          const payload = await callApi('rbac', {}, freshSignal('rbac'))
+          setRbac({
+            status: 'ready',
+            users: Array.isArray(payload.users) ? payload.users : [],
+            audit: Array.isArray(payload.audit) ? payload.audit : [],
+            error: null,
+            verifyResult: null,
+          })
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          setRbac({ status: 'error', users: [], audit: [], error, verifyResult: null })
+        }
+      }, [freshSignal])
+
+      /** P1：RBAC 吊销用户。 */
+      const revokeRbacUser = useCallback(async (user) => {
+        try {
+          await callApi('rbac', { user, action: 'revoke', confirm: 1 }, freshSignal('rbac-revoke'))
+          void loadRbac()
+        } catch (error) {
+          if (error && error.name !== 'AbortError') {
+            setRbac((prev) => ({ ...prev, error }))
+          }
+        }
+      }, [callApi, freshSignal, loadRbac])
+
+      /** P1：RBAC 校验 token。 */
+      const verifyRbacToken = useCallback(async (token) => {
+        setRbac((prev) => ({ ...prev, verifyResult: { status: 'loading', message: '', error: null } }))
+        try {
+          const payload = await callApi('rbac', { token, action: 'verify' }, freshSignal('rbac-verify'))
+          setRbac((prev) => ({ ...prev, verifyResult: { status: 'ready', message: payload.user ? `${payload.user}（${payload.role}）` : 'token 无效', error: null } }))
+        } catch (error) {
+          if (error && error.name !== 'AbortError') {
+            setRbac((prev) => ({ ...prev, verifyResult: { status: 'error', message: error.message || '校验失败', error } }))
+          }
+        }
+      }, [callApi, freshSignal])
+
+      /** P1：Secrets 视图数据加载。 */
+      const loadSecrets = useCallback(async (project) => {
+        setSecrets((prev) => ({ status: 'loading', items: prev.items, error: null, setResult: null }))
+        try {
+          const payload = await callApi('secrets', { project: project || '' }, freshSignal('secrets'))
+          const items = Array.isArray(payload.secrets) ? payload.secrets : []
+          setSecrets({ status: 'ready', items, error: null, setResult: null })
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          setSecrets({ status: 'error', items: [], error, setResult: null })
+        }
+      }, [freshSignal])
+
+      /** P1：设置 secret。 */
+      const setSecret = useCallback(async (scope, name, value) => {
+        if (!name || !value) return
+        try {
+          const payload = await callApi('secrets', { project: projectId || '', scope: scope || 'global', name, value, confirm: 1 }, freshSignal('secret-set'))
+          setSecrets((prev) => ({ ...prev, setResult: { status: 'ready', message: '已设置 ' + name } }))
+          void loadSecrets(projectId)
+        } catch (error) {
+          if (error && error.name !== 'AbortError') {
+            setSecrets((prev) => ({ ...prev, setResult: { status: 'error', message: error.message || '设置失败' } }))
+          }
+        }
+      }, [callApi, freshSignal, loadSecrets, projectId])
+
       const refreshAll = useCallback(() => {
         clearArmed()
         clearRollback()
@@ -1530,7 +1818,11 @@ window.__ModuleLoader__.load({
         }
         if (targetName) void loadReleases(targetName)
         if (view === 'audit') void loadAudit(auditLimit)
-      }, [clearArmed, clearRollback, loadProjects, loadTargets, loadRuns, loadReleases, projectId, targetName, view, loadAudit, auditLimit])
+        if (view === 'approvals') void loadApprovals()
+        if (view === 'rbac') void loadRbac()
+        if (view === 'secrets') void loadSecrets(projectId)
+        if (view === 'runners') void loadRunners()
+      }, [clearArmed, clearRollback, loadProjects, loadTargets, loadRuns, loadReleases, projectId, targetName, view, loadAudit, auditLimit, loadApprovals, loadRbac, loadSecrets, loadRunners])
 
       const toggleReleases = useCallback(() => {
         clearRollback()
@@ -1558,6 +1850,30 @@ window.__ModuleLoader__.load({
       const toggleCreate = useCallback(() => {
         clearRollback()
         setView((current) => (current === 'create' ? 'run' : 'create'))
+      }, [clearRollback])
+
+      /** P1：审批视图开关。 */
+      const toggleApprovals = useCallback(() => {
+        clearRollback()
+        setView((current) => (current === 'approvals' ? 'run' : 'approvals'))
+      }, [clearRollback])
+
+      /** P1：RBAC 管理视图开关（仅 server 模式有意义，但始终可打开查看用户/审计）。 */
+      const toggleRbac = useCallback(() => {
+        clearRollback()
+        setView((current) => (current === 'rbac' ? 'run' : 'rbac'))
+      }, [clearRollback])
+
+      /** P1：Secrets 管理视图开关。 */
+      const toggleSecrets = useCallback(() => {
+        clearRollback()
+        setView((current) => (current === 'secrets' ? 'run' : 'secrets'))
+      }, [clearRollback])
+
+      /** P1：Runner 管理视图开关。 */
+      const toggleRunners = useCallback(() => {
+        clearRollback()
+        setView((current) => (current === 'runners' ? 'run' : 'runners'))
       }, [clearRollback])
 
       /** v2-M0：进入编辑器时从 /project-meta 拉 pipeSource。 */
@@ -1753,18 +2069,23 @@ window.__ModuleLoader__.load({
       const toolbar = h('div', { className: 'cicd-toolbar' },
         h('div', { className: 'cicd-toolbar-group' },
           h('span', { className: 'cicd-label' }, '项目'),
-          // 单项目时不占位置：退化成静态文本；多项目才给选择器（选中记在 localStorage）。
-          projects.status === 'ready' && projects.items.length === 1
-            ? h('span', { className: 'cicd-project-static', title: projects.items[0].path || projects.items[0].id }, projects.items[0].name || projects.items[0].id)
-            : h('select', {
-              className: 'cicd-select cicd-project-select cicd-project-picker',
-              value: projectId,
-              disabled: projects.status !== 'ready' || projects.items.length === 0,
-              onChange: (event) => onSelectProject(event.currentTarget.value),
-              'aria-label': '选择项目',
-            }, projects.items.length === 0
+          // 始终显示选择器（单项目也可见，避免用户以为不能切）；+ 新建 跳 CreateView。
+          h('select', {
+            className: 'cicd-select cicd-project-select cicd-project-picker',
+            value: projectId,
+            disabled: projects.status !== 'ready' || projects.items.length === 0,
+            onChange: (event) => {
+              const value = event.currentTarget.value
+              if (value === '__new__') { toggleCreate(); return }
+              onSelectProject(value)
+            },
+            'aria-label': '选择项目',
+          },
+            projects.items.length === 0
               ? h('option', { value: '' }, '（没有项目）')
-              : projects.items.map((project) => h('option', { key: project.id, value: project.id }, project.name || project.id)))),
+              : projects.items.map((project) => h('option', { key: project.id, value: project.id }, project.name || project.id)),
+            h('option', { value: '__new__', disabled: projects.status !== 'ready' }, '+ 新建项目…'))
+          ,
         h('div', { className: 'cicd-toolbar-group' },
           h('span', { className: 'cicd-label' }, '目标'),
           h('select', {
@@ -1786,7 +2107,8 @@ window.__ModuleLoader__.load({
             'aria-label': '选择构建主机（执行面）',
           },
             h('option', { value: '' }, '本机（Host）'),
-            runners.items.map((runner) => h('option', { key: runner.runnerId, value: runner.runnerId }, runner.runnerId + (runner.status === 'offline' ? '（离线）' : '')))),
+            runners.items.map((runner) => h('option', { key: runner.runnerId, value: runner.runnerId }, runner.runnerId + (runner.status === 'offline' ? '（离线）' : ''))))
+          ),
         h('div', { className: 'cicd-toolbar-group' },
           h('button', { className: 'cicd-button cicd-plan-open', type: 'button', onClick: runPlan, disabled: busy || !targetName || Boolean(plan && plan.status === 'loading') }, plan && plan.status === 'loading' ? '计划…中' : '计划'),
           h('button', { className: 'cicd-button cicd-dry-run', type: 'button', onClick: () => void startRun(true), disabled: busy || !targetName }, busy ? '干跑…中' : '干跑'),
@@ -1813,14 +2135,44 @@ window.__ModuleLoader__.load({
             className: 'cicd-button cicd-view-editor',
             type: 'button',
             'aria-pressed': view === 'editor',
+            title: view === 'editor' ? '切回 阶段/Run详情/Releases 三栏' : '打开编辑器修改 pipe.yml（校验 + 保存）',
             onClick: toggleEditor,
-          }, view === 'editor' ? '回到运行' : '编辑'),
+          }, view === 'editor' ? '返回运行视图' : '编辑 pipe.yml'),
           h('button', {
             className: 'cicd-button cicd-view-create',
             type: 'button',
             'aria-pressed': view === 'create',
+            title: view === 'create' ? '切回 阶段/Run详情/Releases 三栏' : '创建新项目并登记（本地目录 / Git 仓库 + 脚手架模板）',
             onClick: toggleCreate,
-          }, view === 'create' ? '回到运行' : '新建'),
+          }, view === 'create' ? '返回运行视图' : '新建项目'),
+          h('button', {
+            className: 'cicd-button cicd-view-approvals',
+            type: 'button',
+            'aria-pressed': view === 'approvals',
+            title: view === 'approvals' ? '切回 阶段/Run详情/Releases 三栏' : '审批门：通过/拒绝待审批的部署（prod 默认停在待审批）',
+            onClick: toggleApprovals,
+          }, view === 'approvals' ? '返回运行视图' : '审批'),
+          h('button', {
+            className: 'cicd-button cicd-view-rbac',
+            type: 'button',
+            'aria-pressed': view === 'rbac',
+            title: view === 'rbac' ? '切回 阶段/Run详情/Releases 三栏' : 'RBAC：签发/校验/吊销 token（viewer/operator/admin）+ 审计时间线',
+            onClick: toggleRbac,
+          }, view === 'rbac' ? '返回运行视图' : 'RBAC'),
+          h('button', {
+            className: 'cicd-button cicd-view-secrets',
+            type: 'button',
+            'aria-pressed': view === 'secrets',
+            title: view === 'secrets' ? '切回 阶段/Run详情/Releases 三栏' : 'Secrets：列出/设置项目 secret（载荷落 workDir/.secrets.json 0600）',
+            onClick: toggleSecrets,
+          }, view === 'secrets' ? '返回运行视图' : 'Secrets'),
+          h('button', {
+            className: 'cicd-button cicd-view-runners',
+            type: 'button',
+            'aria-pressed': view === 'runners',
+            title: view === 'runners' ? '切回 阶段/Run详情/Releases 三栏' : '构建主机：列出已注册 runner（拉取式协议 + journal 幂等）',
+            onClick: toggleRunners,
+          }, view === 'runners' ? '返回运行视图' : 'Runner'),
           h('button', {
             className: 'cicd-button cicd-notify-test' + (notifyArmed ? ' cicd-button-armed' : ''),
             type: 'button',
@@ -1829,7 +2181,8 @@ window.__ModuleLoader__.load({
             disabled: busy || notify.status === 'running',
             title: notifyArmed ? '8 秒内再点一次才真的发出去' : '向配置的 webhook 发一条测试消息',
           }, notify.status === 'running' ? '测试…中' : notifyArmed ? '确认测试' : '测试通知'),
-          h('button', { className: 'cicd-button cicd-refresh', type: 'button', onClick: refreshAll, disabled: projects.status === 'loading' }, projects.status === 'loading' ? '刷新…中' : '刷新')),
+          h('button', { className: 'cicd-button cicd-refresh', type: 'button', onClick: refreshAll, disabled: projects.status === 'loading' }, projects.status === 'loading' ? '刷新…中' : '刷新')
+        ),
         h('div', { className: 'cicd-toolbar-spacer' }),
         isRunning && view === 'run' ? h('span', { className: 'cicd-poll' }, '运行中 · 每 2 秒刷新') : null,
         // v0.6 B：测试通知的结果内联在工具条尾部，不弹窗、不占整页。
@@ -1882,6 +2235,35 @@ window.__ModuleLoader__.load({
           state: create,
           busy: create.status === 'running',
           onSubmit: (form) => void submitCreate(form),
+        })
+        : view === 'approvals'
+        ? h(ApprovalsView, {
+          state: approvals,
+          onRefresh: () => void loadApprovals(),
+          onApprove: (runId) => void resolveApproval(runId, 'approve'),
+          onReject: (runId) => void resolveApproval(runId, 'reject'),
+          busy,
+        })
+        : view === 'rbac'
+        ? h(RbacView, {
+          state: rbac,
+          onRefresh: () => void loadRbac(),
+          onRevoke: (user) => void revokeRbacUser(user),
+          onVerify: (token) => void verifyRbacToken(token),
+          busy,
+        })
+        : view === 'secrets'
+        ? h(SecretsView, {
+          state: secrets,
+          project: projectId,
+          onRefresh: () => void loadSecrets(projectId),
+          onSet: (scope, name, value) => void setSecret(scope, name, value),
+          busy,
+        })
+        : view === 'runners'
+        ? h(RunnersView, {
+          state: runners,
+          onRefresh: () => void loadRunners(),
         })
         : h('div', { className: 'cicd-columns' },
           h(OverviewColumn, {
