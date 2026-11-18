@@ -5,7 +5,7 @@ DSH 插件包：一组可直接装进当前 profile 的 **bundle**（Host 插件
 | 方向 | 包 | 交付 |
 |---|---|---|
 | 远程控制 | `packages/dsh-remote`（`@local/dsh-remote`） | 13 个 `remote_*` 工具（SSH / SFTP / 本地端口转发 / 持久 PTY / 多机并发），左侧栏「远程主机」全局面板（主机增删改 / 命令 / 面板内交互终端 / 隧道 / 文件浏览）+ 会话内同名 View |
-| 流水线 | `packages/dsh-cicd`（`@local/dsh-cicd`） | 8 个 `cicd_*` 工具（项目 / 计划 / 执行 / 状态 / 日志 / 发布 / 回滚 / 目标），读仓库 `pipe.yml` 本地构建，经 dsh-remote 发布与自动回滚，运行记录落本地 SQLite（`node:sqlite`） |
+| 流水线 | `packages/dsh-cicd`（`@local/dsh-cicd`） | 20 个 `cicd_*` 工具（项目 / 向导 / 编辑器 / 计划 / 执行 / 取消 / DORA / 触发 / 远端 runner / 审批 / secrets / 环境 / RBAC），读仓库 `pipe.yml` 本地或远端构建，经 dsh-remote 发布与自动回滚，运行记录落本地 SQLite（`node:sqlite`）；28 条精确路由 + 1 条 prefix（webhook）+ 1 条 WebSocket upgrade（实时日志） |
 | 社区资讯 | `packages/dsh-aihot`（`@local/dsh-aihot`） | 8 个 `aihot_*` 工具（精选/搜索/热点/日报/周报/月报/额度重置/来龙去脉），左侧栏「AI 资讯」全局面板（精选 / 热点 / 日报+周报+月报期刊 / 福利）+ 会话内同名 View；卡片可展开「来龙去脉」时间线抽屉并复制链接，也可「读正文」就地看全文 |
 
 设计契约：`docs/SPEC.md`。验收闸门：`test/mount.mjs`（无 Host 环境挂载自检）。
@@ -269,20 +269,27 @@ delete（无 recursive 409）→ delete recursive`；`chmod mode=99` → 400「m
 - **v2.7 汇总路由**：`GET /api/plugins/remote/groups`（免执行头，保留同源检查）→ `{envs:[{name,hosts}], groups:[…], tags:[…]}`，供流水线的 `env:`/`group:`/`tag:` 选择器展开；未配元信息的主机不进任何桶。
 - 门禁：remote smoke **70 checks**、`mount` → remote **36 路由**；本仓库 `hosts.json` 已把 linux26/win22 标 `env: test`（group `web`/`build`）、remote113 标 `env: staging`（group `web`），`env:test` 这类选择器因此可直接用。
 
-## dsh-cicd（本地 CI/CD，M0/M1）
+## dsh-cicd（本地 CI/CD，v0.4 → v2.0-M5）
 
-`pipe.yml` → 本机构建 → 经 dsh-remote 上传到目标机 → `releases/<runId>` + `current` 软链 + `revisions.log` → 重启 + 健康检查（失败自动回滚）→ SQLite（`cicd.db`）运行记录 + 每次发布产物的 sha256。
+`pipe.yml` → 本机构建（或远端 runner 构建，v2.0-M2）→ 经 dsh-remote 上传到目标机 → `releases/<runId>` + `current` 软链 + `revisions.log` → 重启 + 健康检查（失败自动回滚）→ SQLite（`cicd.db`）运行记录 + 每次发布产物的 sha256。
 
 | 工具 | 作用 |
 |---|---|
-| `cicd_projects` / `cicd_targets` | 列出项目与部署目标（target 的 hosts / path / restart / health / current） |
+| `cicd_projects` / `cicd_targets` | 列出项目与部署目标（target 的 hosts / path / runtime / app / onHostFailure / keep / restartCommand / health / current / active） |
+| `cicd_project_meta` / `cicd_project_create` | 项目卡 git 元信息（branch / commit / tag / dirty）；项目向导（本地 / git clone + 5 种脚手架模板） |
+| `cicd_validate` / `cicd_pipe_save` | `pipe.yml` 校验（带行号 + 错误码）；保存（先校验后写盘） |
 | `cicd_plan` | 打印 stage 计划（不执行） |
-| `cicd_run` | 真跑一条流水线（`confirm=1`；`dryRun=1` 只出计划；`stage=<id>` 可只跑单 stage） |
+| `cicd_run` | 真跑一条流水线（`confirm=1`；`dryRun=1` 只出计划；`stage=<id>` 可只跑单 stage；`runner=<id>` 指定远端构建主机） |
 | `cicd_status` / `cicd_logs` | 运行状态与日志（尾部截断） |
-| `cicd_releases` / `cicd_rollback` | 发布记录与回滚（`releaseId` 省略=上一条） |
+| `cicd_cancel` | 取消运行（杀进程树，run 记录标 `canceled`） |
+| `cicd_releases` / `cicd_rollback` | 发布记录与回滚（`releaseId` 省略=上一条；可选 `host` 单机） |
+| `cicd_dora` | DORA 四指标（部署频率 / 变更前置时间 / 变更失败率 / MTTR，默认最近 30 天） |
+| `cicd_triggers` | 触发配置摘要 + webhook URL + 调度器快照（cron / git push polling / manual） |
+| `cicd_runners` | 列出已注册远端 runner（labels / 容量 / 在线状态 / 在跑任务数） |
+| `cicd_approve` / `cicd_secrets` / `cicd_environments` / `cicd_rbac` | 审批门（prod 默认停在「待审批」）/ secrets 存储（DB 只存 ref，载荷 0600）/ 环境晋升路径 / RBAC（server 模式三角色 + 短 TTL token） |
 
-- 路由（10 条，全 GET + `resource`）：`/api/plugins/cicd/{projects,plan,run,runs,log,releases,rollback,targets,operations,notify-test}`；写操作额外要 `x-dsh-cicd: 1` 头 + `confirm=1`。
-- 面板：侧栏「流水线」→ 项目切换 / 目标矩阵 / 阶段计划 / Run 详情（含日志跟随）/ Releases（按主机回滚）/ 审计时间线（v0.6）。
+- 路由（28 条精确 + 1 条 prefix `/hooks/<project>` + 1 条 WebSocket upgrade `/log-ws`）：`/api/plugins/cicd/{projects,project-meta,project-create,validate,pipe-save,plan,run,runs,log,releases,rollback,targets,operations,notify-test,cancel,dora,triggers,runner-register,runner-poll,runner-result,runner-log,runners,approve,approvals,secrets,environments,rbac}`；写操作额外要 `x-dsh-cicd: 1` 头 + `confirm=1`；`runner-*` 五条与 prefix `/hooks/` 不校验同源（跨机 / token 鉴权）。
+- 面板：侧栏「流水线」→ 项目切换 / 目标矩阵 / 阶段计划 / Run 详情（含实时日志跟随）/ Releases（按主机回滚）/ 审计时间线（v0.6）/ 创建向导 / 编辑器（v2.0-M0）/ 构建主机下拉（v2.0-M2）。
 - 真机实测（linux26）：首次发布、内容变更发布、双向回滚、404 保护全部验过，细节与 5 个坑见 [packages/dsh-cicd/README.md](packages/dsh-cicd/README.md)。
 - 存储（v0.3）：运行/步骤/产物/发布/操作全进 `~/.dsh-cicd/cicd.db`（Node 22 内置 `node:sqlite`，WAL，无需原生编译），日志仍是 `logs/<runId>.log` 文本文件；旧版 `runs.jsonl` 首次打开自动导入并改名 `.migrated`。
 - 入口：左侧栏独立一行「流水线」；远程主机面板头部也有 `流水线` 按钮直接跳过去（`@local/dsh-cicd` 未加载时会内联提示重启）。
@@ -294,7 +301,13 @@ delete（无 recursive 409）→ delete recursive`；`chmod mode=99` → 400「m
 - **灰度分批（v0.6）**：target 可写 `canary: { first: 1, waitSec: 30 }`——先发 `first` 台，**首批任一台失败立即停止**（不受 `onHostFailure` 影响），首批全绿后等 `waitSec` 再发剩余；每台结果带 `batch: 1|2`，run 结果带 `canary.batches`，等待期写一条 `canary-hold` 审计。
 - **通知 webhook（v0.6）**：插件配置 `notify.webhooks: [{ url, secret?, events? }]`，事件 `run.success|run.failed|run.canceled|rollback.success|rollback.failed`；并发 POST，配了 `secret` 就带 `x-dsh-signature: sha256=<hex>`（HMAC-SHA256）；**通知失败只记审计，绝不影响发布**；`GET /notify-test?confirm=1` 可试发（未配置返回 `configured: 0`）。
 - **审计时间线（v0.6）**：`operations` 表（schema v3，`ALTER TABLE` 补列 + 回填旧 `kind`）记录 `deploy` / `deploy-failed` / `rollback` / `canary-hold` / `notify`，`GET /operations?project=&runId=&limit=` 按时间倒序，面板有对应表格视图。
-- 边界：同层串行、无远端 runner、无定时触发；**数据库变更不可回滚**，回滚只管站点文件。
+- **项目向导 / 编辑器 / git 元信息（v2.0-M0）**：`/project-create`（5 种脚手架模板）、`/validate` + `/pipe-save`（先校验后写盘）、`/project-meta`（branch / commit / tag / dirty）；跑之前把 `branch`/`commit_sha` 回填进 run 记录，`when: branch/tag` 才有真数据。
+- **触发 / 实时日志 / 取消 / DORA（v2.0-M1）**：入站 webhook（`git push`，token 鉴权）+ 进程内 cron（5 字段）+ git push 轮询（baseline 去重）；WebSocket 实时日志（`/log-ws`，ring buffer 5000 行）；`/cancel` 杀进程树、run 记录标 `canceled`；`/dora` 四指标（默认 30 天，`days` 可传）。
+- **远端 runner（v2.0-M2）**：`bin/runner.mjs` 单文件 CLI（拉取式协议 + journal 幂等 + 自签 TLS）；`cicd_run` 带 `runner=<id>` 把构建步骤派给远端，UI「构建主机」下拉；`/runner-*` 五条路由（register / poll / result / log / runners）。
+- **发布策略（v2.0-M3）**：`target.strategy` 五策略（serial / parallel / rolling / canary / blue-green）+ 策略锁（批次进度可续）；无 `strategy` 字段时退化到 `canary.first/waitSec`。
+- **环境与审批（v2.0-M4）**：target 自动映射 environment（dev < staging < prod 顺序 + 保护 / 审批标志）；prod 默认 `approvalRequired: true`，部署停在「待审批」，`/approve` 解除后仍走 `confirm=prod`（双重确认）；secrets 走 `cicd_secrets` / `/secrets`（DB 只存 ref，载荷 `workDir/.secrets.json` 0600），`${{SECRET_NAME}}` 插值自动注入。
+- **RBAC（v2.0-M5）**：server 模式三角色（viewer / operator / admin）+ 项目范围 + 短 TTL token；`cicd_rbac` / `/rbac` 签发 / 校验 / 吊销，写操作全审计（最近 500 条）。
+- 边界：同层串行、数据库变更不可回滚，回滚只管站点文件。
 
 ## dsh-aihot（AI 资讯 / 福利）
 

@@ -1,6 +1,392 @@
 # @local/dsh-cicd
 
-本地优先的轻量 CI/CD：读仓库里的 `pipe.yml`，构建步骤在本机跑，发布/回滚复用 **dsh-remote** 的 SSH 通道，运行记录落在本地 **SQLite**（Node 22 内置 `node:sqlite`，不需要原生编译），日志仍是文本文件。v0.4 起一个 target 可以 fan-out 到多台主机，并按 `runtime` 预设决定重启命令；v0.6 增加灰度分批、webhook 通知和审计时间线；v2.0-M0 增加项目向导（本地新建 / git clone + 脚手架）、`pipe.yml` 编辑器（校验 + 保存）与项目卡上的 git 元信息；v2.0-M1 补齐触发与反馈闭环：入站 webhook（`git push`）、进程内 cron 调度、git 轮询、WebSocket 实时日志、运行取消与 DORA 四指标；v2.0-M2 把执行面变成可插拔的 Executor 抽象：构建步骤默认在本机跑，也可以指定一台注册过的远端 runner 跑（拉取式协议 + journal 幂等 + 自签 TLS），UI 上以「构建主机」下拉呈现；v2.0-M3 把发布从「串行 fan-out + 2 批灰度」升级为五策略引擎（serial / parallel / rolling / canary / blue-green）+ 策略锁，`pipe.yml` 里 `target.strategy` 配置，滚动中记录批次进度、中断可续；v2.0-M4 把 target 升格为 environment（dev < staging < prod 顺序 + 保护/审批标志），prod 默认 `approvalRequired: true`，部署停在「待审批」，面板/`cicd_approve` 点「通过」才继续；secret 走 `cicd_secrets` 存储（DB 只存 ref，载荷落 `workDir/.secrets.json` 0600），`pipe.yml` 里 `${{SECRET_NAME}}` 插值时自动注入；v2.0-M5 增加 RBAC（远端服务模式）：三角色 viewer/operator/admin + 项目范围 + 短 TTL token，写操作全审计，`cicd_rbac` 签发/校验/吊销。不新增第三方依赖、不自己持有任何 SSH 凭据。
+> **Language**: [English](#english) · [中文](#中文)
+
+---
+
+## English
+
+**@local/dsh-cicd** is a local-first, lightweight CI/CD plugin for DSH.
+
+- Reads `pipe.yml` from your repo; build steps run on the **local** machine (no container, no agent on the host).
+- Deploy / rollback reuse the **dsh-remote** SSH channel (this package owns no SSH code and no credentials).
+- Run history lives in a local **SQLite** file (`node:sqlite`, Node 22 built-in, no native compilation); logs remain plain text files.
+- **No third-party runtime dependencies.**
+
+### Feature line
+
+| Version | Highlights |
+|---|---|
+| v0.4 | One target fans out to many hosts; `runtime` presets decide the restart command |
+| v0.6 | Canary batches, webhook notifications, audit timeline |
+| v2.0-M0 | Project wizard (local / git clone + scaffold), `pipe.yml` editor (validate + save), git metadata on the project card |
+| v2.0-M1 | Triggers & feedback: inbound webhook (`git push`), in-process cron, git polling, WebSocket live logs, run cancel, DORA 4 metrics |
+| v2.0-M2 | Pluggable Executor: builds run locally **or** on a registered remote runner (pull protocol + journal idempotency + self-signed TLS); "Build host" dropdown in the UI |
+| v2.0-M3 | Five deploy strategies (serial / parallel / rolling / canary / blue-green) + strategy lock; `target.strategy` in `pipe.yml`, batch progress resumable |
+| v2.0-M4 | Environments (dev < staging < prod + protected / approval flags), approval gate (prod stops at "pending approval"), secrets (DB stores ref only, payload in `workDir/.secrets.json` 0600, auto-injected into `${{SECRET_NAME}}`) |
+| v2.0-M5 | RBAC for server mode: 3 roles (viewer / operator / admin) + project scope + short-TTL tokens, full audit |
+
+### Layout
+
+| File | Responsibility |
+| --- | --- |
+| `index.js` | Host entry: 20 tools + 28 exact GET routes + 1 prefix route (webhook) + 1 WebSocket upgrade (live logs); assembles the runtime |
+| `lib/pipe.js` | YAML-subset parser, `${{VAR}}` interpolation, restricted `when` expressions, glob, stage-DAG planning, `triggers` normalisation |
+| `lib/runner.js` | Local executor: runs steps stage by stage, writes logs & run records; supports external `runId`, `AbortSignal` cancel, live-log hub |
+| `lib/db.js` | SQLite open / DDL / migration: runs, steps, artifacts, releases, operations, projects + indexes; `PRAGMA user_version` tracks schema (v5, adds `steps.runner_id`) |
+| `lib/store.js` | SQLite storage layer (`cicd.db`, WAL); same API as the old JSONL version; first open imports legacy `runs.jsonl` and renames it `runs.jsonl.migrated` |
+| `lib/remote.js` | dsh-remote loopback HTTP client: exec + chunked upload |
+| `lib/deploy.js` | releases / current symlink deploys, multi-host fan-out, canary batches, runtime-preset restart, health check, auto rollback |
+| `lib/notify.js` | Webhook notifications: concurrent POST + HMAC-SHA256 signing; failures never block a deploy |
+| `lib/git.js` | Git integration: sync HEAD metadata (branch / commit / exact tag / dirty / commit time), async `clone` / `fetch`, `remoteHead`, remote branch snapshot, fast-forward `pullFastForward` |
+| `lib/scaffold.js` | `pipe.yml` scaffold templates (static / node / python / go / bare) for the create-project wizard |
+| `lib/cron.js` | 5-field cron parsing & matching (aliases, ranges, steps, lists); `minuteKey` minute-aligned dedup |
+| `lib/triggers.js` | `triggers` normalisation (push branches / tags / secret, schedule, manual) and ref-glob matching |
+| `lib/scheduler.js` | In-process scheduler: cron tick + git push polling; state in `scheduler-state.json` |
+| `lib/live.js` | Per-run ring-buffer log hub: subscribe / snapshot / end events |
+| `lib/ws.js` | Minimal WebSocket server (handshake, TEXT frame codec, `LogSocket`) |
+| `lib/dora.js` | DORA 4-metric summary: deploy frequency, change lead time, change-failure rate, MTTR |
+| `lib/executors.js` | Executor abstraction (local / remote) + `TaskBroker` (pull-based task dispatch, claim / resolve / cancel) + join-token verification |
+| `lib/strategy.js` | Deploy strategy engine: serial / parallel / rolling / canary / blue-green + strategy lock (batch-progress callback) |
+| `lib/environments.js` | Environment promotion: dev / staging / prod order + protected / approval flags + promotion path |
+| `lib/approval.js` | Approval (block-gate) state machine: request / resolve / isPending / list; prod stops at "pending approval" by default |
+| `lib/secrets.js` | Secret store: DB keeps the ref only, payload in `workDir/.secrets.json` (0600); `refsForInterpolate` injection |
+| `lib/rbac.js` | RBAC (server mode): 3 roles + project scope + short-TTL tokens, audit timeline; payload in `workDir/.rbac.json` (0600) |
+| `bin/runner.mjs` | Single-file remote runner CLI: pull protocol + journal idempotency + self-signed TLS (optional undici) |
+
+### Configuration
+
+```yaml
+# config.yaml (plugins.'@local/dsh-cicd' in the DSH config file)
+workDir: C:\Users\me\.dsh-cicd   # run records / logs dir, default ~/.dsh-cicd
+remoteBase: 5174                 # dsh-remote port; a number becomes http://127.0.0.1:<port>
+defaultTarget: prod
+stepTimeoutSec: 600
+maxLogBytes: 262144
+projects:
+  - id: demo
+    name: Demo
+    path: F:\code\demo           # repo root
+    pipe: F:\code\demo\pipe.yml  # defaults to <path>/pipe.yml when omitted
+    env: {}
+notify:                          # v0.6: optional; failures never block a deploy
+  webhooks:
+    - url: https://hooks.example.com/cicd
+      secret: change-me          # only when set is x-dsh-signature: sha256=<hex> sent
+      events: [run.success, run.failed, rollback.success]
+scheduler:                       # v2.0-M1: in-process scheduling (cron + git push polling)
+  enabled: true                  # false disables the whole scheduler
+  tickSec: 20                    # cron check interval (1..3600)
+  pollSec: 60                    # git polling interval (0 disables, max 3600)
+  allowProd: false               # when true, scheduler-triggered prod deploys auto-carry confirm=prod
+```
+
+Without `projects`, a `pipe.yml` in the current working directory is auto-registered as a project. Omitted `remoteBase` falls back to `webServer.port`.
+
+### pipe.yml
+
+```yaml
+version: 1
+name: demo
+vars:
+  APP: demo
+
+targets:
+  prod:
+    hosts: [linux26, win22]    # dsh-remote host aliases; fan out in order
+    path: /opt/demo           # deploy root
+    runtime: python           # static (default) | node | python | go | php | docker
+    app: demo                 # service name; required for node/python/php, falls back to target name for go/docker
+    onHostFailure: continue   # stop (default) | continue
+    canary:                   # v0.6: first batch covers only the first host, wait 30s before the rest
+      first: 1                # 1..hosts.length; equal to hosts.length means no batching
+      waitSec: 30             # 0..3600, default 30
+    # service: demo.service   # explicit service/restart takes precedence over the runtime preset
+    health:
+      http: http://127.0.0.1:8080/health
+      tries: 5
+      interval: 2s
+
+stages:
+  - id: build
+    steps:
+      - name: install
+        run: npm ci
+      - name: package
+        run: tar -czf dist/${{APP}}.tgz -C dist .
+        retries: 1
+        allow_failure: false
+  - id: release
+    needs: [build]
+    steps:
+      - name: ship
+        deploy:
+          target: prod
+          artifacts: ["dist/*.tgz"]
+          keep: 5
+
+triggers:                        # v2.0-M1: manual-only when omitted
+  push:
+    branches: [main, "release/*"]  # glob, `*` also matches `/`
+    tags: ["v*"]                   # optional; tag ref leaves branch empty
+    target: prod                   # optional, defaults to defaultTarget
+    secret: s3cret                 # required webhook token; inbound requests 403 without it
+  schedule:
+    - cron: "0 3 * * *"            # min hour day month week (local time); aliases/ranges/steps/lists
+      target: staging              # optional
+  manual: true                     # default true
+```
+
+- `needs` forms a DAG; a failed upstream stage skips its dependents.
+- `when` only supports `branch ==/!= 'x'`, `tag ==/!= 'x'`, `env.NAME ==/!= 'x'`, `changed: <glob>` — not scripts.
+- Variable interpolation uses `${{NAME}}`; a missing variable is an error, never silently empty.
+- `deploy` steps release to `target.hosts` in order: each host gets its own `<path>/releases/<runId>`, upload, extract, `current` switch, own `revisions.log` line, restart, health check; each host keeps its own `previous`.
+- A single-host failure stops the remaining hosts by default (`onHostFailure: stop`); with `continue` the rest still deploy, already-succeeded hosts are not rolled back, and the overall `ok` is `false`.
+- Omitting `host` on rollback rolls back every host; passing `host` rolls back just that one. Each host's result is returned separately.
+
+### Canary batches, notifications & audit (v0.6)
+
+`target.canary` splits one fan-out into two batches:
+
+- Batch 1 deploys `first` hosts in order; **any failure stops immediately** (even with `onHostFailure: continue`); remaining hosts are not tried; overall `ok:false`.
+- All of batch 1 succeeds → one `canary-hold` audit entry + log line `[canary] first batch N hosts OK, waiting Xs before remaining M` → wait `waitSec` → remaining hosts deploy per `onHostFailure`.
+- Each host result carries `batch: 1|2`; the run result carries `canary: {first, waitSec, batches:[{index,hosts,ok}]}`. `first` equal to the host count is equivalent to no batching.
+- `first` outside `1..hosts.length`, `waitSec` outside `0..3600`, or a non-map `canary` all raise `PIPE_INVALID`, naming the target and field.
+
+Webhook notifications (config above):
+
+- Events: `run.success` / `run.failed` / `run.canceled` / `rollback.success` / `rollback.failed`; `notify-test` sends `test`.
+- Concurrent POST JSON; `secret` adds `x-dsh-signature: sha256=<hex>` (HMAC-SHA256 over the raw body). Omitted `events` means send all.
+- Each result is written to the `notify` audit trail (`status: success|failed`); **any failure is logged/audited only and never affects the deploy**. `GET /notify-test` fires a trial; zero configured webhooks returns `configured: 0` instead of an error.
+- The payload always contains `{event,at,project,target,runId,releaseId,status,durationMs,hosts:[{host,ok,batch,health,error}],prod}`; `prod:true` when any target host is production.
+
+Audit timeline: the `operations` table (schema v3) is `(id,at,action,project,target,host,run_id,release_id,status,detail)`; old DBs auto-`ALTER TABLE` and backfill the legacy `kind` into `action`. `GET /api/plugins/cicd/operations?project=&runId=&limit=` (default 50, max 200) returns newest first. Every per-host deploy, per-host rollback, `canary-hold` and `notify` writes one entry.
+
+### Multi-host fan-out & runtime presets
+
+`target.hosts` is an **ordered** deploy list, not a concurrency pool: the next host starts only after the previous one finishes (or fails). Each `hosts` entry in the response looks like `{host,ok,health,restarted,error,code}`; a host skipped because an earlier one failed carries `skipped:true`.
+
+`runtime` (default `static`) generates a default restart command when neither `restart` nor `service` is set; every command ends in `|| true` so a failed restart cannot wedge the deploy.
+
+| runtime | `app` | default restart command |
+| --- | --- | --- |
+| `static` | not required | no restart; log says "skipping restart" |
+| `node` | required | `pm2 restart '<app>' \|\| systemctl --user restart '<app>' \|\| sudo -n systemctl restart '<app>' \|\| true` |
+| `python` / `go` / `php` | required | `systemctl --user restart '<app>' \|\| sudo -n systemctl restart '<app>' \|\| true` |
+| `docker` | optional, defaults to target name | `docker restart '<app>' \|\| docker compose up -d --no-build \|\| true` |
+
+Precedence: explicit `restart:` > `service:` > runtime preset. Writing both `service` and `restart` is `PIPE_INVALID`; an unknown `runtime`, a missing or illegal `app` (node/python/php), a non-positive-integer `keep`, a non-absolute `path`, or an `onHostFailure` other than `stop`/`continue` all raise `PIPE_INVALID` naming the target and field.
+
+Target field reference (the client renders against this):
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `hosts` | `string[]` | non-empty, de-duplicated host aliases |
+| `path` | `string` | remote deploy root, absolute; empty = default |
+| `runtime` | `static\|node\|python\|go\|php\|docker` | default `static` |
+| `app` | `string` | service name; required for node/python/php |
+| `onHostFailure` | `stop\|continue` | default `stop` |
+| `canary` | `{first,waitSec}` | v0.6 canary batching; omit for a single fan-out |
+| `keep` | `number` | keep the last N releases, default 5 |
+| `service` / `restart` | `string` | pick one; overrides the runtime preset |
+| `restartCommand` | `string` | read-only derived value: the restart command that will actually run |
+| `health` | `{http,tries,interval}` | health check |
+| `current` | `string` | current symlink target (read-only) |
+| `active` | `{host,releaseId}[]` | per-host currently-active release (read-only) |
+
+### Environment selectors & production guard (v0.5)
+
+Besides host aliases, `target.hosts` accepts selectors: `env:prod`, `group:api`, `tag:canary`, freely mixed with aliases. Parse time only checks syntax (`^(env|group|tag):[a-z0-9._-]{1,32}$`); **real expansion happens before deploy**:
+
+1. `/plan` and `/targets` expand lazily (reading dsh-remote's `/api/plugins/remote/hosts` and `/groups`, 5 s cache); the response gains `selectors`, `envs`, `prodHosts`, and `/plan` adds `willDeployToProd`.
+2. Empty expansion → `400 PIPE_INVALID` "selector env:nope matched no host".
+3. Mixed entries keep order; duplicate aliases keep only the first occurrence.
+
+Production guard: if any expanded host has `env === 'prod'`, `/run` and `/rollback` must use `confirm=prod` (not `confirm=1`), otherwise the response is:
+
+```json
+{ "ok": false, "error": "target web contains production hosts (linux26, api1); writes need confirm=prod", "code": "PROD_CONFIRM_REQUIRED", "hosts": ["linux26", "api1"] }
+```
+
+HTTP status **409**. The panel turns this error into a production-guard card (`.cicd-prod-guard`, listing affected hosts); only "Confirm deploy to production" resends with `confirm=prod`. `dryRun` never triggers the guard.
+
+Deploy lock: only one real deploy per target at a time; a second attempt immediately gets `409 DEPLOY_IN_PROGRESS` "target web already has a deploy running, try again after it finishes". `dryRun` takes no lock; the in-process Map is released in `finally`.
+
+Release records gained an `env` column (`SCHEMA_VERSION` 1 → 2; old DBs auto-`ALTER TABLE`, history rows have `env` as empty string); `/releases` supports `env=` filtering.
+
+### Project wizard, editor & git metadata (v2.0-M0)
+
+The panel toolbar adds two mutually exclusive views — **Create** and **Edit** — alongside **Release** and **Audit**:
+
+- **Create wizard**: project name / target directory (optional git repo URL + branch), pick a scaffold template (static/node/python/go/bare). `/project-create` writes a minimal `pipe.yml` that passes `parsePipe` out of the box (build → release). With a repo URL it runs `git clone --depth 1` first; clone failure raises `GIT_CLONE_FAILED` / `GIT_CLONE_TIMEOUT`; a target dir that already has a `pipe.yml` raises `PROJECT_CREATE_FAILED`. Projects are recorded in the SQLite `projects` table (schema v4) and listed on the next start.
+- **Editor**: `/project-meta` returns `pipeSource` for the textarea; **Validate** goes through `/validate?source=` (or `?project=` to validate the on-disk file) with line numbers and error codes; **Save** goes through `/pipe-save confirm=1`, writes only when valid, then refreshes targets and clears the stale plan.
+- **Git metadata**: the project card shows one more line `branch · commit · tag · dirty` (sync `readGitMeta` from `/project-meta`); before a run, `branch`/`commit_sha` are back-filled into the run record so `when: branch/tag` has real data. Git unavailable or a corrupt repo degrades to empty values — the panel never crashes and the pipeline is never blocked.
+
+Four new tools (`cicd_project_meta` / `cicd_project_create` / `cicd_validate` / `cicd_pipe_save`) and four routes (`/project-meta` `/project-create` `/validate` `/pipe-save`); route contracts match the existing resources (reads need same-origin only; writes additionally need the `x-dsh-cicd` header + `confirm=1` and reject unknown query params).
+
+### Triggers, live logs, cancel & DORA (v2.0-M1)
+
+Three trigger modes coexist; manual is always available:
+
+- **Inbound webhook (git push)**: the GET prefix route `/api/plugins/cicd/hooks/<project>` (POST-equivalent), query params `ref` (required, e.g. `refs/heads/main`), `sha`, `event`, `token` (or the `x-cicd-token` header), `confirm`. `triggers.push.branches`/`tags` match the ref with globs (`*` crosses `/`); on a branch hit it first runs an async `fetch`, tries a fast-forward when the working tree is on that branch, then records one `trigger='push'` run and returns 202 + `runId` immediately. Non-matching refs return 200 `{ok:true,skipped:true}` with no run record. Auth: no `triggers.push` or no `secret` in the pipe → 403 `WEBHOOK_DISABLED`; token mismatch (sha256 + constant-time compare) → 401 `WEBHOOK_UNAUTHORIZED`. Because the request may come from GitHub/GitLab, this route **does not require same-origin**; identity is the token only.
+- **cron**: each `triggers.schedule` entry is a 5-field cron + optional target. The scheduler checks on `tickSec` alignment and dedupes by `minuteKey` (`YYYY-MM-DDTHH:mm`), persisted in `scheduler-state.json` so the same minute never fires twice across a restart.
+- **git push polling**: with `pollSec > 0` it periodically `git fetch`es and reads `refs/remotes/origin/*`. The first poll only builds a baseline (existing branches never trigger); afterwards a changed branch sha or a new branch appearing after the baseline triggers a `trigger='push'` run. Runs for one project are serial, never stacked.
+
+Live logs: `ws://<host>/api/plugins/cicd/log-ws?runId=<id>` (`registerUpgrade`, same port as HTTP). On connect you first receive `{type:'snapshot',runId,truncated,lines}`, then per-line `{type:'line',stageId,index,line}`; after `{type:'end',status}` the server closes. When the run already finished or is not in the in-memory hub, the last 2000 lines of `logs/<runId>.log` are sent as the snapshot plus `end`; missing `runId` → 400, unknown run → 404. The hub keeps the last 5000 lines per run.
+
+Cancel: the `cicd_cancel` tool or `/cancel?runId=&confirm=1`. Cancelling a running run → `AbortController.abort()`, the current step's whole process tree is killed (`taskkill /T /F` on Windows), the run record gets `status='canceled'`, `error='canceled'`. Ended / nonexistent runs return `RUN_NOT_ACTIVE` / `RUN_NOT_FOUND` (HTTP 409 / 404). Cancel is idempotent; a repeated call returns `canceling`.
+
+DORA 4 metrics (`cicd_dora` tool, `/dora` route, last 30 days by default, `days` overridable): deploy frequency (successful runs / day, rated elite/high/medium/low), change lead time (median of `finished_at − git commit time`), change-failure rate (failed+canceled over all non-dryRun runs), MTTR (average time from a failure to the next success on the same project+target). `dryRun` and unfinished runs are excluded; `series` gives up to 60 daily `{deployments,failures,canceled}` points for trend charts.
+
+Three new tools (`cicd_cancel` / `cicd_dora` / `cicd_triggers`) and four routes (`/cancel` `/dora` `/triggers` + prefix `/hooks/<project>`) plus one WebSocket upgrade (`/log-ws`). The scheduler starts with the plugin in `apply()`; `dispose()` stops its timers and releases the hub.
+
+### Tools
+
+`cicd_projects` / `cicd_project_meta` / `cicd_project_create` / `cicd_validate` / `cicd_pipe_save` / `cicd_plan` / `cicd_run` (`dryRun`, `stage`, `confirm`, `runner`) / `cicd_status` / `cicd_logs` / `cicd_releases` (filter by `host`) / `cicd_rollback` (optional `host`) / `cicd_targets` (runtime/app/onHostFailure/keep/restartCommand + per-host active) / `cicd_cancel` (`runId`) / `cicd_dora` (`project`, `days`) / `cicd_triggers` (`project`, returns the triggers summary, webhook URL and scheduler snapshot) / `cicd_runners` (lists registered runners: labels, capacity, online state, active task count) / `cicd_approve` (`runId`, `decision`, `resolvedBy`) / `cicd_secrets` (`project`, `scope`, `name`, `value`) / `cicd_environments` (`project`) / `cicd_rbac` (`user`, `role`, `projects`, `ttlSec`, `token`, `action`).
+
+### HTTP routes (GET + resource, plus 1 prefix and 1 upgrade)
+
+`/api/plugins/cicd/{projects,project-meta,project-create,validate,pipe-save,plan,run,runs,log,releases,rollback,targets,operations,notify-test,cancel,dora,triggers,runner-register,runner-poll,runner-result,runner-log,runners,approve,approvals,secrets,environments,rbac}` — 28 exact routes; `run` takes an optional `runner` param to pick the build host; the five `runner-*` routes are the remote-runner pull protocol (register carries the join token, poll doubles as heartbeat, result is idempotent, log pushes line by line) and **do not check same-origin** (cross-machine calls), authenticated by the join token; `runners` requires same-origin. Two special entries: the prefix route `/hooks/<project>` (inbound webhook, token-authenticated, no same-origin check) and the upgrade `/log-ws?runId=` (live logs).
+
+### Remote runner (v2.0-M2)
+
+Build steps run locally by default; when `pipe.yml` has `targets` but the machine has no Node, you can hand the build steps to a registered remote runner:
+
+1. **Register**: on the remote machine run `node bin/runner.mjs --server https://host:port --runner build-01 --labels node,builder --join-token <secret>` → `/runner-register` (join-token check, sha256 constant-time compare).
+2. **Pull protocol**: the runner polls `/runner-poll` to claim tasks (doubling as heartbeat, every 15 s). When the host side runs `cicd_run` with `runner=build-01`, the build steps are dispatched to that runner through the `TaskBroker`; results come back via `/runner-result` (idempotent: `resolve` honours only the first), logs stream line-by-line via `/runner-log` (dropped lines are acceptable; the result is what matters).
+3. **Journal idempotency / power-loss resume**: the runner records `{taskId, attempt, status, exitCode}` in a local `journal.jsonl`; after a restart, `status=success` tasks are skipped, unfinished ones retry with `attempt+1` — the host-side `resolve` idempotency guarantees repeated reports for the same taskId never change state.
+4. **Self-signed TLS**: `--ca <file>` sets the CA (undici `setGlobalDispatcher`); `--insecure` skips certificate verification (intranet debugging only).
+5. **UI**: the panel toolbar adds a "Build host" dropdown after "Target" (local / registered runners, offline marked `(offline)`); selecting one makes `cicd_run` carry the `runner` param automatically.
+6. **Cancel**: host-side `cicd_cancel` calls `broker.cancelAll(runnerId)` for remote runs; the runner's `cancelSignal` kills the child process tree.
+
+### Deploy strategies (v2.0-M3)
+
+`target.strategy` in `pipe.yml` upgrades deploys from "serial fan-out + 2-batch canary" to a five-strategy engine:
+
+```yaml
+targets:
+  prod:
+    hosts: [h1, h2, h3, h4, h5]
+    path: /srv/app
+    runtime: static
+    strategy:
+      type: rolling        # serial / parallel / rolling / canary / blue-green
+      batch: 2             # rolling: hosts per batch (default ceil(hosts/2))
+      waitSec: 30          # rolling/canary/blue-green: wait between batches (default 30)
+      onHostFailure: stop  # stop (default) / continue
+```
+
+| Strategy | Semantics | Notes |
+|---|---|---|
+| `serial` | Deploy host by host; one failure stops | Default (falls back when no `strategy` field) |
+| `parallel` | All hosts concurrently | Failure handled per `onHostFailure` |
+| `rolling` | N hosts per batch, wait `waitSec` between | Single-host failure stops/skips per strategy; within a batch it is serial |
+| `canary` | First `first` hosts + observation window + auto scale-out | Equivalent to the old 2-batch canary; `first` configurable; a first-batch failure always stops |
+| `blue-green` | Spin up a full new set, cut traffic, retire the old | Any host failure → all hosts auto-roll back to `previous` |
+
+- **Strategy lock**: during rolling, the `onStrategyProgress` callback records batch progress (batch index + completed hosts); the host side writes it to `store.operations` (`action:'strategy-progress'`); after a cancel you can resume from the last batch.
+- **Compat**: without a `strategy` field, the existing `canary.first/waitSec` is used; the `canary` field still works.
+- Rollback is still one-click `current` switch-back (`cicd_rollback`).
+
+### Environments & approval (v2.0-M4)
+
+`pipe.yml` targets map automatically to environments (dev < staging < prod order, `lib/environments.js`):
+
+- **prod protected by default**: `targetName === 'prod'` (case-insensitive) → `protected: true` + `approvalRequired: true`; explicit `protected: true` / `approvalRequired: true` also work.
+- **Approval gate (block gate)**: an `approvalRequired` target stops at "pending approval" in `executeRun` and raises `APPROVAL_REQUIRED` (HTTP 409). The panel / `cicd_approve` "Approve" (`decision=approve`) re-runs `executeRun`; on approval → `approval-resolved` audit → the `confirm=prod` guard still applies (double confirmation). Reject → `approval-rejected`.
+- **secrets**: the `cicd_secrets` tool / `/secrets` route sets and lists secrets; the DB stores refs only, payloads land in `workDir/.secrets.json` (0600, atomic write); `${{SECRET_NAME}}` interpolation in `pipe.yml` is auto-injected via `refsForInterpolate`, never written in plaintext to logs or the DB.
+- **Promotion path**: the `cicd_environments` tool / `/environments` route lists environments + `promotionPath` (dev → staging → prod).
+- **Artifact cache**: not implemented this round (`lib/cache.js` deferred); the existing `artifacts` table already records each run's artifacts, and the `keep` cleanup reuses `cleanupReleases` from deploy.js.
+
+### RBAC (v2.0-M5, server mode)
+
+Server mode enables 3-role RBAC (`lib/rbac.js`; single-machine mode has no roles):
+
+| Role | Read | Write | Admin |
+|---|---|---|---|
+| `viewer` | ✅ | ❌ | ❌ |
+| `operator` | ✅ | within project scope | ❌ |
+| `admin` | ✅ | all | ✅ |
+
+- **Token issuance**: the `cicd_rbac` tool / `/rbac` route (`user=alice&role=admin&ttlSec=3600`) → returns `rbac-xxxxxxxx` (sha256 digest persisted, `workDir/.rbac.json` 0600); tokens have a short TTL and expire automatically (`TOKEN_EXPIRED`).
+- **Permission checks**: `canWrite(user, project)` by role + project scope (`*` for all, or a comma list); `canAdmin(user)` is admin-only.
+- **Audit**: every token issue / revoke / write operation lands in the audit timeline (last 500); `action=audit` exports all (chronological).
+- **Revoke**: `action=revoke&user=alice` immediately invalidates that user's tokens.
+
+### Security boundaries
+
+- No arbitrary YAML parsing: only maps / sequences / inline arrays / scalars; block scalars (`|`, `>`) and flow maps are hard errors.
+- Build commands come only from `pipe.yml` `run` fields, executed in the project directory via shell; `dryRun` only prints the plan.
+- Deploys add no credentials: everything goes through dsh-remote's loopback routes; uploads are 8 KB chunks, single file capped at 64 MB.
+- Webhooks only POST to the http(s) URLs configured; payloads carry no credentials; failures are audited only — no retry, never blocks a deploy.
+- Inbound webhooks do not trust the source: `triggers.push.secret` must be set in the pipe; the token is compared with sha256 constant-time; without a secret every inbound request is 403 and no build is ever triggered.
+- The live-log WebSocket shares the HTTP port and same-origin policy: auth follows the DSH webserver's session boundary; only that run's logs are pushed by `runId` (the logs are already on disk, so this is not a new exposure).
+- Scheduler-triggered prod deploys are blocked by the production guard by default (`allowProd: false`); enabling it explicitly makes them carry `confirm=prod` automatically.
+- Remote-runner `runner-*` routes skip the same-origin check (cross-machine) and rely on the join token (sha256 constant-time); `resolve` idempotency guarantees repeated reports for one taskId never change state; dropped log lines are acceptable, the result is what matters.
+- `bin/runner.mjs` `--insecure` is for intranet debugging only; production should use `--ca <file>`.
+- Secret payloads live in `workDir/.secrets.json` (0600); the DB keeps refs; `refsForInterpolate` injection never lands in logs or the DB in plaintext.
+- Approval gate: prod defaults to "pending approval"; `/approve` unblocks, then the `confirm=prod` guard still applies (double confirmation); approval records land in `store.operations` (`action='approval-request/approval-resolved/approval-rejected'`).
+- RBAC tokens live in `workDir/.rbac.json` (0600); the DB keeps sha256 digests only; short TTL (default 3600 s) with automatic expiry; every write is audited (last 500), `action=audit` exports all.
+- Log reads are truncated at `maxLogBytes`; `runId` passes a character whitelist.
+
+### Self-checks
+
+```bash
+node packages/dsh-cicd/test/smoke.mjs   # 73 checks: parse/plan/store/run/deploy/canary/notify/audit/routes/selectors/guard/locks/migration/wizard/editor/scaffold/cron/triggers/scheduler/webhook/log-ws/cancel/DORA/executor/broker/joinToken/strategy(5+lock)/environments/approvalGate/secrets/RBAC
+node test/mount.mjs                     # full mount gate (this package: 20 tools / 28 routes)
+```
+
+No real SSH: the tests use a fake fetch for remote and a command-recording fake remote for deploy.
+
+### Cold-start route registration & lazy remote (v0.6.1)
+
+Same disease as dsh-remote: at cold start `webServer` comes up after the plugin's `apply()`, so a synchronous `ctx.get('webServer')` in apply returned nothing → the whole package's routes 404. Since v0.6.1 route registration is hooked on `ctx.inject(['webServer'], …)` (re-registers everything once ready — 28 exact + 1 prefix + 1 upgrade); `remote()` is lazy — when `options.remoteBase` is empty, the first call reads `ctx.get('webServer').port`; if unavailable it returns an uncached client (keeping a retryable `REMOTE_UNAVAILABLE`). The smoke suite has a cold-start regression (0 routes → 28 + 1 upgrade + remote-base assertion).
+
+### Gotchas hit in the wild (v0.2)
+
+Five pitfalls from the first real run (linux26 + dsh-remote), all fixed and locked in the smoke suite:
+
+1. **`pkill -f 'http.server 8099'` kills itself**: the `restart` command's own command line contains that string, so pkill matches it → exec returns an empty exit and the service never started. Switched to port-based kill: `fuser -k 8099/tcp`.
+2. **Multiple artifact hits must take the newest**: `dist/app-*.tgz` matching several old packages would deploy the alphabetically-first one. Now picks by mtime.
+3. **dsh-remote's exec reply is `{ok, result}`**: the health check must flatten `result` before reading `exitCode`, or it always fails even when the page is 200.
+4. **Health-check retry waits must not `unref()`**: a script / short-lived process empties the event loop while waiting (`unsettled top-level await`).
+5. **`RELEASE_ID` must be generated before plan**: runId is now created first so `${{RELEASE_ID}}` actually interpolates into artifact names (previously always `dist/app-.tgz`).
+
+Also: a first-deploy health-check failure removes `current` (there is no `previous` to roll back to; a bad version is not left live).
+
+### Real-machine proof (linux26 / python3 http.server)
+
+- First deploy: build 144 ms + deploy 2326 ms, `current -> releases/<runId>`, `curl` served the real page, `revisions.log` gained a line.
+- Second deploy (content changed): the new marker appeared → rolled back to the previous: marker gone, `current` pointed back to the old release, `revisions.log` gained `rollback:<id>`; rolling forward brought the marker back.
+- Rolling back a release already cleaned by `keep` → 404 `RELEASE_NOT_FOUND`, live site untouched.
+
+---
+
+## 中文
+
+**@local/dsh-cicd** 是本地优先的轻量 CI/CD：读仓库里的 `pipe.yml`，构建步骤在本机跑，发布/回滚复用 **dsh-remote** 的 SSH 通道，运行记录落在本地 **SQLite**（Node 22 内置 `node:sqlite`，不需要原生编译），日志仍是文本文件。不新增第三方依赖、不自己持有任何 SSH 凭据。
+
+> 中文版的各章节（灰度分批、多主机 fan-out、环境选择器、项目向导、触发/实时日志/取消/DORA、远端 runner、发布策略、环境与审批、RBAC、安全边界、自检、冷启动、实战坑、真机实测）与英文版一一对应，内容相同，此处不再重复全文——以英文版为权威，中文版仅作对照速查。若需要完整中文逐字版，见 `docs/proposals/cicd-v2.md`（设计提案）与各版本提交说明。
+
+### 功能线（速查）
+
+| 版本 | 亮点 |
+|---|---|
+| v0.4 | 一个 target fan-out 多主机；`runtime` 预设决定重启命令 |
+| v0.6 | 灰度分批、webhook 通知、审计时间线 |
+| v2.0-M0 | 项目向导（本地 / git clone + 脚手架）、`pipe.yml` 编辑器（校验+保存）、项目卡 git 元信息 |
+| v2.0-M1 | 触发与反馈：入站 webhook（`git push`）、进程内 cron、git 轮询、WebSocket 实时日志、运行取消、DORA 四指标 |
+| v2.0-M2 | 可插拔 Executor：构建本机或远端 runner（拉取协议 + journal 幂等 + 自签 TLS）；UI「构建主机」下拉 |
+| v2.0-M3 | 五发布策略（serial / parallel / rolling / canary / blue-green）+ 策略锁；`target.strategy` 配置，批次进度可续 |
+| v2.0-M4 | 环境升格（dev < staging < prod + 保护/审批标志）、审批门（prod 停在待审批）、secrets（DB 只存 ref，载荷落 `workDir/.secrets.json` 0600） |
+| v2.0-M5 | 远端服务 RBAC：三角色 viewer / operator / admin + 项目范围 + 短 TTL token，写操作全审计 |
+
+### 自检
+
+```bash
+node packages/dsh-cicd/test/smoke.mjs   # 73 项
+node test/mount.mjs                     # 全包挂载闸门（本包 20 工具 / 28 路由）
+```
 
 ## 组成
 
@@ -218,11 +604,11 @@ DORA 四项指标（`cicd_dora` 工具、`/dora` 路由，默认最近 30 天，
 
 ## 工具
 
-`cicd_projects` / `cicd_project_meta` / `cicd_project_create` / `cicd_validate` / `cicd_pipe_save` / `cicd_plan` / `cicd_run`（`dryRun`、`stage`、`confirm`、`runner`）/ `cicd_status` / `cicd_logs` / `cicd_releases`（可按 `host` 过滤）/ `cicd_rollback`（可选 `host`）/ `cicd_targets`（含 runtime/app/onHostFailure/keep/restartCommand 与每台 active）/ `cicd_cancel`（`runId`）/ `cicd_dora`（`project`、`days`）/ `cicd_triggers`（`project`，返回 triggers 摘要、webhook URL 与调度器快照）/ `cicd_runners`（列出已注册 runner：labels、容量、在线状态、在跑任务数）。
+`cicd_projects` / `cicd_project_meta` / `cicd_project_create` / `cicd_validate` / `cicd_pipe_save` / `cicd_plan` / `cicd_run`（`dryRun`、`stage`、`confirm`、`runner`）/ `cicd_status` / `cicd_logs` / `cicd_releases`（可按 `host` 过滤）/ `cicd_rollback`（可选 `host`）/ `cicd_targets`（含 runtime/app/onHostFailure/keep/restartCommand 与每台 active）/ `cicd_cancel`（`runId`）/ `cicd_dora`（`project`、`days`）/ `cicd_triggers`（`project`，返回 triggers 摘要、webhook URL 与调度器快照）/ `cicd_runners`（列出已注册 runner：labels、容量、在线状态、在跑任务数）/ `cicd_approve`（`runId`、`decision`、`resolvedBy`）/ `cicd_secrets`（`project`、`scope`、`name`、`value`）/ `cicd_environments`（`project`）/ `cicd_rbac`（`user`、`role`、`projects`、`ttlSec`、`token`、`action`）。
 
 ## HTTP 路由（GET + resource，另加 1 条 prefix 与 1 条 upgrade）
 
-`/api/plugins/cicd/{projects,project-meta,project-create,validate,pipe-save,plan,run,runs,log,releases,rollback,targets,operations,notify-test,cancel,dora,triggers,runner-register,runner-poll,runner-result,runner-log,runners}` 共 22 条精确路由；`run` 支持可选 `runner` 参数指定构建主机；`runner-*` 五条是远端 runner 拉取式协议的入口（register 带 join token、poll 兼心跳、result 回报幂等、log 逐行推送），**不校验同源**（跨机调用），靠 join token 鉴权；`runners` 要求同源。另外两条特殊入口：prefix 路由 `/hooks/<project>`（入站 webhook，靠 token 鉴权、不校验同源）与 upgrade `/log-ws?runId=`（实时日志）。
+`/api/plugins/cicd/{projects,project-meta,project-create,validate,pipe-save,plan,run,runs,log,releases,rollback,targets,operations,notify-test,cancel,dora,triggers,runner-register,runner-poll,runner-result,runner-log,runners,approve,approvals,secrets,environments,rbac}` 共 28 条精确路由；`run` 支持可选 `runner` 参数指定构建主机；`runner-*` 五条是远端 runner 拉取式协议的入口（register 带 join token、poll 兼心跳、result 回报幂等、log 逐行推送），**不校验同源**（跨机调用），靠 join token 鉴权；`runners` 要求同源。另外两条特殊入口：prefix 路由 `/hooks/<project>`（入站 webhook，靠 token 鉴权、不校验同源）与 upgrade `/log-ws?runId=`（实时日志）。
 
 ## 远端 runner（v2.0-M2）
 
@@ -316,7 +702,7 @@ node test/mount.mjs                     # 全包挂载闸门（本包 20 工具 
 
 ## 冷启动路由注册与惰性 remote（v0.6.1）
 
-与 dsh-remote 同病：冷启动时 `webServer` 晚于插件 `apply()`，v0.6.0 起在 apply 里同步 `ctx.get('webServer')` 拿不到服务 → 整包路由 404。v0.6.1 起路由注册挂到 `ctx.inject(['webServer'], …)`（就绪后补注册全部路由，v2.0-M2 起是 23 条 = 22 exact + 1 prefix，外加 1 条 upgrade）；`remote()` 改惰性解析——`options.remoteBase` 为空时首次调用从 `ctx.get('webServer').port` 取，取不到返回未缓存客户端（保持可重试的 `REMOTE_UNAVAILABLE`）。smoke 有冷启动回归（0 路由 → 23 条路由 + 1 条 upgrade + remote base 断言）。
+与 dsh-remote 同病：冷启动时 `webServer` 晚于插件 `apply()`，v0.6.0 起在 apply 里同步 `ctx.get('webServer')` 拿不到服务 → 整包路由 404。v0.6.1 起路由注册挂到 `ctx.inject(['webServer'], …)`（就绪后补注册全部路由，v2.0-M5 起是 28 条精确路由 + 1 条 prefix + 1 条 upgrade）；`remote()` 改惰性解析——`options.remoteBase` 为空时首次调用从 `ctx.get('webServer').port` 取，取不到返回未缓存客户端（保持可重试的 `REMOTE_UNAVAILABLE`）。smoke 有冷启动回归（0 路由 → 28 条精确路由 + 1 条 prefix + 1 条 upgrade + remote base 断言）。
 
 ## 实战踩到的坑（v0.2）
 
