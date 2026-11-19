@@ -135,9 +135,24 @@ window.__ModuleLoader__.load({
 .cicd-log-line.is-highlight{border-radius:3px;background:var(--dsw-alias-state-warn-bg, rgba(255,159,10,.16));color:var(--dsw-alias-label-primary)}
 .cicd-note{margin:0;color:var(--dsw-alias-label-tertiary);font-size:11.5px;line-height:17px}
 .cicd-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:18px 10px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;text-align:center}
-.cicd-loading{display:flex;align-items:center;gap:8px;padding:10px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
-.cicd-skeleton{width:100%;height:34px;border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-skeleton)}
+.cicd-empty-icon{font-size:16px;line-height:20px;opacity:.75}
+.cicd-empty.is-select .cicd-empty-icon{color:var(--dsw-alias-brand-primary);opacity:1}
+.cicd-empty.is-unavailable .cicd-empty-icon{color:var(--dsw-alias-state-warning-primary, var(--dsw-alias-label-secondary));opacity:1}
+.cicd-empty-title{color:var(--dsw-alias-label-primary);font-size:12.5px;line-height:18px;font-weight:600}
+.cicd-empty-text{max-width:52ch}
+.cicd-empty-hint{color:var(--dsw-alias-label-dimmed);font-size:11px;line-height:16px;max-width:52ch}
+.cicd-empty-action{margin-top:4px}
+.cicd-log-placeholder{display:flex;align-items:center;justify-content:center;height:100%}
+.cicd-nav-loading{padding:6px 12px;color:var(--dsw-alias-label-tertiary);font-size:11.5px;line-height:16px}
+.cicd-nav-retry{margin:6px 10px;padding:4px 8px;border:.5px solid var(--dsw-alias-state-error-primary);border-radius:var(--dsw-radius-sm, 6px);background:transparent;color:var(--dsw-alias-state-error-primary);font:inherit;font-size:11.5px;line-height:16px;cursor:pointer}
+.cicd-loading{display:flex;flex-direction:column;gap:6px;padding:10px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.cicd-loading-text{display:flex;align-items:center;gap:8px}
+.cicd-skeleton-list{display:flex;flex-direction:column;gap:6px}
+.cicd-skeleton{width:100%;height:34px;border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-skeleton);animation:cicd-pulse 1.4s ease-in-out infinite}
+@keyframes cicd-pulse{0%,100%{opacity:.55}50%{opacity:1}}
+@media (prefers-reduced-motion: reduce){.cicd-skeleton{animation:none}}
 .cicd-error{display:flex;flex-direction:column;gap:4px;padding:9px 10px;border:.5px solid var(--dsw-alias-state-error-primary);border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-1)}
+.cicd-error-title{color:var(--dsw-alias-label-primary);font-size:12px;line-height:17px;font-weight:600}
 .cicd-error-message{color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:17px;overflow-wrap:anywhere}
 .cicd-error-code{color:var(--dsw-alias-label-dimmed);font-size:11px;line-height:15px}
 .cicd-error-hint{color:var(--dsw-alias-label-secondary);font-size:11.5px;line-height:16px}
@@ -346,6 +361,21 @@ window.__ModuleLoader__.load({
       BAD_RESPONSE: 'Host 返回的不是预期的 JSON：对应路由可能还没落地，稍后再试。',
       PROD_CONFIRM_REQUIRED: '这次发布包含生产主机：读一遍受影响主机，确认后点「确认发布到生产」。',
       DEPLOY_IN_PROGRESS: '同一个 target 已经有一次发布在跑：等它结束（或看日志）再重试。',
+      // v3.0-P6-7：这几条以前只显示错误码，用户看不出下一步该做什么。
+      UNAUTHORIZED: '这次请求没有身份：先登录，或用一个有效的 API token 再试。',
+      FORBIDDEN: '当前身份没有这个操作的权限：找项目 owner 授予角色，或换一个有权限的 token。',
+      AUTH_REQUIRED: '这个操作需要登录：先登录再重试。',
+      TOKEN_INVALID: 'API token 无效或已过期：重新签发一个再试。',
+      NOT_FOUND: 'Host 上找不到这个资源：它可能已被移动或删除，刷新列表看看。',
+      UNSUPPORTED: '当前 Host 版本还不支持这个功能：升级 dsh-cicd 后再试。',
+      ENV_GUARD_MISCONFIGURED: '环境护栏配置写坏了：检查 pipe.yml 的 environments 段（allowlist / 分支规则）。',
+      ENV_GUARD_NO_ALLOWLIST: '这个环境是受保护的，但没有任何人写在名单里：先在 pipe.yml 的 environments 里加 allowedActors。',
+      ENV_ACTOR_NOT_ALLOWED: '当前身份不在这个环境的 allowlist 里：让 owner 把你加进 allowedActors。',
+      ENV_BRANCH_NOT_ALLOWED: '这个分支不允许发布到这个环境：检查 environments 的 branch 规则，或换分支。',
+      ENV_DIGEST_REQUIRED: '这个环境只接受可追溯到 digest 的产物：改用构建产物发布，别直接发工作区代码。',
+      APPROVAL_REQUIRED: '这次发布在等审批：让另一位成员到「审批」页通过它，之后会继续。',
+      ARTIFACT_NOT_FOUND: '找不到这个制品：它可能已被 GC；先在有这个制品的机器上重新上传。',
+      SERVER_ERROR: 'Host 内部出错：看 Host 日志里同一时间点的堆栈，再重试。',
     }
 
     /** v0.6 C：审计动作 → 中文标签（Host 的 action 取值见契约）。 */
@@ -808,17 +838,43 @@ window.__ModuleLoader__.load({
       return h('span', { className: 'cicd-status is-' + tone, title: '状态：' + status }, STATUS_LABELS[status] || status || '未知')
     }
 
-    function EmptyState({ text }) {
-      return h('div', { className: 'cicd-empty' }, text)
+    /** 空态/加载态/错误态共用的三个字形（纯文本，不引图标库）。 */
+    const STATE_ICONS = { empty: '○', select: '↖', unavailable: '⚠' }
+
+    /**
+     * v3.0-P6-7：空态的三种情况必须分开说，否则用户读到同一句「还没有数据」。
+     * - 真空：这条线上确实没有东西（「还没有运行记录」），要给出下一步做什么；
+     * - 没选：数据有，只是当前没选中（「在左边选一条」）——它不是空，是等着被点；
+     * - 不可用：功能本身没开（路由未启用 / 版本不支持），再刷新也没用。
+     * tone 只影响配色与图标，文案仍由调用点给——统一的是形状而不是措辞。
+     */
+    function EmptyState({ text, title, hint, tone, action }) {
+      const kind = tone === 'select' || tone === 'unavailable' ? tone : 'empty'
+      return h('div', { className: 'cicd-empty is-' + kind, role: kind === 'unavailable' ? 'status' : null },
+        h('div', { className: 'cicd-empty-icon', 'aria-hidden': 'true' }, STATE_ICONS[kind]),
+        title ? h('div', { className: 'cicd-empty-title' }, title) : null,
+        h('div', { className: 'cicd-empty-text' }, text),
+        hint ? h('div', { className: 'cicd-empty-hint' }, hint) : null,
+        action && action.label && typeof action.onClick === 'function'
+          ? h('button', { className: 'cicd-button cicd-empty-action', type: 'button', onClick: action.onClick, disabled: Boolean(action.disabled) }, action.label)
+          : null)
     }
 
-    function LoadingState({ text }) {
-      return h('div', { className: 'cicd-loading' }, h('span', null, text || '正在加载…'))
+    /**
+     * v3.0-P6-7：加载态用骨架行而不是转圈——骨架的宽度就是内容的宽度，
+     * 数据到达时页面不跳动；转圈只在「必须等一个不可分割的动作」时才用。
+     */
+    function LoadingState({ text, rows }) {
+      const count = Number(rows) > 0 ? Math.min(Number(rows), 8) : 3
+      return h('div', { className: 'cicd-loading', role: 'status', 'aria-busy': 'true' },
+        h('span', { className: 'cicd-loading-text' }, text || '正在加载…'),
+        h('div', { className: 'cicd-skeleton-list' }, Array.from({ length: count }, (unused, index) => h('div', { className: 'cicd-skeleton', key: 'sk-' + index }))))
     }
 
-    function ErrorState({ error, onRetry }) {
+    function ErrorState({ error, onRetry, title }) {
       const hint = explainError(error)
       return h('div', { className: 'cicd-error', role: 'alert' },
+        title ? h('div', { className: 'cicd-error-title' }, title) : null,
         h('div', { className: 'cicd-error-message' }, (error && error.message) || '未知错误'),
         error && error.code
           ? h('div', { className: 'cicd-error-code cicd-mono' }, error.code + (error.line ? ' · 第 ' + error.line + ' 行' : ''))
@@ -860,17 +916,22 @@ window.__ModuleLoader__.load({
     }
 
     /** 左列「阶段 / 目标」：项目列表 + 计划（阶段树）+ 目标矩阵。 */
-    function OverviewColumn({ projects, projectId, projectMetas, onSelectProject, plan, onClosePlan, onPlanRetry, targets, targetName, onSelectTarget }) {
+    function OverviewColumn({ projects, projectId, projectMetas, onSelectProject, onOpenCreate, plan, onClosePlan, onPlanRetry, targets, targetName, onSelectTarget }) {
       return h('section', { className: 'cicd-col cicd-col-overview' },
         h('div', { className: 'cicd-col-head' },
           h('span', { className: 'cicd-col-title' }, '阶段 / 目标'),
           projectId ? h('span', { className: 'cicd-poll' }, projectId) : null),
         h('div', { className: 'cicd-col-body' },
           h('div', { className: 'cicd-section-title' }, '项目'),
-          projects.status === 'loading' ? h(LoadingState, { text: '正在读取项目…' }) : null,
-          projects.status === 'error' ? h(ErrorState, { error: projects.error, onRetry: projects.retry }) : null,
+          projects.status === 'loading' ? h(LoadingState, { text: '正在读取项目…', rows: 4 }) : null,
+          projects.status === 'error' ? h(ErrorState, { title: '读取项目列表失败', error: projects.error, onRetry: projects.retry }) : null,
           projects.status === 'ready' && projects.items.length === 0
-            ? h(EmptyState, { text: '还没有项目：先在目标机器上放一个 pipe.yml，再点刷新。' })
+            ? h(EmptyState, {
+              title: '还没有项目',
+              text: '先在目标机器上放一个 pipe.yml，再点刷新。',
+              hint: '想从零开始就点「新建」，向导会生成一份能跑的 pipe.yml。',
+              action: onOpenCreate ? { label: '新建项目', onClick: onOpenCreate } : null,
+            })
             : null,
           projects.status === 'ready' && projects.items.length > 0
             ? projects.items.map((project) => {
@@ -899,8 +960,8 @@ window.__ModuleLoader__.load({
                 h('span', { className: 'cicd-plan-title' },
                   '计划 · ' + (plan.target || '') + (plan.data && plan.data.name ? ' · ' + plan.data.name : '')),
                 h('button', { className: 'cicd-button cicd-plan-close', type: 'button', onClick: onClosePlan }, '收起')),
-              plan.status === 'loading' ? h(LoadingState, { text: '正在读取计划…' }) : null,
-              plan.status === 'error' ? h(ErrorState, { error: plan.error, onRetry: onPlanRetry }) : null,
+              plan.status === 'loading' ? h(LoadingState, { text: '正在读取计划…', rows: 2 }) : null,
+              plan.status === 'error' ? h(ErrorState, { title: '读取计划失败', error: plan.error, onRetry: onPlanRetry }) : null,
               plan.status === 'ready'
                 ? (plan.data && Array.isArray(plan.data.stages) && plan.data.stages.length > 0
                   ? h(StageTree, { stages: plan.data.stages, showCommand: true })
@@ -914,10 +975,10 @@ window.__ModuleLoader__.load({
     /** 目标矩阵：每个 target 一张卡；hosts 逐台 chip（状态点）、current、keep、runtime 徽标。 */
     function TargetsMatrix({ state, targetName, onSelectTarget }) {
       return h('div', { className: 'cicd-targets' },
-        state.status === 'loading' ? h(LoadingState, { text: '正在读取目标…' }) : null,
-        state.status === 'error' ? h(ErrorState, { error: state.error, onRetry: state.retry }) : null,
+        state.status === 'loading' ? h(LoadingState, { text: '正在读取目标…', rows: 3 }) : null,
+        state.status === 'error' ? h(ErrorState, { title: '读取目标失败', error: state.error, onRetry: state.retry }) : null,
         state.status === 'ready' && state.items.length === 0
-          ? h(EmptyState, { text: '这个项目没有配置 targets：在 pipe.yml 里加 targets。' })
+          ? h(EmptyState, { title: '没有可部署的目标', text: '这个项目的 pipe.yml 里没有 targets。', hint: '在 pipe.yml 里加一段 targets:，写清主机与重启命令。', tone: 'empty' })
           : null,
         state.status === 'ready' && state.items.length > 0
           ? state.items.map((target) => {
@@ -1002,10 +1063,10 @@ window.__ModuleLoader__.load({
           h('div', { className: 'cicd-runs' },
             h('div', { className: 'cicd-runs-head' },
               h('span', null, '运行记录' + (runs.items.length ? '（' + runs.items.length + '）' : ''))),
-            runs.status === 'loading' && runs.items.length === 0 ? h(LoadingState, { text: '正在读取运行记录…' }) : null,
-            runs.status === 'error' ? h(ErrorState, { error: runs.error, onRetry: onRefreshRuns }) : null,
+            runs.status === 'loading' && runs.items.length === 0 ? h(LoadingState, { text: '正在读取运行记录…', rows: 3 }) : null,
+            runs.status === 'error' ? h(ErrorState, { title: '读取运行记录失败', error: runs.error, onRetry: onRefreshRuns }) : null,
             runs.status !== 'error' && runs.items.length === 0 && runs.status !== 'loading'
-              ? h(EmptyState, { text: '还没有运行记录：点工具条「运行」或「干跑」开始一次。' })
+              ? h(EmptyState, { title: '还没有运行记录', text: '点工具条上的「运行」或「干跑」开始第一次。', hint: '干跑只打印计划、不碰主机，适合先确认命令。' })
               : null,
             runs.items.map((row) => h('button', {
               key: row.id,
@@ -1066,7 +1127,7 @@ window.__ModuleLoader__.load({
                 onSelectJob,
                 onSearchLine,
               }))
-            : h(EmptyState, { text: '在上方运行记录里选一条，这里显示 steps 时间线与日志。' })))
+            : h(EmptyState, { tone: 'select', text: '在上方运行记录里选一条，这里显示 steps 时间线与日志。' })))
     }
 
     /**
@@ -1335,12 +1396,16 @@ window.__ModuleLoader__.load({
             : '日志 tail（' + linesCount + ' 行）')),
         logState.status === 'error'
           ? h(ErrorState, {
+            title: '读取日志失败',
             error: logState.error,
             // 读某个 job 的分片失败时，「重试」重试的是同一个坏名字；这时用户真正需要的是回合并时间线。
             onRetry: jobId && typeof onSelectJob === 'function' ? () => onSelectJob('') : onReloadLog,
           })
           : linesCount === 0
-            ? h(EmptyState, { text: '这个运行还没有日志输出。' })
+            ? logState.status === 'loading'
+              ? h(LoadingState, { text: '正在读取日志…', rows: 4 })
+              /* 空态承载在固定高度的日志框里，否则 rail 会随行数收缩，下面的内容跳一下。 */
+              : h('div', { className: 'cicd-log' }, h('div', { className: 'cicd-log-placeholder' }, h(EmptyState, { text: '这个运行还没有日志输出。', hint: '运行刚开始时日志是空的，等几秒或点「重新读取」。' })))
             : h('div', { className: 'cicd-log', ref: logRef, onScroll, role: 'log', 'aria-label': '运行日志' },
               h('div', { className: 'cicd-log-canvas', style: { height: totalHeight + 'px' } },
                 h('div', {
@@ -1475,10 +1540,10 @@ window.__ModuleLoader__.load({
         h('div', { className: 'cicd-releases-head' },
           h('span', { className: 'cicd-col-title' }, '发布记录' + (targetName ? ' · ' + targetName : '')),
           h('button', { className: 'cicd-button', type: 'button', onClick: onRefresh, disabled: state.status === 'loading' }, state.status === 'loading' ? '刷新…中' : '刷新')),
-        state.status === 'loading' ? h(LoadingState, { text: '正在读取发布记录…' }) : null,
-        state.status === 'error' ? h(ErrorState, { error: state.error, onRetry: onRefresh }) : null,
+        state.status === 'loading' ? h(LoadingState, { text: '正在读取发布记录…', rows: 3 }) : null,
+        state.status === 'error' ? h(ErrorState, { title: '读取发布记录失败', error: state.error, onRetry: onRefresh }) : null,
         state.status !== 'error' && state.items.length === 0 && state.status !== 'loading'
-          ? h(EmptyState, { text: '还没有发布记录：先运行一次带部署的流水线。' })
+          ? h(EmptyState, { text: '还没有发布记录。', hint: '运行一次带部署的流水线后，这里会列出可回滚的版本。' })
           : null,
         state.items.length > 0
           ? h(ReleaseTable, { items: state.items, rollbackId, onRollback, busy })
@@ -1497,10 +1562,10 @@ window.__ModuleLoader__.load({
             disabled: state.status === 'loading' || !targetName,
           }, state.status === 'loading' ? '刷新…中' : '刷新')),
         h('div', { className: 'cicd-col-body' },
-          state.status === 'loading' && state.items.length === 0 ? h(LoadingState, { text: '正在读取发布记录…' }) : null,
-          state.status === 'error' ? h(ErrorState, { error: state.error, onRetry: onRefresh }) : null,
+          state.status === 'loading' && state.items.length === 0 ? h(LoadingState, { text: '正在读取发布记录…', rows: 3 }) : null,
+          state.status === 'error' ? h(ErrorState, { title: '读取发布记录失败', error: state.error, onRetry: onRefresh }) : null,
           state.status !== 'error' && state.items.length === 0 && state.status !== 'loading'
-            ? h(EmptyState, { text: '还没有发布记录：运行一次带部署的流水线后，这里会列出可回滚的版本。' })
+            ? h(EmptyState, { text: '还没有发布记录。', hint: '运行一次带部署的流水线后，这里会列出可回滚的版本。' })
             : null,
           state.items.length > 0
             ? h(ReleaseTable, { items: state.items, rollbackId, onRollback, busy })
@@ -1528,11 +1593,11 @@ window.__ModuleLoader__.load({
             disabled: loading,
           }, loading ? '刷新…中' : '刷新')),
         // 旧 Host 没有 /operations：这不是错误，只是还没升级。
-        unsupported ? h(EmptyState, { text: 'Host 还不支持审计（升级到 v0.6 后可用）' }) : null,
-        !unsupported && loading ? h(LoadingState, { text: '正在读取操作记录…' }) : null,
-        !unsupported && state.status === 'error' ? h(ErrorState, { error: state.error, onRetry: onRefresh }) : null,
+        unsupported ? h(EmptyState, { tone: 'unavailable', title: '审计不可用', text: '当前 Host 版本没有 /audit 路由。', hint: '升级到 v0.6 之后可用；升级后刷新本页。' }) : null,
+        !unsupported && loading ? h(LoadingState, { text: '正在读取操作记录…', rows: 3 }) : null,
+        !unsupported && state.status === 'error' ? h(ErrorState, { title: '读取操作记录失败', error: state.error, onRetry: onRefresh }) : null,
         !unsupported && !loading && state.status !== 'error' && items.length === 0
-          ? h(EmptyState, { text: '还没有操作记录' })
+          ? h(EmptyState, { text: '还没有操作记录。', hint: '运行、部署、回滚、审批都会在这里留一条带哈希的记录。' })
           : null,
         items.length > 0
           ? h('div', { className: 'cicd-table-wrap' },
@@ -1592,8 +1657,8 @@ window.__ModuleLoader__.load({
           h('span', { className: 'cicd-editor-meta' },
             editor.dirty ? h('span', { className: 'cicd-status is-running' }, '未保存') : null,
             h('button', { className: 'cicd-button', type: 'button', onClick: onReload, disabled: loading || busy }, loading ? '读取…中' : '重新读取'))),
-        editor.status === 'error' ? h(ErrorState, { error: editor.error, onRetry: onReload }) : null,
-        loading ? h(LoadingState, { text: '正在读取 pipe.yml…' }) : null,
+        editor.status === 'error' ? h(ErrorState, { title: '读取 pipe.yml 失败', error: editor.error, onRetry: onReload }) : null,
+        loading ? h(LoadingState, { text: '正在读取 pipe.yml…', rows: 2 }) : null,
         editor.status !== 'error' && !loading
           ? h('div', { className: 'cicd-editor-body' },
             h('textarea', {
@@ -1689,10 +1754,10 @@ window.__ModuleLoader__.load({
         h('div', { className: 'cicd-approvals-head' },
           h('span', { className: 'cicd-col-title' }, '审批门 · ' + pending.length + ' 条待审批'),
           h('button', { className: 'cicd-button', type: 'button', onClick: onRefresh, disabled: state.status === 'loading' }, state.status === 'loading' ? '刷新…中' : '刷新')),
-        state.status === 'loading' ? h(LoadingState, { text: '正在读取审批记录…' }) : null,
-        state.status === 'error' ? h(ErrorState, { error: state.error, onRetry: onRefresh }) : null,
+        state.status === 'loading' ? h(LoadingState, { text: '正在读取审批记录…', rows: 3 }) : null,
+        state.status === 'error' ? h(ErrorState, { title: '读取审批记录失败', error: state.error, onRetry: onRefresh }) : null,
         state.status === 'ready' && pending.length === 0
-          ? h(EmptyState, { text: '没有待审批的部署。prod 环境默认停在「待审批」，点「运行」后在这里通过或拒绝。' })
+          ? h(EmptyState, { text: '没有待审批的部署。', hint: 'prod 环境默认停在「待审批」：运行之后在这里通过或拒绝。' })
           : null,
         pending.length > 0
           ? h('div', { className: 'cicd-approvals-list' },
@@ -1723,13 +1788,13 @@ window.__ModuleLoader__.load({
         h('div', { className: 'cicd-rbac-head' },
           h('span', { className: 'cicd-col-title' }, 'RBAC · ' + users.length + ' 个用户'),
           h('button', { className: 'cicd-button', type: 'button', onClick: onRefresh, disabled: state.status === 'loading' }, state.status === 'loading' ? '刷新…中' : '刷新')),
-        state.status === 'loading' ? h(LoadingState, { text: '正在读取 RBAC…' }) : null,
-        state.status === 'error' ? h(ErrorState, { error: state.error, onRetry: onRefresh }) : null,
+        state.status === 'loading' ? h(LoadingState, { text: '正在读取 RBAC…', rows: 3 }) : null,
+        state.status === 'error' ? h(ErrorState, { title: '读取 RBAC 失败', error: state.error, onRetry: onRefresh }) : null,
         state.status === 'ready'
           ? h('div', { className: 'cicd-rbac-body' },
             h('div', { className: 'cicd-section-title' }, '用户'),
             users.length === 0
-              ? h(EmptyState, { text: '还没有用户。用 cicd_rbac 工具签发 token（user / role / projects / ttlSec）。' })
+              ? h(EmptyState, { text: '还没有用户。', hint: '用 cicd_rbac 工具签发 token（user / role / projects / ttlSec）。' })
               : h('div', { className: 'cicd-table-wrap' },
                 h('table', { className: 'cicd-table' },
                   h('thead', null, h('tr', null,
@@ -1774,12 +1839,12 @@ window.__ModuleLoader__.load({
         h('div', { className: 'cicd-secrets-head' },
           h('span', { className: 'cicd-col-title' }, 'Secrets · ' + (project || '全局') + ' · ' + items.length + ' 条'),
           h('button', { className: 'cicd-button', type: 'button', onClick: onRefresh, disabled: state.status === 'loading' }, state.status === 'loading' ? '刷新…中' : '刷新')),
-        state.status === 'loading' ? h(LoadingState, { text: '正在读取 secrets…' }) : null,
-        state.status === 'error' ? h(ErrorState, { error: state.error, onRetry: onRefresh }) : null,
+        state.status === 'loading' ? h(LoadingState, { text: '正在读取 secrets…', rows: 3 }) : null,
+        state.status === 'error' ? h(ErrorState, { title: '读取 secrets 失败', error: state.error, onRetry: onRefresh }) : null,
         state.status === 'ready'
           ? h('div', { className: 'cicd-secrets-body' },
             items.length === 0
-              ? h(EmptyState, { text: '还没有 secret。pipe.yml 里用 ${{SECRET_NAME}} 引用；载荷落 workDir/.secrets.json（0600），DB 只存 ref。' })
+              ? h(EmptyState, { text: '还没有 secret。', hint: 'pipe.yml 里用 ${{SECRET_NAME}} 引用；载荷加密落 workDir/.secrets.json（0600），DB 只存 ref。' })
               : h('div', { className: 'cicd-table-wrap' },
                 h('table', { className: 'cicd-table' },
                   h('thead', null, h('tr', null,
@@ -1814,13 +1879,13 @@ window.__ModuleLoader__.load({
         h('div', { className: 'cicd-runners-head' },
           h('span', { className: 'cicd-col-title' }, '构建主机 · ' + items.length + ' 台'),
           h('button', { className: 'cicd-button', type: 'button', onClick: onRefresh, disabled: state.status === 'loading' }, state.status === 'loading' ? '刷新…中' : '刷新')),
-        state.status === 'loading' ? h(LoadingState, { text: '正在读取 runner…' }) : null,
-        state.status === 'error' ? h(ErrorState, { error: state.error, onRetry: onRefresh }) : null,
+        state.status === 'loading' ? h(LoadingState, { text: '正在读取 runner…', rows: 3 }) : null,
+        state.status === 'error' ? h(ErrorState, { title: '读取 runner 失败', error: state.error, onRetry: onRefresh }) : null,
         state.unsupported
-          ? h(EmptyState, { text: 'Runner 管理不可用（/runners 路由未启用）。用 bin/runner.mjs 注册远端构建主机。' })
+          ? h(EmptyState, { tone: 'unavailable', title: 'Runner 管理不可用', text: '当前 Host 没有启用 /runners 路由。', hint: '仍可用 bin/runner.mjs 在目标机注册远端构建主机。' })
           : null,
         state.status === 'ready' && items.length === 0
-          ? h(EmptyState, { text: '还没有注册 runner。在目标机运行：node bin/runner.mjs --host=<host> --token=<token>（拉取式协议 + journal 幂等 + 自签 TLS）。' })
+          ? h(EmptyState, { text: '还没有注册 runner。', hint: '在目标机运行 node bin/runner.mjs --host=<host> --token=<token>（拉取式协议 + journal 幂等 + 自签 TLS）。' })
           : null,
         state.status === 'ready' && items.length > 0
           ? h('div', { className: 'cicd-table-wrap' },
@@ -1942,7 +2007,7 @@ window.__ModuleLoader__.load({
       }, [freshSignal])
 
       const loadProjects = useCallback(async () => {
-        setProjects({ status: 'loading', items: [], error: null })
+        setProjects((current) => (current.status === 'ready' ? { ...current, status: 'loading', error: null } : { status: 'loading', items: [], error: null }))
         try {
           const payload = await callApi('projects', {}, freshSignal('projects'))
           const items = Array.isArray(payload.projects) ? payload.projects : []
@@ -1969,7 +2034,7 @@ window.__ModuleLoader__.load({
           setTargetName('')
           return
         }
-        setTargets({ status: 'loading', items: [], error: null })
+        setTargets((current) => (current.status === 'ready' && current.items.length > 0 ? { ...current, status: 'loading', error: null } : { status: 'loading', items: [], error: null }))
         try {
           const payload = await callApi('targets', { project: id }, freshSignal('targets'))
           const items = Array.isArray(payload.targets) ? payload.targets : []
@@ -1998,7 +2063,7 @@ window.__ModuleLoader__.load({
           setLog({ status: 'idle', lines: [], jobs: [], jobId: '', error: null })
           return
         }
-        if (!quiet) setLog({ status: 'loading', lines: [], jobs: [], jobId: jobId || '', error: null })
+        if (!quiet) setLog((prev) => ({ status: 'loading', lines: prev.lines, jobs: prev.jobs, jobId: jobId || '', error: null }))
         try {
           const payload = await callApi('log', { runId, tail: LOG_TAIL, jobId: jobId || '' }, freshSignal('log'))
           setLog({
@@ -2030,7 +2095,7 @@ window.__ModuleLoader__.load({
           setReleases({ status: 'idle', items: [], error: null })
           return
         }
-        setReleases({ status: 'loading', items: [], error: null })
+        setReleases((current) => (current.status === 'ready' && current.items.length > 0 ? { ...current, status: 'loading', error: null } : { status: 'loading', items: [], error: null }))
         try {
           const payload = await callApi('releases', { target, limit: 50 }, freshSignal('releases'))
           setReleases({ status: 'ready', items: Array.isArray(payload.releases) ? payload.releases : [], error: null })
@@ -2497,6 +2562,7 @@ window.__ModuleLoader__.load({
           return
         }
         setEditor({ status: 'loading', source: '', loaded: false, dirty: false, error: null })
+        // 编辑器刻意清空源码：读回来的内容会覆盖用户正在改的那份，宁可先显示骨架也不要吞掉编辑。
         setEditorValidate(null)
         setEditorSave(null)
         try {
@@ -2829,6 +2895,7 @@ window.__ModuleLoader__.load({
             projectId,
             projectMetas,
             onSelectProject,
+            onOpenCreate: () => goView('create'),
             plan,
             onClosePlan: () => setPlan(null),
             onPlanRetry: () => void runPlan(),
@@ -2911,7 +2978,14 @@ window.__ModuleLoader__.load({
           },
           h('span', { className: 'cicd-nav-label' }, entry.label),
           entry.badge ? h('span', { className: 'cicd-nav-badge' }, String(entry.badge)) : null)),
-        ]))
+        ]),
+        // v3.0-P6-7：项目还没读回来时导航下方是空的，看起来像加载失败；这里给一行极简骨架说明正在读。
+        projects.status === 'loading' && projects.items.length === 0
+          ? h('div', { className: 'cicd-nav-loading', role: 'status', 'aria-busy': 'true' }, '正在读取项目…')
+          : null,
+        projects.status === 'error'
+          ? h('button', { className: 'cicd-nav-retry', type: 'button', onClick: () => void loadProjects() }, '项目读取失败：重试')
+          : null)
 
       /**
        * 面包屑 + 复制链接。
