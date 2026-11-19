@@ -45,7 +45,7 @@ import {
   buildSimpleHtml, buildSimpleJson, prefersJson, pypiFilename, pypiHashOf, pypiNameCandidates, normalizePyPIname,
 } from './lib/packages.js'
 import { createApprovalGate } from './lib/approval.js'
-import { normalizeEnvironments, promotionPath, isProtected, requiresApproval } from './lib/environments.js'
+import { normalizeEnvironments, promotionPath, isProtected, requiresApproval, parseEnvironmentGuards, assertEnvironmentGuard, actorMatchesAllowlist } from './lib/environments.js'
 import {
   PROMOTION_ERRORS, promotionError, envRequiresPromotion, findSourceRelease,
   currentPointer, isPromoted, listPromotions, recordPromotion, promotionView,
@@ -179,6 +179,9 @@ function normalizeConfig(config = {}, ctx) {
   // 部署锁 TTL 30 分钟（足够一次全量部署，又不会让崩溃进程永久占锁）。
   const rawAuth = baseConfig.auth && typeof baseConfig.auth === 'object' ? baseConfig.auth : {}
   const rawDeploy = baseConfig.deploy && typeof baseConfig.deploy === 'object' ? baseConfig.deploy : {}
+  // v3.0-P4-3：受保护环境的护栏按环境名集中写在这里，而不是散在每个项目的 pipe.yml 里。
+  // 两者语义不同：pipe 说的是"这个 target 怎么部署"，这里说的是"谁有资格把字节放上去"。
+  const rawDeployment = baseConfig.deployment && typeof baseConfig.deployment === 'object' ? baseConfig.deployment : {}
   const rawApproval = baseConfig.approval && typeof baseConfig.approval === 'object' ? baseConfig.approval : {}
   const rawRunners = baseConfig.runners && typeof baseConfig.runners === 'object' ? baseConfig.runners : {}
   const rawJobs = baseConfig.jobs && typeof baseConfig.jobs === 'object' ? baseConfig.jobs : {}
@@ -188,6 +191,7 @@ function normalizeConfig(config = {}, ctx) {
   const rawToolchain = baseConfig.toolchain && typeof baseConfig.toolchain === 'object' ? baseConfig.toolchain : {}
   // v3.0-P5-4：OCI 分发。token 密钥留空时启动生成一个随机密钥——它只保护「15 分钟内的一次 pull」，
   // 进程重启后旧票自然失效，这比要求运维先配置一个密钥更不容易出错。
+  const rawSecrets = baseConfig.secrets && typeof baseConfig.secrets === 'object' ? baseConfig.secrets : {}
   const rawRegistry = baseConfig.registry && typeof baseConfig.registry === 'object' ? baseConfig.registry : {}
   return {
     projects: projects.map((project) => ({
@@ -215,6 +219,16 @@ function normalizeConfig(config = {}, ctx) {
     },
     deploy: {
       lockTtlSec: clampInt(rawDeploy.lockTtlSec, 30 * 60, 30, 24 * 60 * 60),
+    },
+    // v3.0-P4-3：受保护环境五条件里的 ①②④（protected / allowedActors / branchRule）。
+    // 解析错误不在这里抛：配置文件写错时插件仍然要能启动去看一眼（面板会提示），
+    // 但**任何**一次受保护环境判定都会因为 invalid 非空而拒绝 —— 见 environmentGuard()。
+    deployment: {
+      environments: rawDeployment.environments && typeof rawDeployment.environments === 'object' && !Array.isArray(rawDeployment.environments)
+        ? rawDeployment.environments
+        : {},
+      defaultBranch: typeof rawDeployment.defaultBranch === 'string' ? rawDeployment.defaultBranch.trim() : '',
+      forbidDirectProd: rawDeployment.forbidDirectProd === true,
     },
     approval: {
       ttlSec: clampInt(rawApproval.ttlSec, 4 * 60 * 60, 60, 7 * 24 * 60 * 60),
@@ -245,6 +259,15 @@ function normalizeConfig(config = {}, ctx) {
       verifyChecksum: rawToolchain.verifyChecksum !== false,
       // 断言每个语言真的跑在声明的版本上。关掉它的唯一理由是「这颗树是交叉编译产物、跑不起来」。
       verify: rawToolchain.verify !== false,
+    },
+    // v3.0-P4-4：secret 载荷加密的密钥来源。不写 keyFile 时用 <workDir>/secrets.key（本机生成、0600）。
+    // 三种入口的顺序见 lib/secrets.js 的 resolveSecretKey：env → config → file → local。
+    secrets: {
+      keyFile: typeof rawSecrets.keyFile === 'string' ? rawSecrets.keyFile.trim() : '',
+      file: typeof rawSecrets.file === 'string' ? rawSecrets.file.trim() : '',
+      // 显式密钥：让容器/CI 形态能把密钥从编排层注入，而不必写文件。
+      // 优先级仍低于环境变量 —— 配置文件常常会进版本库，环境变量不会。
+      key: typeof rawSecrets.key === 'string' ? rawSecrets.key.trim() : '',
     },
     registry: {
       enabled: rawRegistry.enabled !== false,
@@ -437,7 +460,14 @@ function createRuntime(ctx, config) {
   })
   // V2-M4：审批门（block gate）+ secrets 存储（DB 只存 ref，载荷落 workDir/.secrets.json）
   const approvalGate = createApprovalGate({ db: store.db, ttlSec: options.approval?.ttlSec })
-  const secrets = createSecretStore({ dir: options.workDir })
+  // 密钥来源按 env → config.keyFile → <workDir>/secrets.key 解析（见 lib/secrets.js）。
+  // 密文落 .secrets.json，所以「备份带走」不再等于「明文带走」—— 这才是 P4-4 要修的那件事。
+  const secrets = createSecretStore({
+    dir: options.workDir,
+    file: options.secrets?.file || '',
+    keyFile: options.secrets?.keyFile || '',
+    key: options.secrets?.key || '',
+  })
   // v3.0-P5：制品 CAS。字节落磁盘（<workDir>/artifacts），元数据落 SQLite。
   // 两个方向的引用都要能问出来：GC 问「这个 digest 还有 release/指针指着吗」，
   // 页面问「这个项目最近传了什么」。
@@ -618,6 +648,43 @@ function createRuntime(ctx, config) {
     return project
   }
 
+  // v3.0-P4-3：宿主配置（options.deployment.environments）是**基线**，pipe 里的 `environments:`
+  // 按项目覆盖它 —— 同一个 prod 在不同项目里可能允许不同的人发（生产项目只允许发布流水线，
+  // 开发项目只允许手工）。覆盖方向只有一个（pipe 盖宿主），否则"这条规则谁说了算"说不清。
+  const guardCache = new Map()
+  /**
+   * 拿到某个项目的护栏集合。pipe 里写了同名环境就以 pipe 为准。
+   *
+   * invalid 只报宿主层的问题：pipe 写错由 parseEnvironmentGuards 在**用到该项目时**报出来
+   * （见 environmentGuard 的 project 参数）—— 一个项目的笔误不该让别的项目也发不出去。
+   * 按 project.id + pipe 修改时间缓存：trampoline 可能被每秒调用，重新解析 yaml 不划算。
+   */
+  function guardsFor(project) {
+    if (!project?.path) return hostGuards
+    let stamp = ''
+    try { stamp = String(statSync(project.pipe).mtimeMs) } catch { stamp = '' }
+    const key = String(project.id || project.path) + '@' + stamp
+    const cached = guardCache.get(key)
+    if (cached) return cached
+    let pipeEnvironments = {}
+    try { pipeEnvironments = readPipe(project).environments || {} } catch (error) {
+      // 解析失败时**不能**退回宿主配置：那会让一个写坏的 pipe 悄悄失去它自己的白名单，
+      // 变成"谁都能发"。宁可整条拒绝，并说出是哪份 pipe 坏了。
+      pipeEnvironments = { prod: false }
+      guardCache.set(key, { byEnv: new Map(), invalid: [{ env: '', message: `项目 ${project.id || project.path} 的 pipe 解析失败，环境护栏无法判定：${error?.message || error}` }] })
+      return guardCache.get(key)
+    }
+    let result = hostGuards
+    if (Object.keys(pipeEnvironments).length > 0) {
+      const local = parseEnvironmentGuards(pipeEnvironments)
+      const merged = new Map(hostGuards.byEnv)
+      for (const [name, spec] of local.byEnv.entries()) merged.set(name, spec)
+      result = { byEnv: merged, invalid: hostGuards.invalid.concat(local.invalid) }
+    }
+    guardCache.set(key, result)
+    return result
+  }
+
   // 宿主（host 清单）定义的环境名。项目自己的 pipe 里没有这个 target，环境依然是真实存在的：
   // 「这份字节被验过」是环境的事实，不是某个 pipe 的事实。
   function hostEnvironmentNames(catalogSnapshot) {
@@ -631,6 +698,56 @@ function createRuntime(ctx, config) {
     const list = new Set(names.map((name) => String(name || '').toLowerCase()))
     if (list.has('prod')) return {}
     return normalizeEnvironments({ prod: { hosts: [] } })
+  }
+
+  /**
+   * 受保护环境的五条件判定（v3.0-P4-3）。返回 `{ required, ok, failures, guard }`，永不抛。
+   *
+   * 三个调用点共用它：部署（deployStep，逐环境）、回滚（runtime.rollback）、
+   * 面向前端的预检（/environments）。判定本身在 lib/environments.js，这里只负责
+   * 「护栏配置写坏了怎么办」——写坏时不猜、不放行。
+   */
+  function environmentGuard({ env = '', actor = null, branch = '', tag = '', digestPresent = null, project = null } = {}) {
+    const name = String(env || '')
+    const guards = project ? guardsFor(project) : hostGuards
+    if (guards.invalid.length > 0) {
+      return {
+        required: true,
+        ok: false,
+        guard: guards.byEnv.get(name) || null,
+        failures: guards.invalid.map((item) => ({ condition: 'config', code: 'ENV_GUARD_MISCONFIGURED', message: item?.message || String(item), env: item?.env || '' })),
+      }
+    }
+    const guard = guards.byEnv.get(name) || null
+    return assertEnvironmentGuard({ env: name, guard, actor, branch, tag, digestPresent })
+  }
+
+  /**
+   * 护栏视角的主体：`{ id, role }`。
+   *
+   * 为什么不用 `actor` 包里那份：`runOperator` 是**这次运行的执行人**（面板点按钮的人、
+   * 调度器、或被触发的服务），而 actor 可能是"调用 run 接口的人"。两者在手动触发时相同，
+   * 在调度器/API token 触发时不同，护栏要判的是前者。
+   * 引导期（库里还没有任何账号）没有第二个人可以登录，凭据是 local：护栏仍要求它出现在
+   * allowlist 里（`user:local`），不做隐式放行 —— 见 environmentGuard() 的注释。
+   */
+  /**
+   * 护栏视角的主体 id。
+   *
+   * 引导期（库里还没有任何账号）auth 返回的 actor.id 恒为 'anonymous'，它不是一个人，
+   * 而是"这台机器上没人登录"这件事。护栏里写成 user:local 的名单要对得上它，
+   * 所以这里把它归一成 local，其余情况用真实 id。
+   */
+  function guardOperatorOf(actor, trigger = '') {
+    const id = String(actor?.id || '')
+    if (id && id !== 'anonymous') return id
+    const fallback = String(trigger || 'manual')
+    return fallback === 'manual' || fallback === 'api' ? 'local' : fallback
+  }
+
+  function actorForGuard(project, operator = '') {
+    const id = String(operator || project?.operator || project?.trigger || 'local')
+    return { id, role: String(project?.role || '') }
   }
 
   function markPreviousSuperseded(targetName, host) {
@@ -671,6 +788,10 @@ function createRuntime(ctx, config) {
   const runtimeSeen = { gate: async () => { throw Object.assign(new Error('制品闸门尚未就绪'), { code: 'GATE_NOT_READY' }) } }
   // CAS 收件失败不拦发布，但必须留痕（受保护环境的闸门随后会以 ARTIFACT_NOT_PROMOTED / CORRUPTED 拒绝）。
   const artifactWarnings = []
+  // v3.0-P4-3：环境护栏只解析一次（配置在进程生命周期内不变）。写错的条目不静默忽略，
+  // 而是让**所有**受保护环境判定直接拒绝并说出原因 —— 见 environmentGuard() 的 invalid 分支。
+  const hostGuards = parseEnvironmentGuards(options.deployment.environments)
+
   const CATALOG_TTL_MS = 5000
   let catalogCache = null
   let catalogAt = 0
@@ -991,7 +1112,10 @@ function createRuntime(ctx, config) {
   async function deployStep({ project, step, runId, commit, log }) {
     const { targetName, target } = resolveTargetForStep(project, step)
     // 选择器在部署前展开成真实别名：deploy.js 只认别名清单，不认 env:/group:/tag:。
-    const expanded = await expandTarget(targetName, target)
+    // 用宽容版展开：护栏必须在任何主机被改动**之前**跑完，而 expandTarget 要读远端主机清单。
+    // dsh-remote 没就绪时读不到清单，若在这里抛，护栏就永远轮不到判 —— 白名单/分支/digest
+    // 这些「不发出去」的结论本该先于「发不出去」的基础设施错误给出。
+    const expanded = await tryExpandTarget(targetName, target)
     const deployTarget = { ...target, hosts: expanded.hosts }
     const artifactPath = artifactFor(project, step.deploy?.artifacts || [])
     if (!artifactPath) {
@@ -1004,9 +1128,51 @@ function createRuntime(ctx, config) {
     // 同名 prod target"这条绕过路径在这里断掉。必须在任何主机被改动之前跑完。
     const hosting = targetProject(project, targetName)
     const hostingEnvs = normalizeEnvironments(readPipe(hosting).targets)
-    const protectedEnv = deployTarget.hosts.map((name) => expanded.meta.get(name)?.env || '').find((name) => envRequiresPromotion(hostingEnvs, name)) || ''
+    const protectedEnvs = [...new Set(deployTarget.hosts
+      .map((name) => expanded.meta.get(name)?.env || '')
+      .filter((name) => name && envRequiresPromotion(hostingEnvs, name)))]
+    const protectedEnv = protectedEnvs[0] || ''
     // 收件失败的那几条必须在上闸门之前露出来：闸门只说"digest 不在 CAS"，原因在更早一步。
     while (artifactWarnings.length > 0) log?.(artifactWarnings.shift())
+    // v3.0-P4-3：环境级护栏先于制品闸门 —— 「这个人有没有资格发生产」比「这份字节验过没有」
+    // 更早、也更根本；把两者顺序颠倒，会让一个没资格的人先拿到"字节没问题"的确认。
+    // 一批主机跨多个受保护环境时**每个**都要放行：只要有一台落在没资格的环境里，整批不发。
+    // 站在本项目视角的受保护环境（prod 是"约定即存在"的环境）—— 主机标了 env 就按主机判，
+    // 没标也不等于它能绕开护栏：一个只有本机 host、没有 env 标签的 prod target 仍是 prod。
+    const localEnvs = normalizeEnvironments(readPipe(project).targets)
+    const guardEnvs = new Set(protectedEnvs)
+    for (const candidate of Object.keys(localEnvs)) {
+      if (envRequiresPromotion(localEnvs, candidate)) guardEnvs.add(candidate)
+    }
+    const guardedEnvs = [...guardEnvs]
+    for (const envName of guardedEnvs) {
+      const verdict = environmentGuard({
+        env: envName,
+        actor: actorForGuard(project),
+        branch: project.branch || '',
+        tag: project.tag || '',
+        digestPresent: Boolean(artifactDigest),
+        project: hosting,
+      })
+      if (!verdict.ok) {
+        for (const failure of verdict.failures) {
+          if (log) log('环境护栏拦下 [' + envName + '] ' + failure.code + '：' + failure.message)
+          try {
+            audit.record({
+              action: 'deploy.env_guard_deny', actorId: String(project.operator || project.trigger || ''), authMethod: '',
+              resourceType: 'environment', resourceId: envName, projectId: hosting.id, result: 'deny',
+              reason: failure.code + ': ' + failure.message, sourceIp: '', requestId: runId || '',
+            })
+          } catch { /* 审计失败不改变拒绝 */ }
+        }
+        const error = Object.assign(new Error(verdict.failures.map((item) => item.message).join('；')), {
+          code: verdict.failures[0]?.code || 'ENV_GUARD_DENIED',
+          env: envName,
+          failures: verdict.failures,
+        })
+        throw error
+      }
+    }
     if (protectedEnv) {
       try {
         await runtimeSeen.gate({
@@ -1306,6 +1472,10 @@ function createRuntime(ctx, config) {
       commit: commit || meta.commit || '',
       tag: meta.tag || '',
       trigger: trigger || 'manual',
+      // v3.0-P4-3：环境护栏要判"是谁在跑"，所以主体必须随运行传递下去。
+      // 旧的 deployStep 只认 trigger 字符串，判不出人 —— 那正是 P4-3 之前护栏缺席的原因。
+      operator: guardOperatorOf(actor, trigger),
+      role: String(actor?.role || ''),
     }
     const { targetName: resolvedTarget, target: resolvedSpec } = resolveTarget(pipe, options, targetName)
     // 先展开选择器：生产护栏与部署锁都以「真实会部署到哪些主机」为准。
@@ -2194,8 +2364,17 @@ function createRuntime(ctx, config) {
       const rows = approvalGate.list({ project, status, limit })
       return { approvals: rows, stats: approvalGate.stats(), ttlSec: approvalGate.ttlSec }
     },
+    /**
+     * secrets（v3.0-P4-4）：载荷加密落盘，DB 里只有 ref。
+     *
+     * `action: 'stats' | 'rotate'` 是给面板/运维用的：一个答得上「密钥在哪、还有几条是明文」的
+     * 存储，才有资格说自己是加密的；一个能换密钥的存储，才不会在密钥泄漏时把用户逼成
+     * 「删库重设所有 secret」。两者都不返回密钥本身。
+     */
     secrets(args = {}) {
-      const { project = '', scope = 'global', name = '', value = '', reveal = false } = args
+      const { project = '', scope = 'global', name = '', value = '', reveal = false, action = '' } = args
+      if (action === 'stats') return { ok: true, stats: secrets.stats() }
+      if (action === 'rotate') return { ok: true, ...secrets.rotate({ key: args.key || '' }), stats: secrets.stats() }
       if (name) {
         if (!value) {
           const error = new Error('设置 secret 需要 value')
@@ -2720,6 +2899,29 @@ function createRuntime(ctx, config) {
      * 调用方可以拿自己项目的 project 名去触发别的项目的同名 target，主机级判定不依赖
      * 调用方自报的项目，绕不过去。
      */
+    /**
+     * 环境护栏的配置（供策略层使用）：没配过该环境时返回 null。
+     *
+     * 带项目时按「pipe 覆盖宿主」取（与部署时同一份判据），不带项目时只看宿主配置。
+     */
+    environmentGuardSpec(env = '', projectId = '') {
+      const project = projectId ? options.projects.find((item) => item.id === projectId) || null : null
+      const guards = project ? guardsFor(project) : hostGuards
+      return guards.byEnv.get(String(env || '')) || null
+    },
+    /** 面向前端的预检：这个环境需不需要护栏、这次请求过不过得了（不做任何改动）。 */
+    environmentGuard(args = {}) {
+      const actor = args.actor || null
+      const project = args.projectId ? options.projects.find((item) => item.id === args.projectId) || null : null
+      return environmentGuard({
+        env: args.env || args.environment || '',
+        actor,
+        branch: args.branch || '',
+        tag: args.tag || '',
+        digestPresent: args.digest ? true : null,
+        project,
+      })
+    },
     async artifactGate({ projectId = '', env = '', digest = '', host = '' } = {}) {
       const project = options.projects.find((item) => item.id === projectId) || null
       if (!project) throw promotionError(PROMOTION_ERRORS.SOURCE_NOT_FOUND, '项目 ' + projectId + ' 不存在')
@@ -3799,6 +4001,8 @@ function registerTools(ctx, runtime) {
         scope: { type: 'string', description: '作用域（默认 global）' },
         name: { type: 'string', description: 'secret 名（设置时必填）' },
         value: { type: 'string', description: 'secret 值（设置时必填）' },
+        action: { type: 'string', enum: ['stats', 'rotate'], description: 'stats=看密钥来源与有多少条明文；rotate=换密钥重加密（需 MANAGE_SECRET + confirm）' },
+        key: { type: 'string', description: 'action=rotate 时的新密钥（hex 64 位或 base64 32 字节；省略则按 env/config 解析）' },
       },
     },
     output: {
@@ -3810,9 +4014,21 @@ function registerTools(ctx, runtime) {
           scope: { type: 'string' },
           name: { type: 'string' },
           secrets: { type: 'array', items: { type: 'object', properties: { ref: { type: 'string' }, scope: { type: 'string' }, name: { type: 'string' }, createdAt: { type: 'string' } } } },
+          stats: { type: 'object', properties: { entries: { type: 'number' }, encrypted: { type: 'number' }, plaintext: { type: 'number' }, undecryptable: { type: 'number' }, backend: { type: 'string' }, algorithm: { type: 'string' }, file: { type: 'string' } } },
+          rotated: { type: 'number' },
+          skipped: { type: 'number' },
         },
       },
       render(_args, value) {
+        if (value.stats) {
+          const s = value.stats
+          const lines = [`secret 存储：${s.entries} 条（密文 ${s.encrypted}，明文 ${s.plaintext}，解不开 ${s.undecryptable}）`]
+          lines.push(`- 密钥来源：${s.backend}；算法：${s.algorithm}`)
+          if (value.rotated !== undefined) lines.push(`- 已重加密 ${value.rotated} 条，跳过 ${value.skipped} 条`)
+          if (s.plaintext > 0) lines.push('- 明文条目还在：它们会在下一次写入时自动加密；也可以用 action=rotate 一次性重写。')
+          if (s.undecryptable > 0) lines.push('- 解不开的条目说明密钥换过或密文被改：这些 secret 目前注入为空。')
+          return textBlocks(lines.join('\n'))
+        }
         if (value.ref) return textBlocks(`已设置 secret ${value.name}（ref=${value.ref}）`)
         const lines = [`项目 ${value.project || '全局'} 的 secrets：`]
         if (!value.secrets || value.secrets.length === 0) lines.push('- （空）')
@@ -4562,7 +4778,26 @@ function authorize(request, params, { runtime, action, resource = {}, confirm = 
       return json({ ok: false, error: `没有权限执行 ${action}：target 属于项目 ${resource.hostingProjectId}，而你没有该项目的角色`, code: 'POLICY_DENY', action, reason: 'no_role_in_hosting_project' }, 403)
     }
     const hosted = { ...target, projectId: resource.hostingProjectId }
-    const decision = can(actor, action, hosted, { role: hostingRole })
+    // 护栏的配置也按**宿主**项目取：字节最终落在它家主机上，判据就该是它家那份 pipe。
+    const guardSpec = typeof runtime.environmentGuardSpec === 'function'
+      ? runtime.environmentGuardSpec(resource.env || '', resource.hostingProjectId)
+      : null
+    // role: 名单判的是「在这个环境所属的项目里担任什么角色」，所以这里把角色的归属
+    // 换成宿主项目 —— 否则 A 项目的 admin 触发 B 项目的 prod 时，名单上的 role:admin
+    // 会拿 A 项目的身份去对 B 项目的账。
+    const guardActor = { ...actor, role: hostingRole || actor.role }
+    const decision = can(guardActor, action, hosted, {
+      role: hostingRole,
+      environmentGuard: resource.env
+        ? {
+          env: resource.env,
+          spec: guardSpec,
+          branch: resource.branch || '',
+          tag: resource.tag || '',
+          digestPresent: resource.digestPresent ?? null,
+        }
+        : null,
+    })
     try {
       runtime.auditRecord?.({
         action: decision.allow ? `${action}.allow` : 'policy.deny',
@@ -4579,7 +4814,22 @@ function authorize(request, params, { runtime, action, resource = {}, confirm = 
     request.__cicdActor = actor
     return null
   }
-  const decision = can(actor, action, target, { role: resource.role })
+  // v3.0-P4-3：环境护栏是「资源属性 × 主体属性」的联合判定，交给策略层统一做，
+  // 这样 audit 里记的是同一个 policyId，面板和测试看到的是同一份判据。
+  const decision = can(actor, action, target, {
+    // role 交给策略层按「主体 × 项目」自己推导：调用点并不知道 actor 在那个项目里是什么角色，
+    // 传空串会让 role: 名单永远匹配不上，传死值又会把宿主的身份带进别人的项目。
+    role: runtime.roleForProject ? runtime.roleForProject(actor, resource.projectId || '') : (resource.role || actor.role || ''),
+    environmentGuard: resource.env
+      ? {
+        env: resource.env,
+        spec: typeof runtime.environmentGuardSpec === 'function' ? runtime.environmentGuardSpec(resource.env, resource.projectId || '') : null,
+        branch: resource.branch || '',
+        tag: resource.tag || '',
+        digestPresent: resource.digestPresent ?? null,
+      }
+      : null,
+  })
   try {
     runtime.auditRecord?.({
       action: decision.allow ? `${action}.allow` : 'policy.deny',
@@ -4706,7 +4956,7 @@ async function planResource(request, runtime) {
 
 async function runResource(request, runtime) {
   const params = queryOf(request)
-  const bad = unsupportedParams(params, new Set(['project', 'target', 'stage', 'dryRun', 'confirm', 'runner', 'approvalId']))
+  const bad = unsupportedParams(params, new Set(['project', 'target', 'stage', 'dryRun', 'confirm', 'runner', 'approvalId', 'env', 'branch', 'tag']))
   if (bad) return json({ ok: false, error: bad }, 400)
   const targetName = params.get('target') || ''
   const projectId = params.get('project') || ''
@@ -4718,7 +4968,17 @@ async function runResource(request, runtime) {
     : authorize(request, params, {
       runtime,
       action: isProd ? ACTIONS.DEPLOY_PROD : ACTIONS.RUN,
-      resource: { type: 'target', id: targetName, projectId, protected: isProd },
+      // v3.0-P4-3：护栏所需的上下文随资源一起进策略层 —— 主体是否在名单里、分支是否合规
+      // 都是「这次请求的属性」，判定层不该再回读 pipe.yml 反推。
+      resource: {
+        type: 'target',
+        id: targetName,
+        projectId,
+        env: params.get('env') || (isProd ? 'prod' : ''),
+        protected: isProd,
+        branch: params.get('branch') || '',
+        tag: params.get('tag') || '',
+      },
     })
   if (guard) return guard
   try {
@@ -5455,13 +5715,30 @@ async function artifactsResource(request, runtime) {
 
 async function secretsResource(request, runtime) {
   const params = queryOf(request)
-  const bad = unsupportedParams(params, new Set(['project', 'scope', 'name', 'value', 'reveal', 'confirm']))
+  const bad = unsupportedParams(params, new Set(['project', 'scope', 'name', 'value', 'reveal', 'confirm', 'action', 'key']))
   if (bad) return json({ ok: false, error: bad }, 400)
   const project = params.get('project') || ''
   const scope = params.get('scope') || 'global'
   const name = params.get('name') || ''
   const value = params.get('value') || ''
   const reveal = params.get('reveal') === '1' || params.get('reveal') === 'true'
+  // v3.0-P4-4：stats 只回答问题（密钥在哪、几条明文），不需要写权限；rotate 会重写全部密文，
+  // 必须 MANAGE_SECRET（换密钥等于把所有已存凭据重新托管一次）。
+  const mode = params.get('action') || ''
+  if (mode && mode !== 'stats' && mode !== 'rotate') return json({ ok: false, error: `不支持的 action：${mode}` }, 400)
+  if (mode === 'stats') {
+    const readGuard = authorizeRead(request, params, { runtime, action: ACTIONS.READ, resource: { type: 'secret', id: '', projectId: project } })
+    if (readGuard) return readGuard
+    try { return json({ ok: true, ...runtime.secrets({ action: 'stats' }) }) } catch (error) { return errorJson(error) }
+  }
+  if (mode === 'rotate') {
+    const rotateGuard = authorize(request, params, {
+      runtime, action: ACTIONS.MANAGE_SECRET, confirm: true,
+      resource: { type: 'secret', id: '', projectId: project },
+    })
+    if (rotateGuard) return rotateGuard
+    try { return json({ ok: true, ...runtime.secrets({ action: 'rotate', key: params.get('key') || '' }) }) } catch (error) { return errorJson(error) }
+  }
   // 三档：列出名字 = 读（viewer）；读值 = REVEAL_SECRET（admin + 审计）；写入 = MANAGE_SECRET。
   const action = name ? ACTIONS.MANAGE_SECRET : reveal ? ACTIONS.REVEAL_SECRET : ACTIONS.READ
   // 三档：列名 = 读（viewer，不加 confirm/写头）；读值 = REVEAL_SECRET（admin + confirm + 审计）；写入 = MANAGE_SECRET。

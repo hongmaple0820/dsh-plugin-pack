@@ -13,6 +13,8 @@
  *    这里是前三项中的「允许主体」，其余在部署链路里断言。
  */
 
+import { assertEnvironmentGuard } from './environments.js'
+
 export const ACTIONS = Object.freeze({
   READ: 'read',
   RUN: 'run',
@@ -118,11 +120,28 @@ export function can(actor, action, resource, context = {}) {
   if (!role) return deny('no_role')
   if (rank(role) < rank(minimum)) return deny(`role_${role}_below_${minimum}`)
 
-  // R4：prod 是 protected 环境，角色够也只是「候选」，必须是显式允许主体。
-  // 这里以「admin 及以上」为默认 allowlist，环境级 allowlist 在部署链路二次校验。
+  // R4：prod 是 protected 环境，角色够也只是「候选」，必须再过环境护栏。
   if (res.protected || res.env === 'prod') {
     const productActions = [ACTIONS.DEPLOY_PROD, ACTIONS.ROLLBACK_PROD, ACTIONS.MANAGE_ENV]
     if (productActions.includes(action) && rank(role) < rank('admin')) return deny('protected_env_requires_admin')
+    // v3.0-P4-3：角色达到 admin 只是必要条件，不再是充分条件 ——
+    // 「因为它是 admin 所以能发生产」正是 P4-3 要拆掉的那条捷径。
+    // 名单/分支规则的配置由运行时从 options.deployment.environments 解析后传进来。
+    // 这里**不**用 `if (guard)` 图省事：没传护栏等于"没有配置"，而受保护环境在
+    // 没有名单时必须是拒绝的。context.environmentGuard === undefined 说明调用点漏接，
+    // 传 null 说明那个动作没有环境上下文（MANAGE_ENV 之类），后者只跳过环境级判定。
+    const guard = context?.environmentGuard
+    if (guard !== null) {
+      const verdict = assertEnvironmentGuard({
+        env: guard.env || res.env,
+        guard: guard.spec || null,
+        actor: { id: who.id, role, tokenId: who.tokenId || '' },
+        branch: guard.branch || '',
+        tag: guard.tag || '',
+        digestPresent: guard.digestPresent,
+      })
+      if (verdict.required && !verdict.ok) return deny(verdict.failures[0]?.code || 'env_guard_denied')
+    }
   }
 
   return { allow: true, reason: 'role_satisfied', policyId, actor: who.id, action: String(action), resource: res }

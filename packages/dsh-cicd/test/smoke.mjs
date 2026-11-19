@@ -28,7 +28,7 @@ import { matchPushRef, triggerSummary } from '../lib/triggers.js'
 import { createLocalExecutor, createRemoteExecutor, createTaskBroker, joinTokenMatches } from '../lib/executors.js'
 import { createApprovalGate } from '../lib/approval.js'
 import { createSecretStore } from '../lib/secrets.js'
-import { normalizeEnvironments, promotionPath } from '../lib/environments.js'
+import { normalizeEnvironments, promotionPath, parseEnvironmentGuards } from '../lib/environments.js'
 import { deployRelease as strategyDeploy, normalizeStrategy } from '../lib/strategy.js'
 import { deployTransaction, planBatches, readManifest, usesTransaction } from '../lib/deploy-engine.js'
 import { createNativeActuator, renderTemplate } from '../lib/actuator/native.js'
@@ -1163,6 +1163,9 @@ check('DB：v1 库迁移到 user_version=12，补出 env、operations 审计列�
 const ENV_PIPE_SOURCE = [
   'version: 1',
   'name: env-pipe',
+  'environments:',
+  '  prod:',
+  '    allowedActors: [user:local]',
   'targets:',
   '  web:',
   '    hosts: [env:prod, group:api, linux26]',
@@ -1193,6 +1196,9 @@ const ENV_PIPE_SOURCE = [
 const DIRECT_PIPE_SOURCE = [
   'version: 1',
   'name: direct-pipe',
+  'environments:',
+  '  prod:',
+  '    allowedActors: [user:local]',
   'targets:',
   '  staging:',
   '    hosts: [api2]',
@@ -2388,6 +2394,83 @@ check('V2-M4 approvalGate：TTL 到期落 approval_timeout', () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
+check('P4-4 secrets：载荷加密落盘、密钥来源可答、坏密钥不悄悄换新', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-cicd-secrets-enc-'))
+  const workDir = join(dir, 'state')
+  // 1) 磁盘上找不到明文：载荷文件里既没有值，也没有能直接读出来的字节。
+  const store = createSecretStore({ dir: workDir, key: 'a'.repeat(64) })
+  store.set('demo', 'global', 'DB_PASSWORD', 's3cret-value-9137')
+  const raw = readFileSync(join(workDir, '.secrets.json'), 'utf8')
+  assert.ok(!raw.includes('s3cret-value-9137'), '载荷文件里不能出现明文')
+  assert.ok(raw.includes('"iv"') && raw.includes('"tag"') && raw.includes('"ct"'), '记录必须是 iv/tag/ct 形态')
+  assert.equal(store.stats().encrypted, 1)
+  assert.equal(store.stats().plaintext, 0)
+  assert.equal(store.stats().backend, 'config')
+  // 装载时生成了本机密钥文件；重开一次就是从这个文件读回来的（local 表示本次生成）。
+  const local = createSecretStore({ dir: workDir })
+  assert.equal(local.stats().backend, 'local')
+  assert.equal(local.stats().keyFile, join(workDir, 'secrets.key'))
+  // 换成不相关的钥匙重开：已有密文解不开，但这把钥匙的位置仍要报得出来。
+  assert.equal(local.get('demo', 'global', 'DB_PASSWORD'), '')
+  assert.equal(local.stats().undecryptable, 1)
+
+  // 2) 换一把钥匙：解不开就报 undecryptable，也不把它注进构建环境。
+  const stranger = createSecretStore({ dir: workDir, key: 'b'.repeat(64) })
+  assert.equal(stranger.get('demo', 'global', 'DB_PASSWORD'), '')
+  assert.equal(stranger.stats().undecryptable, 1)
+  assert.equal(stranger.refsForInterpolate('demo', {}).DB_PASSWORD, undefined)
+
+  // 3) 密钥文件内容坏掉 = 配置错误。悄悄生成新钥会让已有密文全部变成垃圾。
+  writeFileSync(join(workDir, 'secrets.key'), 'not-a-key')
+  assert.throws(() => createSecretStore({ dir: workDir }), /不是合法的 32 字节密钥/)
+
+  // 4) rotate：能解开的重加密，解不开的原样留下并报数量 —— 不替用户删 secret。
+  const rotated = store.rotate({ key: 'c'.repeat(64) })
+  assert.equal(rotated.rotated, 1)
+  assert.equal(rotated.skipped, 0)
+  const afterRotate = createSecretStore({ dir: workDir, key: 'c'.repeat(64) })
+  assert.equal(afterRotate.get('demo', 'global', 'DB_PASSWORD'), 's3cret-value-9137')
+  store.dispose()
+  rmSync(dir, { recursive: true, force: true })
+})
+
+checkAsync('P4-3 环境护栏：五条件缺一即拒，名单按真实角色判', async () => {
+  const { assertEnvironmentGuard, parseEnvironmentGuards, actorMatchesAllowlist, branchMatchesRule } = await import('../lib/environments.js')
+  const guards = parseEnvironmentGuards({
+    prod: {
+      protected: true,
+      allowedActors: ['user:alice', 'role:owner', 'token:tok-1'],
+      branchRule: '^release/.*$',
+      approval: true,
+    },
+    // 写错的前缀不是「不限」，是配置错误：悄悄放行等于谁知道写法谁就能发生产。
+    broken: { allowedActors: ['alice'] },
+  })
+  assert.equal(guards.invalid.length, 1)
+  assert.equal(guards.invalid[0].env, 'broken')
+
+  const guard = guards.byEnv.get('prod')
+  assert.equal(actorMatchesAllowlist({ id: 'alice', role: 'viewer' }, guard.allowedActors), true)
+  assert.equal(actorMatchesAllowlist({ id: 'bob', role: 'owner' }, guard.allowedActors), true)
+  assert.equal(actorMatchesAllowlist({ id: 'bob', role: 'viewer', tokenId: 'tok-1' }, guard.allowedActors), true)
+  assert.equal(actorMatchesAllowlist({ id: 'bob', role: 'viewer' }, guard.allowedActors), false)
+  assert.equal(branchMatchesRule(guard.branchRule, { branch: 'release/1.2' }), true)
+  assert.equal(branchMatchesRule(guard.branchRule, { branch: 'main' }), false)
+
+  const verdict = (over) => assertEnvironmentGuard({ env: 'prod', guard, digestPresent: true, branch: 'release/1.2', tag: '', actor: { id: 'alice', role: 'viewer' }, ...over })
+  assert.equal(verdict({}).ok, true)
+  assert.equal(verdict({ actor: { id: 'mallory', role: 'viewer' } }).failures[0].code, 'ENV_ACTOR_NOT_ALLOWED')
+  assert.equal(verdict({ branch: 'main' }).failures[0].code, 'ENV_BRANCH_NOT_ALLOWED')
+  assert.equal(verdict({ digestPresent: false }).failures[0].code, 'ENV_DIGEST_REQUIRED')
+  assert.equal(verdict({ guard: { ...guard, approval: false } }).failures[0].code, 'ENV_GUARD_MISCONFIGURED')
+  assert.equal(verdict({ guard: { ...guard, protected: false } }).failures[0].code, 'ENV_GUARD_MISCONFIGURED')
+  // 非受保护环境不判条件；但护栏若把 protected 标成 true，就不再是「非受保护」。
+  assert.equal(assertEnvironmentGuard({ env: 'dev', guard: { name: 'dev', protected: false, allowedActors: [], branchRule: '', approval: false }, actor: { id: 'x' }, digestPresent: true }).required, false)
+  // 没有名单 != 谁都可以：受保护环境必须写清楚「谁能发」。
+  const noList = assertEnvironmentGuard({ env: 'prod', guard: { ...guard, allowedActors: [] }, actor: { id: 'alice' }, digestPresent: true, branch: 'release/1.2' })
+  assert.equal(noList.failures[0].code, 'ENV_GUARD_NO_ALLOWLIST')
+})
+
 check('V2-M4 secrets：set/get/list/remove + refsForInterpolate', () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-cicd-secrets-'))
   const store = createSecretStore({ dir: join(dir, 'state') })
@@ -2548,6 +2631,11 @@ checkAsync('V2-M5 /rbac 路由：签发/校验/吊销/审计', async () => {
 const ACC_PIPE = [
   'version: 1',
   'name: acc-pipe',
+  // v3.0-P4-3：受保护环境必须有主体名单，否则护栏先于审批门拒（403 ENV_GUARD_NO_ALLOWLIST），
+  // 这三条验收测的是审批门本身（谁批、一条审批能用到哪个 digest），不是护栏。
+  'environments:',
+  '  prod:',
+  '    allowedActors: [role:owner]', // 验收②的 token 属于 owner 账号（/auth 如实报 owner，名单按真实角色精确匹配）
   'targets:',
   '  dev:',
   '    hosts: [api2]',
@@ -4517,6 +4605,51 @@ checkAsync('P5-6 tombstone：引用集算全才敢删，minAge 护住刚上传�
   assert.deepEqual(withRef.held.find((item) => item.digest === fromRelease.digest).why, ['ref:demo/latest'])
   store.dispose()
 })
+checkAsync('P4-3 接线：pipe.yml 里的 environments 真的会被执行', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-cicd-guard-'))
+  const projectDir = join(root, 'guard-demo')
+  mkdirSync(projectDir, { recursive: true })
+  writeFileSync(join(projectDir, 'pipe.yml'), [
+    'name: guard-demo',
+    'environments:',
+    '  prod:',
+    '    allowedActors: [role:owner]',
+    '    branchRule: "^release/.*$"',
+    'targets:',
+    '  staging:',
+    '    hosts: [api1]',
+    '    path: /srv/guard-staging',
+    '  prod:',
+    '    hosts: [api1]',
+    '    path: /srv/guard',
+    'stages:',
+    '  - id: deploy',
+    '    steps:',
+    '      - name: ship',
+    '        deploy:',
+    '          target: prod',
+    '          artifacts: [bundle.tgz]',
+  ].join('\n'))
+  writeFileSync(join(projectDir, 'bundle.tgz'), 'guard-bundle')
+  const tool = await repoTool(join(root, 'state'), { projects: [{ id: 'guard', name: 'guard', path: projectDir }] })
+  try {
+    // 护栏配置本身必须解析成功：pipe.yml 里写错一条名单会整体拒绝，而不是悄悄放行。
+    const spec = tool.runtime.environmentGuardSpec('prod', 'guard')
+    assert.equal(spec?.allowedActors?.[0], 'role:owner', 'pipe.yml 里的 environments.prod 名单没有被解析出来')
+    // 分支不匹配：pipe 里的 branchRule 必须在**任何主机被改动之前**拦下，
+    // 且拦下的原因要说得出来（不是笼统一句"部署失败"）。
+    const wrongBranch = await tool.call('/run?project=guard&target=prod&confirm=1', { method: 'POST', headers: { 'x-dsh-cicd': '1' } })
+    const respBody = await wrongBranch.clone().json()
+    assert.notEqual(wrongBranch.status, 403, '护栏是安全的出口，不该被误读成身份问题')
+    const blocked = (respBody.stages || []).flatMap((stage) => stage.steps || []).find((step) => step.status === 'failed')
+    assert.ok(blocked, '部署没跑起来，护栏也就无从判定：' + JSON.stringify(respBody).slice(0, 400))
+    const logResp = await tool.call('/log?runId=' + (respBody.runId || ''), { method: 'GET', headers: { 'x-dsh-cicd': '1' } })
+    const logText = String((await logResp.clone().json()).text || '')
+    // 没有分支 → 撞上 pipe.yml 里的 branchRule，且日志说得出是哪一个条件。
+    assert.match(logText, /环境护栏拦下 \[prod\] ENV_BRANCH_NOT_ALLOWED/, 'pipe.yml 里的 branchRule 没被执行：' + logText.slice(-500))
+  } finally { tool.close(); rmSync(root, { recursive: true, force: true }) }
+})
+
 checkAsync('P5-S5：指针（tag）只动引用 —— 指向不存在的 digest 被拒，GC 两段式且默认 dry-run', async () => {
   const { createArtifactStore, DEFAULT_GRACE_MS } = await import('../lib/artifacts.js')
   const store = createArtifactStore({ dir: join(casRoot, 'cas-e') })
@@ -4850,8 +4983,11 @@ async function repoTool(workDir, config = {}) {
   const routeOf = (pathname) => fresh.routes.find((item) => pathname === item.path || pathname.startsWith(`${item.path}/`))
   return {
     runtime,
+    workDir,
     call: (pathname, init = {}) => {
-      const route = routeOf(pathname)
+      // 路由匹配只看 pathname：query 是参数，不是路由的一部分。
+      const bare = pathname.split('?')[0]
+      const route = routeOf(bare) || fresh.routes.find((item) => item.path === internals.ROUTE_PREFIX + bare)
       assert.ok(route, `仓库路由没注册：${pathname}`)
       return route.resource(new Request(`http://registry.test${pathname}`, init))
     },

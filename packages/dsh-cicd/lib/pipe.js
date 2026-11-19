@@ -722,7 +722,34 @@ export function parsePipe(source, { path = 'pipe.yml' } = {}) {
 
   const triggers = normalizeTriggers(root)
   const toolchain = normalizeToolchain(root.toolchain)
-  return { version, name, vars: vars || {}, targets: normalizedTargets, stages: normalizedStages, triggers, toolchain, path }
+  // v3.0-P4-3：受保护环境的护栏可以写在 pipe 里（`environments:`），也可以写在插件配置里。
+  // 解析只做形状检查，语义判定统一在 lib/environments.js 的 parseEnvironmentGuards ——
+  // 两处各写一份校验，最后一定会出现"pipe 说合法、运行时说不合法"的分裂。
+  const environments = normalizePipeEnvironments(root.environments)
+  return { version, name, vars: vars || {}, targets: normalizedTargets, stages: normalizedStages, triggers, toolchain, environments, path }
+}
+
+/**
+ * 归一 `environments:`（v3.0-P4-3）。
+ *
+ * 这里只做形状检查：是不是 map、每项是不是 map 或 false。
+ * 名单前缀、正则能否编译这类**语义**问题交给 lib/environments.js 的
+ * parseEnvironmentGuards，它会把写错的条目集中报出来并让受保护环境一律拒绝 ——
+ * 在解析层抛异常反而更糟：一个环境的名单写错会让整条流水线跑不起来，
+ * 而正确的反应是"只有那个环境拒绝部署"。
+ */
+function normalizePipeEnvironments(input) {
+  if (input === undefined || input === null) return {}
+  if (typeof input !== 'object' || Array.isArray(input)) throw new PipeError('environments 必须是 map')
+  const out = {}
+  for (const [rawName, rawSpec] of Object.entries(input)) {
+    const name = String(rawName || '').trim()
+    if (!name) throw new PipeError('environments 里有空的环境名')
+    if (rawSpec === false || rawSpec === null) { out[name] = false; continue }
+    if (typeof rawSpec !== 'object' || Array.isArray(rawSpec)) throw new PipeError(`environments.${name} 必须是 map（或 false）`)
+    out[name] = rawSpec
+  }
+  return out
 }
 
 // 工具链语言枚举：与 lib/toolchain.js 的 LANGS 必须一致。
