@@ -8,7 +8,21 @@
  * v0.4: one target may list several hosts. A release is applied to every host in order, each with
  * its own previous/current symlink. `target.onHostFailure: stop|continue` decides whether a failed
  * host aborts the remaining hosts. Successful hosts are never rolled back automatically.
+ *
+ * v3.0-P3: `target.mode: container` 的目标不走软链 —— 回滚要换回上一版 manifest 里记的不可变
+ * digest，所以这里把工作交给容器 Actuator（与部署补偿共用同一段 revert）。
  */
+
+import { createContainerActuator } from './actuator/container.js'
+
+// Actuator 要的是 (host, command) 形状的 exec，而 remote 客户端把 host 放在第一个参数上。
+// 这一层绑定只做形状对齐，不做任何策略。
+function hostBound(remote, host) {
+  return {
+    exec: (command, options) => remote.exec(host, command, options),
+    uploadFile: (localPath, remotePath) => remote.uploadFile(host, localPath, remotePath),
+  }
+}
 
 export function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`
@@ -313,7 +327,7 @@ export async function deployRelease({
   }
 }
 
-export async function rollbackOne({ remote, target, host, releaseId, commit, onLog }) {
+export async function rollbackOne({ remote, target, host, releaseId, commit, onLog, actuatorFactory = null }) {
   const targetPath = String(target.path).replace(/\/+$/, '')
   const currentLink = `${targetPath}/current`
   let wanted = releaseId
@@ -334,8 +348,53 @@ export async function rollbackOne({ remote, target, host, releaseId, commit, onL
     throw error
   }
 
-  await remote.exec(host, `ln -sfn ${shellQuote(`releases/${wanted}`)} ${shellQuote(currentLink)}`)
   const stamp = new Date().toISOString()
+  if (target.mode === 'container') {
+    // 容器的回滚不是「换个软链、重启一下」：上一版跑的是另一个镜像，
+    // 旧容器必须停掉、旧 digest 必须重新 pull 起来。走容器 Actuator 的 revert，
+    // 与部署补偿用的是同一段代码，避免两条回滚路径各自漂移。
+    const factory = actuatorFactory || createContainerActuator
+    const actuator = factory({ host: hostBound(remote, host), target, hostName: host, onLog })
+    // rollback 只读一条事实：current 现在指向谁。那一版的 digest 从它自己的 manifest 读，
+    // 而不是从数据库或本次参数里带 —— 回滚要的是当时部署了什么。
+    const handle = {
+      host, mode: 'container', releaseId: wanted, dir,
+      image: target.container?.image || '', imageDigest: '',
+      imageReference: '', containers: [], instances: [],
+      previous: wanted, previousImage: '', pids: [], activatedAt: stamp,
+    }
+    const recorded = await remote.exec(host, `cat ${shellQuote(`${dir}/.dsh-manifest.json`)} 2>/dev/null || true`)
+    try {
+      const artifact = JSON.parse(String(recorded?.stdout || '').trim() || '{}').artifact || {}
+      handle.previousImage = String(artifact.reference || (artifact.image && artifact.digest ? `${artifact.image}@${artifact.digest}` : ''))
+    } catch { /* 老 release 没有 manifest：revert 会用 CONTAINER_IMAGE_INVALID 明说，而不是按 tag 猜 */ }
+    const reverted = await actuator.revert(handle, { drainSec: target.instances?.drain?.seconds || 0 })
+    logLine(onLog, `[${host}] current -> releases/${wanted}（回滚）`)
+    const verdict = await actuator.health({ ...handle, activatedAt: stamp, containers: reverted?.containers || [] })
+    if (verdict && verdict.ok === false) {
+      const error = new Error(`[${host}] 回滚后健康检查失败（${verdict.detail || verdict.layer || target.health?.http || ''}）`)
+      error.code = 'HEALTH_FAILED'
+      error.health = 'failed'
+      error.restarted = 'container'
+      throw error
+    }
+    return {
+      host,
+      ok: true,
+      batch: 1,
+      releaseId: wanted,
+      releaseDir: dir,
+      restarted: 'container',
+      health: verdict?.ok === false ? 'failed' : 'ok',
+      previous: '',
+      cleaned: false,
+      activated_at: stamp,
+      instances: (reverted?.instances || handle.instances || []),
+      error: '',
+      code: '',
+    }
+  }
+  await remote.exec(host, `ln -sfn ${shellQuote(`releases/${wanted}`)} ${shellQuote(currentLink)}`)
   await remote.exec(host, `echo ${shellQuote(`${stamp} rollback:${wanted} ${commit}`)} >> ${shellQuote(`${targetPath}/revisions.log`)}`)
   logLine(onLog, `[${host}] current -> releases/${wanted}（回滚）`)
   const restarted = await restartTarget({ remote, host, target, onLog })
@@ -371,6 +430,7 @@ export async function rollbackRelease({
   releaseId = '',
   commit = '',
   onLog = null,
+  actuatorFactory = null,
 } = {}) {
   if (!remote) throw new Error('rollbackRelease 需要 remote')
   if (!target || !target.path) throw Object.assign(new Error('target 缺少 path，无法回滚'), { code: 'PIPE_INVALID' })
@@ -382,7 +442,7 @@ export async function rollbackRelease({
   for (const current of hosts) {
     logLine(onLog, `[${current}] rollback ${wanted || 'current'} 开始`)
     try {
-      results.push(await rollbackOne({ remote, target, host: current, releaseId: wanted, commit, onLog }))
+      results.push(await rollbackOne({ remote, target, host: current, releaseId: wanted, commit, onLog, actuatorFactory }))
     } catch (error) {
       const failed = failureResult(current, error)
       results.push(failed)

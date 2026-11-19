@@ -152,9 +152,9 @@ P1+P2+P3 ─→ P5 制品库(3w) ─→ P6 体验(4w) ─→ P7 加固(持续)
 | P3-3 | 三层探针 | L1/L2/L3 + 观察窗 | 人为 500 → 自动回滚 |
 | P3-4 | 补偿事务 | per-host 状态 + 只回滚已激活 | 第 2 台失败时第 1 台回滚 |
 | P3-5 | 五策略 | serial/parallel/rolling/canary/blue-green | 每种有集成测试 |
-| P3-6 | 容器 Actuator | `docker pull @digest` + proxy 切流 | 镜像为 digest 形式 |
-| P3-7 | K8s Actuator（可选） | patch Deployment + `rollout undo` | 灰度交给 Argo Rollouts |
-| P3-8 | manifest 落盘 | `.dsh-manifest.json` + DB | 断网可读完整现场 |
+| P3-6 | 容器 Actuator | `lib/actuator/container.js`：`docker pull <image>@sha256:…` → `docker run -p 0:<port>` → `docker port` 读回宿主端口 → 切 `current`；回滚重新 pull 上一版 manifest 里记的 digest（不按 tag） | 镜像只接受 digest（tag 一律 `CONTAINER_IMAGE_INVALID`）；失败不切 current。测试 P3-S6b/S8/S9/S10/S11 | ✅ |
+| P3-7 | K8s Actuator（可选） | patch Deployment + `rollout undo` | 灰度交给 Argo Rollouts（仍抛 `ACTUATOR_NOT_IMPLEMENTED`，P3-S6 守着） | ⏳ |
+| P3-8 | manifest 落盘 | `.dsh-manifest.json` + DB（容器版另记 `artifact.reference` 与 `instances[].containerId`） | 断网可读完整现场（P3-S7、P3-S8） | ✅ |
 
 **前置**：P5 的 digest 模型（可先用“产物 sha256”临时顶替，P5 再统一）。
 

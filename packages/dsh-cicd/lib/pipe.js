@@ -20,6 +20,8 @@ import { normalizeTriggers } from './triggers.js'
 export const RUNTIME_VALUES = ['static', 'node', 'python', 'go', 'php', 'docker']
 const RUNTIME_SET = new Set(RUNTIME_VALUES)
 const APP_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._@:/-]*$/
+// registry[:port]/namespace/name — 小写、无 tag、无 digest。docker 自己定的形状，抄一份而不是自创。
+const DOCKER_IMAGE_PATTERN = /^[a-z0-9]+(?:(?:[._-]|:)[a-z0-9]+)*(?:\/[a-z0-9]+(?:(?:[._-])[a-z0-9]+)*)*$/
 const HOST_FAILURE_VALUES = new Set(['stop', 'continue'])
 // v3.0-P3：目前只有 native 有诚实的实现。container / k8s 在解析层就认得，
 // 但要等各自的 Actuator 落地才允许真的部署 —— 见 normalizeTarget 里的模式校验。
@@ -310,6 +312,7 @@ function normalizeTarget(targetName, target) {
   }
   if (target.service && target.restart) throw new PipeError(`target ${targetName} 不能同时配置 service 与 restart`)
 
+
   if (target.onHostFailure !== undefined && !HOST_FAILURE_VALUES.has(String(target.onHostFailure))) {
     throw new PipeError(`target ${targetName} 的 onHostFailure 只有 stop 或 continue（收到 “${target.onHostFailure}”）`)
   }
@@ -347,6 +350,10 @@ function normalizeTarget(targetName, target) {
   if (!DEPLOY_MODES.has(mode)) {
     throw new PipeError(`target ${targetName} 的 mode “${target.mode}” 不支持（可用 ${[...DEPLOY_MODES].join('、')}）`)
   }
+  // 容器由 docker run 起，没有「重启命令」这回事；配了它的人以为自己能改变启动方式，实际上会被忽略。
+  if (mode === 'container' && (target.service || target.restart)) {
+    throw new PipeError(`target ${targetName} 的 mode 是 container，容器由 docker run 启动，不能配置 service / restart（删掉它们，或改回 mode: native）`)
+  }
 
   // v3.0-P3：实例不是「副本数」而是端口 + pid + 日志。count 必须显式给，
   // 端口基址必须显式给 —— 猜一个 8080 出来，就会与用户机器上别的东西抢端口。
@@ -359,22 +366,27 @@ function normalizeTarget(targetName, target) {
     if (!Number.isInteger(count) || count < 1 || count > 512) {
       throw new PipeError(`target ${targetName} 的 instances.count 必须是 1-512 的整数`)
     }
-    const portSpec = target.instances.port
-    if (!portSpec || typeof portSpec !== 'object' || Array.isArray(portSpec)) {
-      throw new PipeError(`target ${targetName} 的 instances.port 必须是 map（含 base，可选 step）`)
-    }
-    const base = portSpec.base
-    if (!Number.isInteger(base) || base < 1 || base > 65535) {
-      throw new PipeError(`target ${targetName} 的 instances.port.base 必须是 1-65535 的整数`)
-    }
-    const step = portSpec.step === undefined || portSpec.step === null ? 1 : portSpec.step
-    if (!Number.isInteger(step) || step < 1 || step > 1000) {
-      throw new PipeError(`target ${targetName} 的 instances.port.step 必须是 1-1000 的整数`)
-    }
-    // 越界在这里就报，不留到部署时让第一个实例起在 70000 上。
-    const lastPort = base + step * (count - 1)
-    if (lastPort > 65535) {
-      throw new PipeError(`target ${targetName} 的实例端口会越界（${base} + ${step} × ${count - 1} = ${lastPort} > 65535）`)
+    // 容器不挑宿主机端口（-p 0 由 docker 分配再读回），所以 instances.port 只对 native 有意义。
+    let portRange = null
+    if (mode !== 'container') {
+      const portSpec = target.instances.port
+      if (!portSpec || typeof portSpec !== 'object' || Array.isArray(portSpec)) {
+        throw new PipeError(`target ${targetName} 的 instances.port 必须是 map（含 base，可选 step）`)
+      }
+      const base = portSpec.base
+      if (!Number.isInteger(base) || base < 1 || base > 65535) {
+        throw new PipeError(`target ${targetName} 的 instances.port.base 必须是 1-65535 的整数`)
+      }
+      const step = portSpec.step === undefined || portSpec.step === null ? 1 : portSpec.step
+      if (!Number.isInteger(step) || step < 1 || step > 1000) {
+        throw new PipeError(`target ${targetName} 的 instances.port.step 必须是 1-1000 的整数`)
+      }
+      // 越界在这里就报，不留到部署时让第一个实例起在 70000 上。
+      const lastPort = base + step * (count - 1)
+      if (lastPort > 65535) {
+        throw new PipeError(`target ${targetName} 的实例端口会越界（${base} + ${step} × ${count - 1} = ${lastPort} > 65535）`)
+      }
+      portRange = { base, step }
     }
     if (target.instances.weight !== undefined) {
       const weight = target.instances.weight
@@ -409,13 +421,15 @@ function normalizeTarget(targetName, target) {
     }
     instances = {
       count,
-      port: { base, step },
+      port: portRange,
       weight: target.instances.weight === undefined ? null : target.instances.weight,
       env: instanceEnv || {},
       log: instanceLog || '',
       drain,
     }
-    if (!target.restart) {
+    // v3.0-P3：容器由 docker run 起，没有「重启命令模板」这回事；端口也由 docker 分配，
+    // 要求 instances.port 是一次「猜一个 8080 出来」的强制——那正是容器部署要避免的抢端口。
+    if (mode !== 'container' && !target.restart) {
       throw new PipeError(`target ${targetName} 声明了 instances 就必须给 restart 命令模板（可用 {{.port}} / {{.slot}} / {{.host}} / {{.release}} / {{.app}} / {{.instance}} / {{.index}}）`)
     }
   }
@@ -454,6 +468,38 @@ function normalizeTarget(targetName, target) {
     }
   }
 
+  // v3.0-P3：容器 target。image 与 container.port 是两件「只能由用户说、猜不得」的事：
+  // 猜仓库名会把镜像发到别人的命名空间，猜容器内端口会让探针永远打在一个关闭的门上。
+  let container = null
+  if (mode === 'container') {
+    const rawImage = String(target.image || '').trim()
+    if (!rawImage) {
+      throw new PipeError(`target ${targetName} 的 mode 是 container，必须给 image（如 registry.example.com/demo/web）`)
+    }
+    // 镜像名跟着 digest 走：写 <image>@sha256:… 或带 tag 都是误用，引用得在部署时由产物 digest 拼出来。
+    if (rawImage.includes('@') || /:[^/]+$/.test(rawImage)) {
+      throw new PipeError(`target ${targetName} 的 image “${rawImage}” 不能带 tag 或 digest；容器部署的镜像引用是 image@sha256:<产物 digest>`)
+    }
+    if (!DOCKER_IMAGE_PATTERN.test(rawImage)) {
+      throw new PipeError(`target ${targetName} 的 image “${rawImage}” 不合法（registry[:port]/path 的小写形状）`)
+    }
+    if (target.container !== undefined && (typeof target.container !== 'object' || Array.isArray(target.container))) {
+      throw new PipeError(`target ${targetName} 的 container 必须是 map`)
+    }
+    const containerPort = target.container?.port
+    if (!Number.isInteger(containerPort) || containerPort < 1 || containerPort > 65535) {
+      throw new PipeError(`target ${targetName} 的 container.port 必须是 1-65535 的整数（容器内监听的端口）`)
+    }
+    container = {
+      image: rawImage,
+      port: containerPort,
+      pullTimeoutSec: target.container.pullTimeoutSec ?? 600,
+      runTimeoutSec: target.container.runTimeoutSec ?? 120,
+      args: asArray(target.container.args ?? [], `target ${targetName} 的 container.args`).map((entry) => String(entry)),
+      volumes: asArray(target.container.volumes ?? [], `target ${targetName} 的 container.volumes`).map((entry) => String(entry)),
+    }
+  }
+
   // 环境（environment）升格：target 自动映射，带保护/审批标志
   const protected_ = targetName.toLowerCase() === 'prod' || target.protected === true
   const approvalRequired = targetName.toLowerCase() === 'prod' || target.approvalRequired === true
@@ -479,6 +525,7 @@ function normalizeTarget(targetName, target) {
     runtime,
     app,
     mode,
+    container,
     instances,
     health,
     onHostFailure,

@@ -30,6 +30,7 @@ import { normalizeEnvironments, promotionPath } from '../lib/environments.js'
 import { deployRelease as strategyDeploy, normalizeStrategy } from '../lib/strategy.js'
 import { deployTransaction, planBatches, readManifest, usesTransaction } from '../lib/deploy-engine.js'
 import { createNativeActuator, renderTemplate } from '../lib/actuator/native.js'
+import { createContainerActuator, resolveImageReference, parsePublishedPort, parseInspect, normalizeImageDigest, CONTAINER_ERRORS } from '../lib/actuator/container.js'
 import { createSlotStore } from '../lib/slots.js'
 import {
   createToolchain, envFor, assertVersions, inferFromFiles, writeDualLocks, binDirOf,
@@ -3803,9 +3804,183 @@ checkAsync('P3-S5：release 存储保留不可变 artifact digest 与实例快�
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
 })
 
-checkAsync('P3-S6：container/k8s 尚无 Actuator 时拒绝静默退回 native', async () => {
-  await assert.rejects(() => deployTransaction({ remote: {}, target: { mode: 'container', path: '/srv', hosts: ['h1'] }, releaseId: 'p3-r6' }), (error) => error.code === 'ACTUATOR_NOT_IMPLEMENTED')
+checkAsync('P3-S6：k8s 尚无 Actuator 时拒绝静默退回 native', async () => {
+  await assert.rejects(() => deployTransaction({ remote: {}, target: { mode: 'k8s', path: '/srv', hosts: ['h1'] }, releaseId: 'p3-r6' }), (error) => error.code === 'ACTUATOR_NOT_IMPLEMENTED')
 })
+
+checkAsync('P3-S6b：容器 mode 与 native 同一条事务路径 —— 先全部 pull 再切，一台失败谁都不换', async () => {
+  const calls = []
+  const remote = { async exec(hostName, command) {
+    calls.push({ hostName, command })
+    if (command.startsWith('docker inspect --type image')) return { stdout: 'no', exitCode: 0 }
+    if (command.startsWith('docker pull')) {
+      return hostName === 'bad'
+        ? { stdout: '', stderr: 'manifest unknown', exitCode: 1 }
+        : { stdout: '', exitCode: 0 }
+    }
+    if (command.startsWith('docker run')) return { stdout: hostName + '-container-id\n', exitCode: 0 }
+    if (command.startsWith('docker port')) return { stdout: '8080/tcp -> 0.0.0.0:32768\n', exitCode: 0 }
+    if (command.startsWith('docker ps -q --filter')) return { stdout: hostName + '-container-id\n', exitCode: 0 }
+    if (command === 'readlink') return { stdout: '', exitCode: 0 }
+    return { stdout: '', exitCode: 0 }
+  } }
+  const target = { mode: 'container', path: '/srv/web', hosts: ['h1', 'bad'], image: 'registry.example.com/demo/web', container: { image: 'registry.example.com/demo/web', port: 8080 }, health: { http: '' }, keep: 3 }
+  const result = await deployTransaction({
+    remote,
+    target,
+    releaseId: 'p3-r6b',
+    artifactDigest: 'sha256:' + 'a'.repeat(64),
+    actuatorFactory: ({ host: bound, hostName, target: t }) => createContainerActuator({ host: bound, target: t, hostName, onLog: () => {} }),
+  })
+  assert.equal(result.ok, false)
+  // h1 已经 pull 到本地（stage 成功），但 bad 的 pull 失败 → 谁都没有 docker run 过。
+  assert.ok(calls.some((item) => item.hostName === 'h1' && item.command.startsWith('docker pull')))
+  assert.equal(calls.filter((item) => item.command.startsWith('docker run')).length, 0)
+  const bad = result.hosts.find((item) => item.host === 'bad')
+  assert.match(bad.error, /docker pull 失败/)
+  assert.equal(bad.code, 'CONTAINER_PULL_FAILED')
+})
+
+checkAsync('P3-S8：容器按 digest 部署 —— pull @sha256、-p 0 读回端口、切 current、manifest 记容器 id', async () => {
+  const calls = []
+  const releaseDir = '/srv/web/releases/p3-r8'
+  const host = {
+    async exec(command) {
+      calls.push(command)
+      if (command.startsWith('docker inspect --type image')) return { stdout: 'no', exitCode: 0 }
+      if (command.startsWith('docker pull')) return { stdout: '', exitCode: 0 }
+      if (command.startsWith('docker run')) return { stdout: 'c0ffee123456\n', exitCode: 0 }
+      if (command.startsWith('docker port')) return { stdout: '80/tcp -> 0.0.0.0:32770\n80/tcp -> [::]:32770\n', exitCode: 0 }
+      if (command.startsWith('docker ps -q --filter')) return { stdout: 'c0ffee123456\n', exitCode: 0 }
+      if (command.startsWith('ss -ltn')) return { stdout: '1\n', exitCode: 0 }
+      if (command.startsWith('readlink')) return { stdout: 'releases/p3-r7\n', exitCode: 0 }
+      if (command.startsWith('cat ') && command.includes('.dsh-manifest.json')) {
+        return { stdout: JSON.stringify({ artifact: { image: 'registry.example.com/demo/web', digest: 'sha256:' + 'b'.repeat(64) } }), exitCode: 0 }
+      }
+      if (command.startsWith('curl')) return { stdout: 'ok', exitCode: 0 }
+      return { stdout: '', exitCode: 0 }
+    },
+    async uploadFile() {},
+  }
+  const target = {
+    path: '/srv/web', app: 'web', keep: 3,
+    container: { image: 'registry.example.com/demo/web', port: 80, pullTimeoutSec: 600, runTimeoutSec: 120, args: [], volumes: ['/data:/data'] },
+    instances: { count: 2, port: null, env: { RELEASE: '{{.release}}', PORT: '80' }, log: '/var/log/web-{{.index}}.log', drain: null },
+    health: { http: 'curl -fsS http://127.0.0.1:{{.port}}/healthz', tries: 2, interval: 0, expect: 0, window: 0 },
+  }
+  const digest = 'sha256:' + 'a'.repeat(64)
+  const actuator = createContainerActuator({ host, target, hostName: 'h1', onLog: () => {}, now: () => Date.parse('2026-01-01T00:00:00Z') })
+  const handle = await actuator.stage({ releaseId: 'p3-r8', artifactDigest: digest })
+  assert.equal(handle.imageReference, 'registry.example.com/demo/web@' + digest)
+  await actuator.activate(handle)
+  assert.equal(handle.instances.length, 2)
+  assert.deepEqual(handle.instances.map((item) => item.port), [32770, 32770])
+  const runs = calls.filter((command) => command.startsWith('docker run'))
+  assert.equal(runs.length, 2)
+  assert.ok(runs[0].includes('@' + digest), '镜像引用必须是 image@sha256，不能是 tag')
+  assert.ok(runs[0].includes('-p 0:80'), '容器端口由 -p 0 交给 docker 分配')
+  assert.ok(runs[0].includes("-e 'RELEASE=p3-r8'"), '实例环境变量模板会被渲染')
+  // 第二实例起名不同，否则 docker run --name 直接冲突。
+  assert.equal(new Set(handle.instances.map((item) => item.containerName)).size, 2)
+  const verdict = await actuator.health(handle)
+  assert.equal(verdict.ok, true)
+  assert.match(calls.find((command) => command.startsWith('curl')), /:32770\/healthz/)
+  const dir = mkdtempSync(join(tmpdir(), 'cicd-p3-container-'))
+  try {
+    const manifestHost = { exec: async (command) => {
+      if (command.startsWith('printf %s')) writeFileSync(join(dir, 'manifest.json'), command.replace(/^printf %s '((?:[^']|'\\'')*)'.*$/s, '$1').replace(/'\\''/g, "'"))
+      return { stdout: '', exitCode: 0 }
+    } }
+    const writer = createContainerActuator({ host: manifestHost, target, hostName: 'h1', onLog: () => {} })
+    handle.dir = dir
+    const manifest = await writer.writeManifest(handle, { runId: 'run-1', commit: 'deadbeef' })
+    assert.equal(manifest.artifact.digest, digest)
+    assert.equal(manifest.artifact.reference, 'registry.example.com/demo/web@' + digest)
+    const written = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8'))
+    assert.equal(written.instances[0].containerId, 'c0ffee123456')
+    assert.equal(written.instances[0].port, 32770)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+  // 回滚要用上一版 manifest 里记的 digest，而不是「当前磁盘上是什么」。
+  assert.equal(handle.previous, 'p3-r7')
+  assert.equal(handle.previousImage, 'registry.example.com/demo/web@sha256:' + 'b'.repeat(64))
+  const reverted = await actuator.revert(handle)
+  assert.equal(reverted.previous, 'p3-r7')
+  assert.ok(calls.some((command) => command === 'docker pull ' + "'registry.example.com/demo/web@sha256:" + 'b'.repeat(64) + "'"))
+  assert.equal(calls.filter((command) => command.startsWith('docker stop')).length, 2)
+})
+
+checkAsync('P3-S9：tag 一律拒绝 —— 按 tag 回滚会跟着 tag 漂移', async () => {
+  for (const digest of ['', 'latest', 'sha256:abc', 'b'.repeat(64)]) {
+    const ok = normalizeImageDigest(digest)
+    assert.equal(ok, digest === 'b'.repeat(64) ? 'sha256:' + digest : '')
+  }
+  assert.throws(() => resolveImageReference({ image: 'demo/web', digest: 'v1.2.3' }), (error) => error.code === CONTAINER_ERRORS.IMAGE)
+  assert.throws(() => resolveImageReference({ image: 'demo/web:1.2', digest: 'sha256:' + 'c'.repeat(64) }), (error) => error.code === CONTAINER_ERRORS.IMAGE)
+  assert.throws(() => resolveImageReference({ image: '', digest: 'sha256:' + 'c'.repeat(64) }), (error) => error.code === CONTAINER_ERRORS.IMAGE)
+  const parsed = parsePublishedPort('80/tcp -> 0.0.0.0:32768\n443/tcp -> 0.0.0.0:32769\n', 443)
+  assert.equal(parsed.hostPort, 32769)
+  assert.equal(parsePublishedPort('garbage', 80), null)
+  const inspected = parseInspect(JSON.stringify([{ Id: 'abc', State: { Running: true }, Config: { Image: 'demo/web@sha256:x' }, NetworkSettings: { Ports: { '80/tcp': [{ HostIp: '0.0.0.0', HostPort: '32770' }] } } }]))
+  assert.equal(inspected[0].ports[0].hostPort, 32770)
+  assert.equal(inspected[0].running, true)
+  assert.deepEqual(parseInspect('not json'), [])
+})
+
+checkAsync('P3-S10：容器端口读不回来就当失败 —— 探针打不到的门不算起来了', async () => {
+  const host = { async exec(command) {
+    if (command.startsWith('docker inspect --type image')) return { stdout: 'no', exitCode: 0 }
+    if (command.startsWith('docker run')) return { stdout: 'deadbeef\n', exitCode: 0 }
+    if (command.startsWith('docker port')) return { stdout: '', exitCode: 0 }
+    return { stdout: '', exitCode: 0 }
+  } }
+  const target = { path: '/srv/web', app: 'web', container: { image: 'demo/web', port: 8080 }, health: {} }
+  const actuator = createContainerActuator({ host, target, hostName: 'h1', onLog: () => {} })
+  const handle = await actuator.stage({ releaseId: 'p3-r10', artifactDigest: 'sha256:' + 'd'.repeat(64) })
+  await assert.rejects(() => actuator.activate(handle), (error) => error.code === CONTAINER_ERRORS.PORT)
+  // 失败后 current 没有被切过去：探针没通过的一版不许成为「当前」。
+  const calls = []
+  assert.equal(handle.activatedAt, '')
+  void calls
+})
+
+checkAsync('P3-S11：容器回滚走 Actuator —— 换回上一版 digest，而不是重放软链', async () => {
+  const calls = []
+  const remote = {
+    async exec(host, command) {
+      calls.push({ host, command })
+      if (command.startsWith('readlink')) return { stdout: 'releases/r-new\n', exitCode: 0 }
+      if (command.startsWith('test -d')) return { stdout: 'yes\n', exitCode: 0 }
+      if (command.startsWith('docker stop')) return { stdout: 'r-old\n', exitCode: 0 }
+      if (command.startsWith('docker rm')) return { stdout: '', exitCode: 0 }
+      if (command.startsWith('docker inspect --type image')) return { stdout: 'no', exitCode: 0 }
+      if (command.startsWith('docker pull')) return { stdout: '', exitCode: 0 }
+      if (command.startsWith('docker run')) return { stdout: 'old-container\n', exitCode: 0 }
+      if (command.startsWith('docker port')) return { stdout: '80/tcp -> 0.0.0.0:31000\n', exitCode: 0 }
+      if (command.startsWith('docker ps -q --filter')) return { stdout: 'old-container\n', exitCode: 0 }
+      if (command.startsWith('ss -ltn')) return { stdout: '1\n', exitCode: 0 }
+      if (command.startsWith('cat ') && command.includes('.dsh-manifest.json')) {
+        return { stdout: JSON.stringify({ artifact: { image: 'registry.example.com/demo/web', digest: 'sha256:' + 'e'.repeat(64) } }), exitCode: 0 }
+      }
+      return { stdout: '', exitCode: 0 }
+    },
+    async uploadFile() {},
+  }
+  const target = {
+    mode: 'container', path: '/srv/web', app: 'web', hosts: ['h1'],
+    container: { image: 'registry.example.com/demo/web', port: 80 },
+    instances: { count: 1, port: null, env: {}, log: '' },
+    health: {},
+  }
+  const result = await rollbackRelease({ remote, target, targetName: 'prod', releaseId: 'r-old' })
+  assert.equal(result.ok, true)
+  assert.equal(result.hosts[0].restarted, 'container')
+  const pull = calls.find((item) => item.command.startsWith('docker pull'))
+  assert.ok(pull, '容器回滚必须重新 pull 上一版镜像')
+  assert.ok(pull.command.includes("'registry.example.com/demo/web@sha256:" + 'e'.repeat(64) + "\''") || pull.command.includes('@sha256:' + 'e'.repeat(64)), '回滚按上版 manifest 里的 digest 拉取')
+  assert.equal(calls.filter((item) => /^ln -sfn/.test(item.command)).length, 0, '容器回滚不重写 current 软链')
+  assert.equal(calls.filter((item) => /^systemctl/.test(item.command)).length, 0, '容器回滚不重启 systemd 服务')
+})
+
 
 checkAsync('P3-S7：断网仍可从 manifest 读取回滚现场', async () => {
   const result = await readManifest({

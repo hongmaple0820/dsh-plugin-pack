@@ -26,6 +26,7 @@
  */
 
 import { createNativeActuator, ACTUATOR_ERRORS } from './actuator/native.js'
+import { createContainerActuator } from './actuator/container.js'
 import { normalizeStrategy } from './strategy.js'
 import { delay, logLine, shellQuote } from './deploy.js'
 
@@ -121,6 +122,7 @@ function emptyHostResult(host, batch, reason, code) {
  * @param {Function} [params.onStrategyProgress]
  * @param {object} [params.strategy]        覆盖 target.strategy
  * @param {Function} [params.actuatorFactory] 测试注入点：({host, target, hostName, onLog}) => actuator
+ * @param {object} [params.actuatorOptions]   透传给 Actuator 的注入项（如现在的时间/等待函数）
  */
 export async function deployTransaction(params = {}) {
   const {
@@ -141,6 +143,7 @@ export async function deployTransaction(params = {}) {
     onStrategyProgress = null,
     strategy: strategyOverride = null,
     actuatorFactory = null,
+    actuatorOptions = null,
   } = params
 
   if (!remote) throw new Error('deployTransaction 需要 remote')
@@ -160,8 +163,9 @@ export async function deployTransaction(params = {}) {
   // mode 拒绝静默降级：写 mode: container 却走软链部署，是那种「面板显示成功、生产其实
   // 没有换镜像」的失败。只有 native 有诚实的实现，其余必须等各自 Actuator 落地。
   // actuatorFactory 是测试注入点，注入时不看 mode（测试用自己的假执行器）。
-  if (!actuatorFactory && target.mode && target.mode !== 'native') {
-    const error = new Error(`mode ${target.mode} 的 Actuator 还没实现（当前只有 native）；拒绝退回软链部署——那会让面板显示成功而生产没有真的换版本`)
+  const nativeOrContainer = !target.mode || target.mode === 'native' || target.mode === 'container'
+  if (!actuatorFactory && !nativeOrContainer) {
+    const error = new Error(`mode ${target.mode} 的 Actuator 还没实现（当前有 native 与 container）；拒绝退回软链部署——那会让面板显示成功而生产没有真的换版本`)
     error.code = 'ACTUATOR_NOT_IMPLEMENTED'
     throw error
   }
@@ -175,8 +179,10 @@ export async function deployTransaction(params = {}) {
       exec: (command, options) => remote.exec(hostName, command, options),
       uploadFile: (localPath, remotePath) => remote.uploadFile(hostName, localPath, remotePath),
     }
-    const factory = actuatorFactory || createNativeActuator
-    const actuator = factory({ host: bound, target, hostName, onLog })
+    // v3.0-P3：mode 决定用哪个 Actuator，其余一切（批次、补偿、health 分层、manifest）都在这里，
+    // 与模式无关。容器 Actuator 只需要 pull 得到 digest、起得来容器、读得回端口。
+    const factory = actuatorFactory || (target.mode === 'container' ? createContainerActuator : createNativeActuator)
+    const actuator = factory({ ...(actuatorOptions || {}), host: bound, target, hostName, onLog })
     actuators.set(hostName, actuator)
     return actuator
   }
@@ -202,7 +208,7 @@ export async function deployTransaction(params = {}) {
       const actuator = makeActuator(hostName)
       try {
         logLine(onLog, `[${hostName}] stage 开始`)
-        const handle = await actuator.stage({ releaseId: release, artifactPath })
+        const handle = await actuator.stage({ releaseId: release, artifactPath, artifactDigest })
         staged.push({ hostName, actuator, handle })
       } catch (error) {
         stageFailure = { hostName, error }
@@ -271,7 +277,9 @@ export async function deployTransaction(params = {}) {
         let compensation = null
         try {
           compensation = await actuator.revert(handle, { drainSec: 0 })
-          logLine(onLog, `[${hostName}] 补偿：${compensation.reverted ? `已指回 ${compensation.previous}` : '无 previous，已移除 current'}`)
+          // native 的 revert 返回「指回哪里」，容器的 revert 返回它自己；两种都只认事实字段。
+          const where = compensation?.previous || handle.previous || ''
+          logLine(onLog, `[${hostName}] 补偿：${where ? `已指回 ${where}` : '无 previous，已移除 current'}`)
         } catch (error) {
           compensation = { ok: false, notes: [`补偿抛错：${error.message}`] }
           logLine(onLog, `[${hostName}] 补偿失败：${error.message}`)
@@ -339,6 +347,8 @@ export async function deployTransaction(params = {}) {
         })),
         manifest: null,
         compensated: false,
+        containerIds: (handle.containers || []).slice(),
+        imageReference: handle.imageReference || '',
         error: '',
         code: '',
       }
@@ -351,6 +361,7 @@ export async function deployTransaction(params = {}) {
           commit,
           runId,
           operator,
+          health: 'ok',
         })
       } catch (error) {
         // manifest 写不下去代表「主机失联时没有回滚现场」，这是要报出来的，但不必让整批失败：
