@@ -2,6 +2,11 @@ node_modules/
 hosts.json
 *.log
 packages/*/hosts.json
+# 临时测试输出（PowerShell 重定向产物，常被进程占用删不掉）
+packages/*/out.txt
+packages/*/o.txt
+packages/*/smoke*.txt
+packages/*/r.txt
 
 # 根目录的临时运维脚本与本地实验产物不属于插件包本体，不推送
 /*.mjs
