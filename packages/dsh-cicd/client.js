@@ -20,7 +20,7 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react')
     const h = React.createElement
-    const { useCallback, useEffect, useRef, useState } = React
+    const { useCallback, useEffect, useMemo, useRef, useState } = React
 
     const STYLE_ID = '@local/dsh-cicd/page.css'
     /** 左侧栏全局面板的 id / `main` 槽 key。 */
@@ -43,6 +43,18 @@ window.__ModuleLoader__.load({
     const AUDIT_DEFAULT_LIMIT = 50
 
     const CSS = `
+.cicd-palette-mask{position:fixed;inset:0;z-index:60;background:var(--dsw-alias-bg-mask, rgba(0,0,0,.28));display:flex;align-items:flex-start;justify-content:center;padding-top:12vh}
+.cicd-palette{box-sizing:border-box;width:min(560px,92vw);max-height:62vh;display:flex;flex-direction:column;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md, 8px);background:var(--dsw-alias-bg-layer-1);box-shadow:0 12px 40px rgba(0,0,0,.24);overflow:hidden}
+.cicd-palette-input{box-sizing:border-box;width:100%;height:38px;padding:0 12px;border:0;border-bottom:.5px solid var(--dsw-alias-border-l1);background:transparent;color:var(--dsw-alias-label-primary);font-size:13px;outline:none}
+.cicd-palette-list{margin:0;padding:4px 0;list-style:none;overflow:auto}
+.cicd-palette-item{display:flex;align-items:baseline;gap:8px;padding:6px 12px;cursor:pointer;color:var(--dsw-alias-label-primary);font-size:12.5px}
+.cicd-palette-item.is-active{background:var(--dsw-alias-bg-layer-2);box-shadow:inset 2px 0 0 var(--dsw-alias-brand-primary)}
+.cicd-palette-kind{flex:0 0 auto;color:var(--dsw-alias-label-tertiary);font-size:11px}
+.cicd-palette-label{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cicd-palette-hint{flex:0 0 auto;color:var(--dsw-alias-label-tertiary);font-size:11px}
+.cicd-palette-empty{padding:14px 12px;color:var(--dsw-alias-label-tertiary);font-size:12px}
+.cicd-palette-foot{padding:6px 12px;border-top:.5px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-tertiary);font-size:11px}
+
 .cicd-page{display:flex;flex-direction:column;box-sizing:border-box;width:100%;height:100%;min-height:0;overflow:hidden;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px}
 .cicd-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:none;padding:10px 16px;border-bottom:.5px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-base)}
 .cicd-toolbar-group{display:flex;align-items:center;gap:8px;min-width:0}
@@ -111,8 +123,15 @@ window.__ModuleLoader__.load({
 .cicd-step-name{flex:1 1 auto;min-width:0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:17px;overflow-wrap:anywhere}
 .cicd-step-cmd{display:block;margin:2px 0 4px 26px;color:var(--dsw-alias-label-tertiary);font-size:11.5px;line-height:16px;white-space:pre-wrap;overflow-wrap:anywhere}
 .cicd-step-flag{flex:none;color:var(--dsw-alias-label-dimmed);font-size:11px;line-height:15px;white-space:nowrap}
-.cicd-log{display:flex;flex-direction:column;gap:1px;margin:0;padding:8px 10px;border:.5px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-2);max-height:320px;overflow:auto;overscroll-behavior:contain}
-.cicd-log-line{margin:0;color:var(--dsw-alias-label-secondary);font-size:11.5px;line-height:16px;white-space:pre-wrap;overflow-wrap:anywhere}
+/* v3.0-P6-4：日志窗口固定高度 + 内部虚拟滚动。10 万行时只渲染可见的那几十行。 */
+.cicd-log{position:relative;margin:0;padding:0;border:.5px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-2);height:320px;overflow:auto;overscroll-behavior:contain;--cicd-log-line-height:16px}
+.cicd-log-canvas{position:relative;margin:0;padding:0;width:100%}
+.cicd-log-window{position:absolute;top:0;left:0;right:0;will-change:transform}
+.cicd-log-line{margin:0;padding:0 10px;color:var(--dsw-alias-label-secondary);font-size:11.5px;line-height:var(--cicd-log-line-height);height:var(--cicd-log-line-height);white-space:pre;overflow:hidden;text-overflow:clip;box-sizing:border-box}
+.cicd-log-line.is-hit{background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base)}
+.cicd-log-search{display:flex;align-items:center;gap:6px;min-width:0}
+.cicd-log-search-input{box-sizing:border-box;height:24px;width:150px;padding:0 6px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:11.5px;line-height:22px}
+.cicd-log-search-count{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;white-space:nowrap}
 .cicd-log-line.is-highlight{border-radius:3px;background:var(--dsw-alias-state-warn-bg, rgba(255,159,10,.16));color:var(--dsw-alias-label-primary)}
 .cicd-note{margin:0;color:var(--dsw-alias-label-tertiary);font-size:11.5px;line-height:17px}
 .cicd-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:18px 10px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;text-align:center}
@@ -368,7 +387,7 @@ window.__ModuleLoader__.load({
       if (!value) return '—'
       const date = new Date(value)
       if (Number.isNaN(date.getTime())) return String(value)
-      return TIME_FORMAT.format(date).replace(/\//g, '-')
+      return TIME_FORMAT.format(date).replace(new RegExp('/', 'g'), '-')
     }
 
     function formatDuration(ms) {
@@ -962,7 +981,7 @@ window.__ModuleLoader__.load({
     }
 
     /** 中列「Run 详情」：上方运行记录（选择器），下方选中运行的 steps 时间线与日志。 */
-    function RunsDetailColumn({ runs, onRefreshRuns, selectedRunId, onSelectRun, run, stages, canary, jobs, logState, onReloadLog, highlightLine, logJobId, onSelectJob }) {
+    function RunsDetailColumn({ runs, onRefreshRuns, selectedRunId, onSelectRun, run, stages, canary, jobs, logState, onReloadLog, highlightLine, logJobId, onSelectJob, onSearchLine }) {
       // v0.6 A：灰度信息只在「刚跑完的这次 run」的返回里，历史运行没有；批次行来自 canary.batches。
       const batches = canary && Array.isArray(canary.batches) ? canary.batches.filter(Boolean) : []
       const firstDone = batches.some((batch) => Number(batch.index) === 1 && batch.ok === true)
@@ -1045,6 +1064,7 @@ window.__ModuleLoader__.load({
                 logJobId: logJobId || '',
                 jobOptions: jobRows,
                 onSelectJob,
+                onSearchLine,
               }))
             : h(EmptyState, { text: '在上方运行记录里选一条，这里显示 steps 时间线与日志。' })))
     }
@@ -1125,9 +1145,24 @@ window.__ModuleLoader__.load({
      * v3.0-P1：DSL v2 里一个 stage 的多个 job 是并行的，主日志是一份交错时间线；
      * `logJobId` 选某条分片时只显示那个 job 自己的输出。「全部」= 老行为。
      */
-    function LogView({ runId, logState, onReloadLog, highlightLine, logJobId, jobOptions, onSelectJob }) {
+    /**
+     * v3.0-P6-4：日志窗口的虚拟滚动。
+     *
+     * 一条日志渲染成一个 <p> 在 200 行时没问题，10 万行时浏览器要为 10 万个节点做布局——
+     * 每次轮询把整段日志换掉就是一次十万节点的重建，用户看到的是页面卡死而不是「日志在动」。
+     * 这里只渲染可见区间（外加 overscan）：画布按总行数撑出高度，窗口整块用 transform 偏移，
+     * 节点数恒定在几十个，滚动条仍反映真实长度。
+     * 行高必须固定，否则窗口内的偏移没法反推行号——所以日志行禁用换行（white-space:pre + overflow:hidden）。
+     */
+    const LOG_LINE_HEIGHT = 16
+    const LOG_OVERSCAN = 12
+
+    function LogView({ runId, logState, onReloadLog, highlightLine, logJobId, jobOptions, onSelectJob, onSearchLine }) {
       const logRef = useRef(null)
       const [follow, setFollow] = useState(true)
+      const [scrollTop, setScrollTop] = useState(0)
+      const [viewport, setViewport] = useState(320)
+      const [query, setQuery] = useState('')
       const lines = Array.isArray(logState.lines) ? logState.lines : []
       const linesCount = lines.length
       const mark = Number(highlightLine) > 0 ? Number(highlightLine) : 0
@@ -1140,8 +1175,27 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         if (!follow) return
         const node = logRef.current
-        if (node) node.scrollTop = node.scrollHeight
+        if (!node) return
+        node.scrollTop = node.scrollHeight
+        setScrollTop(node.scrollTop)
       }, [follow, logState.lines])
+
+      // 容器尺寸会随布局变化（窄屏两列 / 侧栏折叠），窗口高度不能写死成 320。
+      useEffect(() => {
+        const node = logRef.current
+        if (!node || typeof node.clientHeight !== 'number') return
+        if (node.clientHeight > 0) setViewport(node.clientHeight)
+      }, [logState.lines, linesCount])
+
+      const scrollToLine = useCallback((lineNumber) => {
+        const node = logRef.current
+        if (!node || !(lineNumber > 0)) return
+        setFollow(false)
+        // 让目标行落在窗口正中：顶部留 40% 的上下文，否则用户得自己往上翻才能看清前因。
+        const target = Math.max(0, (lineNumber - 1) * LOG_LINE_HEIGHT - Math.round(node.clientHeight * 0.4))
+        node.scrollTop = target
+        setScrollTop(node.scrollTop)
+      }, [])
 
       /**
        * v3.0-P0 深链定位：`#/projects/p/runs/<id>?line=1204` 打开时把那一行高亮并滚进视野。
@@ -1150,18 +1204,13 @@ window.__ModuleLoader__.load({
        */
       useEffect(() => {
         if (!mark) return
-        const node = logRef.current
-        if (!node || typeof node.querySelector !== 'function') return
-        const target = node.querySelector('[data-log-line="' + mark + '"]')
-        if (!target) return
-        setFollow(false)
-        if (typeof target.scrollIntoView === 'function') target.scrollIntoView({ block: 'center' })
-        else node.scrollTop = Math.max(0, target.offsetTop - node.clientHeight / 2)
-      }, [mark, logState.lines])
+        scrollToLine(mark)
+      }, [mark, logState.lines, scrollToLine])
 
       const onScroll = useCallback((event) => {
         const node = event && event.currentTarget
         if (!node || typeof node.scrollHeight !== 'number') return
+        setScrollTop(node.scrollTop)
         const atBottom = node.scrollHeight - node.scrollTop - node.clientHeight <= 40
         setFollow(atBottom)
       }, [])
@@ -1169,7 +1218,10 @@ window.__ModuleLoader__.load({
       const resumeFollow = useCallback(() => {
         setFollow(true)
         const node = logRef.current
-        if (node) node.scrollTop = node.scrollHeight
+        if (node) {
+          node.scrollTop = node.scrollHeight
+          setScrollTop(node.scrollTop)
+        }
       }, [])
 
       const onDownload = useCallback(() => {
@@ -1191,6 +1243,46 @@ window.__ModuleLoader__.load({
         }
       }, [lines, linesCount, runId, jobId])
 
+      /**
+       * 搜索是「在已加载的行里找」，不是服务端全文检索——日志本来就是 tail 窗口。
+       * 一次扫完 10 万行字符串只花几毫秒，比让用户来回滚动快得多。
+       */
+      const hits = (() => {
+        const needle = query.trim().toLowerCase()
+        if (!needle || linesCount === 0) return []
+        const found = []
+        for (let index = 0; index < lines.length; index += 1) {
+          const line = String(lines[index] == null ? '' : lines[index])
+          if (line.toLowerCase().indexOf(needle) >= 0) found.push(index + 1)
+          if (found.length >= 500) break
+        }
+        return found
+      })()
+      const hitSet = new Set(hits)
+      const [hitCursor, setHitCursor] = useState(0)
+      useEffect(() => { setHitCursor(0) }, [query, runId, jobId])
+      const jumpHit = useCallback((delta) => {
+        if (hits.length === 0) return
+        // 用函数式更新取下一个游标：连续按 Enter 时事件里读到的是上一次渲染的 hitCursor，
+        // 两次快速按键会算出同一个下标，表现为「按了没反应」。
+        // 游标按 hits 下标取：hits 里存的是「行号」，拿它当数组下标再去 hits[...] 会取错行。
+        let picked = hitCursor
+        setHitCursor((current) => {
+          const next = ((current + delta) % hits.length + hits.length) % hits.length
+          picked = next
+          return next
+        })
+        const lineNumber = hits[picked]
+        scrollToLine(lineNumber)
+        // 深链定位同一个机制：把命中行交给上层，地址片段同步成 ?line=，于是「分享这一行」按钮仍然有效。
+        if (typeof onSearchLine === 'function') onSearchLine(lineNumber)
+      }, [hits, hitCursor, scrollToLine, onSearchLine])
+
+      const totalHeight = linesCount * LOG_LINE_HEIGHT
+      const first = Math.max(0, Math.floor(scrollTop / LOG_LINE_HEIGHT) - LOG_OVERSCAN)
+      const last = Math.min(linesCount, Math.ceil((scrollTop + viewport) / LOG_LINE_HEIGHT) + LOG_OVERSCAN)
+      const visible = lines.slice(first, last)
+
       return h('div', { className: 'cicd-log-section' },
         h('div', { className: 'cicd-section-title' },
           h('span', { className: 'cicd-log-tools' },
@@ -1205,6 +1297,30 @@ window.__ModuleLoader__.load({
               h('option', { value: '' }, '全部 job（合并时间线）'),
               jobs.map((job) => h('option', { key: job.id, value: job.id }, job.id)))
               : null,
+            h('div', { className: 'cicd-log-search' },
+              h('input', {
+                className: 'cicd-log-search-input',
+                value: query,
+                onChange: (event) => setQuery(event.currentTarget.value),
+                onKeyDown: (event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault()
+                    jumpHit(event.shiftKey ? -1 : 1)
+                  }
+                },
+                placeholder: '在日志里找…',
+                'aria-label': '在日志里查找',
+                spellCheck: false,
+              }),
+              query.trim()
+                ? h('span', { className: 'cicd-log-search-count' }, hits.length === 0 ? '无匹配' : (hitCursor + 1) + '/' + hits.length + (hits.length >= 500 ? '+' : ''))
+                : null,
+              query.trim() && hits.length > 0
+                ? h('button', { className: 'cicd-button', type: 'button', onClick: () => jumpHit(-1), title: '上一处（Shift+Enter）' }, '↑')
+                : null,
+              query.trim() && hits.length > 0
+                ? h('button', { className: 'cicd-button', type: 'button', onClick: () => jumpHit(1), title: '下一处（Enter）' }, '↓')
+                : null),
             h('button', {
               className: 'cicd-button cicd-log-follow',
               type: 'button',
@@ -1225,14 +1341,103 @@ window.__ModuleLoader__.load({
           })
           : linesCount === 0
             ? h(EmptyState, { text: '这个运行还没有日志输出。' })
-            : h('div', { className: 'cicd-log', ref: logRef, onScroll },
-              lines.map((line, index) => h('p', {
-                className: 'cicd-log-line cicd-mono' + (mark === index + 1 ? ' is-highlight' : ''),
-                key: index,
-                'data-log-line': index + 1,
-              }, line))))
+            : h('div', { className: 'cicd-log', ref: logRef, onScroll, role: 'log', 'aria-label': '运行日志' },
+              h('div', { className: 'cicd-log-canvas', style: { height: totalHeight + 'px' } },
+                h('div', {
+                  className: 'cicd-log-window',
+                  style: { transform: 'translateY(' + (first * LOG_LINE_HEIGHT) + 'px)' },
+                }, visible.map((line, offset) => {
+                  const lineNumber = first + offset + 1
+                  return h('p', {
+                    className: 'cicd-log-line cicd-mono' + (mark === lineNumber ? ' is-highlight' : '') + (hitSet.has(lineNumber) ? ' is-hit' : ''),
+                    key: lineNumber,
+                    'data-log-line': lineNumber,
+                  }, line)
+                })))))
     }
+    /**
+     * v3.0-P6-5：命令面板（⌘K / Ctrl+K）。
+     *
+     * 面板有九个视图、每次运行有 stage/job/target/run 四层对象，光靠左侧导航点，
+     * 「跳到某个 target 的某次运行」得点五六下；命令面板把「去哪儿」和「做什么」压成一次输入。
+     * 它只做路由与已有动作的转发——不新增任何写操作，所以键盘快并不等于更容易误操作：
+     * 真正会改机器的动作（运行/回滚）仍然要经过原有的二次确认。
+     */
+    function CommandPalette({ open, items, onClose, onRun }) {
+      const [query, setQuery] = useState('')
+      const [cursor, setCursor] = useState(0)
+      const inputRef = useRef(null)
 
+      useEffect(() => {
+        if (!open) return
+        setQuery('')
+        setCursor(0)
+        // 打开就聚焦：面板靠键盘驱动，让用户先点一下输入框等于把键盘价值砍掉一半。
+        const node = inputRef.current
+        if (node && typeof node.focus === 'function') node.focus()
+      }, [open])
+
+      const filtered = useMemo(() => {
+        const needle = query.trim().toLowerCase()
+        if (!needle) return items
+        return items.filter((item) => (
+          String(item.label || '').toLowerCase().indexOf(needle) >= 0
+          || String(item.hint || '').toLowerCase().indexOf(needle) >= 0
+          || String(item.kind || '').toLowerCase().indexOf(needle) >= 0))
+      }, [items, query])
+
+      useEffect(() => {
+        if (cursor >= filtered.length) setCursor(filtered.length === 0 ? 0 : filtered.length - 1)
+      }, [filtered.length, cursor])
+
+      if (!open) return null
+      const choose = (item) => {
+        if (!item) return
+        onClose()
+        if (typeof onRun === 'function') onRun(item)
+      }
+      return h('div', {
+        className: 'cicd-palette-mask',
+        role: 'presentation',
+        onMouseDown: (event) => { if (event.target === event.currentTarget) onClose() },
+      },
+      h('div', {
+        className: 'cicd-palette',
+        role: 'dialog',
+        'aria-modal': 'true',
+        'aria-label': '命令面板',
+      },
+      h('input', {
+        ref: inputRef,
+        className: 'cicd-palette-input',
+        value: query,
+        placeholder: '跳到视图 / 目标 / 运行，或者输入动作…',
+        'aria-label': '命令面板搜索',
+        spellCheck: false,
+        onChange: (event) => setQuery(event.currentTarget.value),
+        onKeyDown: (event) => {
+          const key = event.key
+          if (key === 'Escape') { event.preventDefault(); onClose(); return }
+          if (key === 'ArrowDown') { event.preventDefault(); setCursor((c) => Math.min(filtered.length - 1, c + 1)); return }
+          if (key === 'ArrowUp') { event.preventDefault(); setCursor((c) => Math.max(0, c - 1)); return }
+          if (key === 'Enter') { event.preventDefault(); choose(filtered[cursor]) }
+        },
+      }),
+      filtered.length === 0
+        ? h('div', { className: 'cicd-palette-empty' }, '没有匹配的命令。')
+        : h('ul', { className: 'cicd-palette-list', role: 'listbox' }, filtered.map((item, index) => h('li', {
+          key: item.id,
+          role: 'option',
+          'aria-selected': index === cursor,
+          className: 'cicd-palette-item' + (index === cursor ? ' is-active' : ''),
+          onMouseEnter: () => setCursor(index),
+          onMouseDown: (event) => { event.preventDefault(); choose(item) },
+        },
+        h('span', { className: 'cicd-palette-kind' }, item.kind),
+        h('span', { className: 'cicd-palette-label' }, item.label),
+        item.hint ? h('span', { className: 'cicd-palette-hint' }, item.hint) : null))),
+      h('div', { className: 'cicd-palette-foot' }, '↑↓ 选择 · Enter 执行 · Esc 关闭')))
+    }
     /** 发布记录表格（列：版本 / 目标 / 主机 / 部署时间 / 状态 / 操作），整页视图与右列共用。 */
     function ReleaseTable({ items, rollbackId, onRollback, busy }) {
       return h('div', { className: 'cicd-table-wrap' },
@@ -1689,6 +1894,8 @@ window.__ModuleLoader__.load({
       /** P1：Secrets 视图数据。 */
       const [secrets, setSecrets] = useState({ status: 'idle', items: [], error: null, setResult: null })
       /** P1：Runner 管理视图数据（复用 runners 状态）。 */
+      /** v3.0-P6-5：命令面板展开状态（⌘K / Ctrl+K 切换）。 */
+      const [palette, setPalette] = useState(false)
 
       /** 每类请求各自一个 controller：轮询时 runs 与 log 一起发，不能互相 abort。 */
       const aborters = useRef({})
@@ -1897,7 +2104,10 @@ window.__ModuleLoader__.load({
       const selectRun = useCallback((runId) => {
         setSelectedRunId(runId || '')
         setLogJobId('')
+        // 换运行等于换日志：旧的命中行号在新日志里指向别的内容，留着只会误导。
+        setPendingLine('')
       }, [])
+
 
       // 深链 `#/projects/p/runs/<id>` 打开的就是那一次运行，偷偷换成别的正是「刷新丢视图」的老毛病；
       // 列表还没就绪时更不能回落，否则深链会在首帧被清掉。
@@ -2218,6 +2428,18 @@ window.__ModuleLoader__.load({
         step: bootRoute.current.step || '',
         line: bootRoute.current.line || '',
       })
+      /**
+       * v3.0-P6-4：日志搜索命中的行号。走 `?line=` 同一条通道，所以高亮/滚动/分享只实现一次。
+       * 单独一份 state 而不是写回 deepLink：深链是「进来时收到的地址」，这里是「用户此刻在找什么」，
+       * 两者混在一起会让刷新把搜索位置当成深链。
+       */
+      const [pendingLine, setPendingLine] = useState('')
+      const jumpToLine = useCallback((lineNumber) => {
+        const value = Number(lineNumber) > 0 ? String(Number(lineNumber)) : ''
+        if (!value) return
+        deepLink.current = { ...deepLink.current, runId: selectedRunId || '', line: value }
+        setPendingLine(value)
+      }, [selectedRunId])
       const lastRouteHash = useRef(routeHash)
       useEffect(() => {
         if (routeHash === lastRouteHash.current) return
@@ -2264,7 +2486,7 @@ window.__ModuleLoader__.load({
         writeHash(next, replace)
         hashSeeded.current = true
         lastRouteHash.current = readHash()
-      }, [projectId, view, selectedRunId, targetName])
+      }, [projectId, view, selectedRunId, targetName, pendingLine])
 
       /** v2-M0：进入编辑器时从 /project-meta 拉 pipeSource。 */
       const loadEditor = useCallback(async (id) => {
@@ -2630,6 +2852,7 @@ window.__ModuleLoader__.load({
             onReloadLog: () => void loadLog(selectedRunId, false, logJobId),
             // v3.0-P0：深链 `?line=` 只在「深链指定的那一次运行」上生效，切到别的运行就不再高亮。
             highlightLine: deepLink.current.runId && deepLink.current.runId === selectedRunId ? deepLink.current.line : '',
+            onSearchLine: jumpToLine,
           }),
           h(ReleasesColumn, {
             state: releases,
@@ -2713,9 +2936,74 @@ window.__ModuleLoader__.load({
           ? h('span', { key: 'run' }, '› ', h('span', { className: 'cicd-mono' }, selectedRunId))
           : null,
       ]
+      /**
+       * v3.0-P6-5：面板里的命令清单。
+       *
+       * 三类：视图跳转（永远可用）、目标切换（有目标时）、跳最近运行。
+       * 动作类只放「已经存在的入口」——运行/回滚不进来：它们要二次确认，
+       * 从键盘直接触发会让「按错了」变成「部署了」。
+       */
+      /**
+       * v3.0-P6-5：⌘K / Ctrl+K 唤出命令面板（与多数编辑器一致）。
+       * 挂在 window 上而不是页面 div 上：面板常常还没挂载、焦点在别处（例如日志搜索框），
+       * 只有全局监听才能做到「任何地方都能一键跳」。卸载时必须解绑，否则重新挂载会重复触发。
+       */
+      useEffect(() => {
+        if (typeof window === 'undefined' || !window.addEventListener) return undefined
+        const onKey = (event) => {
+          if (!event || (!event.metaKey && !event.ctrlKey)) return
+          const key = String(event.key || '').toLowerCase()
+          if (key !== 'k') return
+          event.preventDefault()
+          setPalette((current) => !current)
+        }
+        window.addEventListener('keydown', onKey)
+        return () => window.removeEventListener('keydown', onKey)
+      }, [])
+
+      const paletteItems = useMemo(() => {
+        const list = []
+        navSections.forEach((section) => {
+          section.entries.forEach((entry) => {
+            list.push({
+              id: 'view:' + entry.view,
+              kind: '视图',
+              label: entry.label,
+              hint: entry.hint,
+              run: () => goView(entry.view),
+            })
+          })
+        })
+        targets.items.forEach((target) => {
+          list.push({
+            id: 'target:' + target.name,
+            kind: '目标',
+            label: target.name,
+            hint: '切到 ' + target.name,
+            run: () => { onSelectTarget(target.name); goView('run') },
+          })
+        })
+        runs.items.slice(0, 20).forEach((run) => {
+          list.push({
+            id: 'run:' + run.id,
+            kind: '运行',
+            label: shortId(run.id, 24),
+            hint: [run.status || '', run.target || '', formatTime(run.startedAt)].filter(Boolean).join(' · '),
+            run: () => { selectRun(run.id); goView('run') },
+          })
+        })
+        return list
+      }, [navSections, targets.items, runs.items, goView, onSelectTarget, selectRun])
+
       const routeBar = h('div', { className: 'cicd-route' },
         routeTrail,
         h('span', { style: { flex: '1 1 auto' } }),
+        h('button', {
+          className: 'cicd-button cicd-palette-open',
+          type: 'button',
+          title: '命令面板（⌘K / Ctrl+K）',
+          onClick: () => setPalette(true),
+        }, '⌘K'),
         h('button', {
           className: 'cicd-button cicd-route-copy',
           type: 'button',
@@ -2737,6 +3025,13 @@ window.__ModuleLoader__.load({
           },
         }, '复制链接'))
 
+      const paletteNode = h(CommandPalette, {
+        open: palette,
+        items: paletteItems,
+        onClose: () => setPalette(false),
+        onRun: (item) => { if (item && typeof item.run === 'function') item.run() },
+      })
+
       const main = h('div', { className: 'cicd-main' },
         routeBar,
         toolbar,
@@ -2746,6 +3041,7 @@ window.__ModuleLoader__.load({
 
       return h('div', { className: 'cicd-page', 'data-dsh-cicd-page': '' },
         h('div', { className: 'cicd-shell' }, nav, main),
+        paletteNode,
         h('div', { className: 'cicd-footer' },
           '数据来自 Host 的 /api/plugins/cicd/*；命令在 Host 本机执行，部署经 dsh-remote 的 SSH 通道送达目标机。'))
     }
