@@ -454,14 +454,29 @@ function createRuntime(ctx, config) {
       try { store.db.prepare('DELETE FROM artifact_blobs WHERE digest = ?').run(String(digest || '')) } catch { /* best effort */ }
     },
   }
+  // 账本里所有还会把字节要回来的地方。GC 只看 refs/ 是不够的：release 目录、晋级记录、
+  // 包坐标都不写成指针文件，漏掉任何一类都意味着「删掉了一次正在跑的部署」。
+  // 回滚要拿得住旧 release 的字节，所以只要还留着回溯窗口，它就必须算活引用。
+  function ledgerReferences() {
+    const out = []
+    const push = (sql, why) => {
+      let rows = []
+      try { rows = store.db.prepare(sql).all() } catch { return }
+      for (const row of rows) {
+        const digest = String(row.digest || '').trim()
+        if (digest.startsWith('sha256:')) out.push({ digest, why })
+      }
+    }
+    push("SELECT DISTINCT artifact_digest AS digest FROM releases WHERE artifact_digest <> ''", 'release')
+    push('SELECT DISTINCT digest FROM promotions WHERE digest <> \'\'', 'promotion')
+    push('SELECT DISTINCT digest FROM artifact_packages WHERE digest <> \'\'', 'package')
+    push('SELECT DISTINCT artifact_digest AS digest FROM approvals WHERE artifact_digest <> \'\'', 'approval')
+    return out
+  }
   const artifactStore = createArtifactStore({
     dir: options.artifacts.dir || join(options.workDir, 'artifacts'),
     meta: artifactMeta,
-    // 被 release 引用的 digest 永远不删：回滚要拿得住它，删了就等于删掉了回滚能力。
-    pinned: [() => {
-      const rows = store.db.prepare("SELECT artifact_digest FROM releases WHERE artifact_digest <> ''").all()
-      return rows.map((row) => row.artifact_digest).filter((digest) => digest && digest.startsWith('sha256:'))
-    }],
+    refsReader: () => ledgerReferences(),
   })
   // v3.0-P5-3：只读分发层。坐标（生态+名字+版本）指向 digest，字节仍由 artifactStore 持有；
   // maven-metadata.xml / packument / PEP 503 索引全部由这张表**生成**，不落盘、不复制字节。
@@ -2241,8 +2256,23 @@ function createRuntime(ctx, config) {
         return { ok: true, ref: record }
       }
       if (action === 'gc') {
-        const result = artifactStore.gc({ dryRun: args.dryRun !== false, minAgeMs: 0 })
+        const result = artifactStore.gc({
+          dryRun: args.dryRun !== false,
+          minAgeMs: Math.max(0, Number(args.minAgeSec || 0) * 1000),
+          graceMs: args.graceSec === undefined ? undefined : Math.max(0, Number(args.graceSec) * 1000),
+        })
+        // trashed 的元数据行先留着：宽限期内 restore 回来时它是「这份字节是谁传的」的唯一记录。
         return { ok: true, ...result }
+      }
+      if (action === 'restore') {
+        const restored = artifactStore.restore(String(args.digest || ''))
+        if (!restored) {
+          throw artifactError('ARTIFACT_NOT_FOUND', `digest ${String(args.digest || '')} 不在 trash 里（要么从没被回收，要么宽限期已过、字节已真删）`)
+        }
+        return { ok: true, restored, digest: restored.digest, bytes: restored.bytes }
+      }
+      if (action === 'trash') {
+        return { ok: true, trash: artifactStore.listTrash(), stats: artifactStore.stats() }
       }
       // list：项目维度优先（带上传时间/来源），否则给全仓统计。
       const rows = project
@@ -4087,7 +4117,7 @@ function registerTools(ctx, runtime) {
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['list', 'upload', 'tag', 'verify', 'gc', 'stats', 'publish', 'packages', 'catalog', 'promote'], description: '默认 list；publish=登记一个坐标（Maven/npm/PyPI），packages=已登记坐标清单，catalog=各生态仓库视图，promote=晋级到下一个环境（等价于 cicd_promotions）' },
+        action: { type: 'string', enum: ['list', 'upload', 'tag', 'verify', 'gc', 'restore', 'trash', 'stats', 'publish', 'packages', 'catalog', 'promote'], description: '默认 list；publish=登记一个坐标（Maven/npm/PyPI），packages=已登记坐标清单，catalog=各生态仓库视图，promote=晋级到下一个环境（等价于 cicd_promotions），gc=两段式回收（默认 dry-run），restore=把 tombstone 的 blob 放回来，trash=看回收站' },
         toEnv: { type: 'string', description: 'action=promote：目标环境名（如 prod）' },
         fromEnv: { type: 'string', description: 'action=promote：源环境名（与 releaseId 二选一）' },
         releaseId: { type: 'string', description: 'action=promote：源发布 id（与 fromEnv 二选一）' },
@@ -4108,6 +4138,8 @@ function registerTools(ctx, runtime) {
         name: { type: 'string', description: 'action=tag：指针名，如 latest / staging；action=publish：包名（npm 可带 @scope/）；packages：按名字过滤' },
         limit: { type: 'number' },
         dryRun: { type: 'boolean', description: 'action=gc：默认 true，只列出不删除' },
+        minAgeSec: { type: 'number', description: 'action=gc：只回收创建超过这么多秒的 blob（保护刚上传、还没被引用的字节）' },
+        graceSec: { type: 'number', description: 'action=gc：tombstone 在回收站里躺多久才真删（默认 7 天）' },
       },
       required: [],
     },
@@ -4123,6 +4155,13 @@ function registerTools(ctx, runtime) {
           ref: { type: 'object' },
           stats: { type: 'object' },
           removed: { type: 'array', items: { type: 'object' } },
+          trashed: { type: 'array', items: { type: 'object' } },
+          purged: { type: 'array', items: { type: 'object' } },
+          pending: { type: 'array', items: { type: 'object' } },
+          held: { type: 'array', items: { type: 'object' } },
+          trash: { type: 'array', items: { type: 'object' } },
+          restored: { type: 'object' },
+          graceMs: { type: 'number' },
           kept: { type: 'array', items: { type: 'string' } },
           reclaimedBytes: { type: 'number' },
           artifacts: { type: 'array', items: { type: 'object' } },
@@ -4157,9 +4196,22 @@ function registerTools(ctx, runtime) {
         }
         if (value.digest) return textBlocks(`${value.digest}（${value.bytes ?? 0} 字节${value.deduped ? '，已存在，未重复写入' : ''}）`)
         if (value.ref) return textBlocks(`${value.ref.owner}/${value.ref.name} → ${value.ref.digest}`)
+        if (value.restored) {
+          return textBlocks(`已从回收站放回 ${value.digest}（${value.bytes} 字节）`)
+        }
+        if (value.trash && !value.stats) {
+          const lines = [`回收站 ${value.trash.length} 个`]
+          for (const item of value.trash) lines.push(`- ${item.digest} ${item.bytes} 字节，${new Date(item.trashedAt).toISOString()}`)
+          return textBlocks(lines.join('\n'))
+        }
         if (value.removed || value.kept) {
-          const lines = [`GC${value.dryRun ? '（dry-run，未删除）' : ''}：可回收 ${(value.removed || []).length} 个，${value.reclaimedBytes || 0} 字节；保留 ${(value.kept || []).length} 个`]
-          for (const item of value.removed || []) lines.push(`- ${item.digest} ${item.bytes} 字节`)
+          const graceDays = ((value.graceMs ?? 0) / 86400000).toFixed(1)
+          const lines = [
+            `GC${value.dryRun ? '（dry-run，未做任何改动）' : ''}：进回收站 ${(value.trashed || []).length} 个；真删 ${(value.purged || []).length} 个，${value.reclaimedBytes || 0} 字节；保留 ${(value.kept || []).length} 个`,
+            `宽限期 ${graceDays} 天：进过回收站的字节在期限内都可以用 action=restore 放回`,
+          ]
+          for (const item of value.trashed || []) lines.push(`- 回收 ${item.digest} ${item.bytes} 字节`)
+          for (const item of value.purged || []) lines.push(`- 真删 ${item.digest} ${item.bytes} 字节`)
           return textBlocks(lines.join('\n'))
         }
         if (value.artifacts) {

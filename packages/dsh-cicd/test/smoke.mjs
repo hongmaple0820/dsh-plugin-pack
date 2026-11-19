@@ -4223,8 +4223,114 @@ checkAsync('P5-S4：Range 单区间读取 —— 首段、尾段、超界降级�
   store.dispose()
 })
 
-checkAsync('P5-S5：指针（tag）只动引用 —— 指向不存在的 digest 被拒，GC 按引用与 dry-run 行事', async () => {
+checkAsync('P5-6 接进运行时：gc / restore 走 HTTP，release 在用的字节删不掉', async () => {
+  // 独立的库与 CAS：这条用例自己写 releases 行，不能和别的用例共库（谁知道它们留了什么引用）。
+  const work = join(root, 'p5-6-runtime')
+  const rt = await repoTool(work)
+  // 直接开同库：要往 releases 里塞一条「正在跑的发布」，这是运行时不暴露的账本内部状态。
+  // 库文件名由 store 决定（DB_FILE_NAME），别猜 —— 猜错会开出一个空库，release 引用就「不存在」了。
+  const { DB_FILE_NAME } = await import('../lib/db.js')
+  const database = (await import('../lib/db.js')).openDatabase(join(work, DB_FILE_NAME))
+  // runtime 不暴露内部 store，用例直接用同一个目录建一个（读的都是磁盘，不影响事实）。
   const { createArtifactStore } = await import('../lib/artifacts.js')
+  const internalStore = createArtifactStore({ dir: join(work, 'artifacts') })
+  const fileA = join(root, 'p5-6-a.bin')
+  const fileB = join(root, 'p5-6-b.bin')
+  writeFileSync(fileA, 'still-running', 'utf8')
+  writeFileSync(fileB, 'nobody-knows', 'utf8')
+
+  const upA = await rt.runtime.artifacts({ action: 'upload', path: fileA, runId: 'run-a' })
+  const upB = await rt.runtime.artifacts({ action: 'upload', path: fileB, runId: 'run-b' })
+  assert.ok(upA.digest && upB.digest)
+
+  database.prepare("INSERT OR REPLACE INTO releases (id, target, host, status, artifact_digest, created_at) VALUES (?, ?, ?, 'active', ?, ?)")
+    .run('rel-a@web1', 'web', 'web1', upA.digest, new Date().toISOString())
+
+  const dry = await rt.runtime.artifacts({ action: 'gc' })
+  assert.equal(dry.dryRun, true)
+  assert.deepEqual(dry.trashed.map((item) => item.digest), [upB.digest], '只有没人引用的那个才在候选里')
+  assert.ok(dry.kept.includes(upA.digest))
+  assert.deepEqual(dry.held.find((item) => item.digest === upA.digest).why, ['release'], 'held 说得出是谁按住的')
+
+  const real = await rt.runtime.artifacts({ action: 'gc', dryRun: false })
+  assert.equal(real.trashed.length, 1)
+  assert.equal(internalStore.has(upB.digest), false)
+  assert.equal(internalStore.has(upA.digest), true, 'release 在用的字节删不掉')
+  assert.deepEqual((await rt.runtime.artifacts({ action: 'trash' })).trash.map((item) => item.digest), [upB.digest])
+
+  // 宽限期内能救回来：字节重新出现在 blobs/ 下，digest 还是那个 digest。
+  const restored = await rt.runtime.artifacts({ action: 'restore', digest: upB.digest })
+  assert.equal(restored.digest, upB.digest)
+  assert.equal(internalStore.has(upB.digest), true)
+  await assert.rejects(
+    () => rt.runtime.artifacts({ action: 'restore', digest: upB.digest }),
+    (error) => error.code === 'ARTIFACT_NOT_FOUND',
+  )
+
+  // 宽限期一过才真删：graceSec=0 模拟「7 天已经到了」。
+  await rt.runtime.artifacts({ action: 'gc', dryRun: false })
+  const overdue = await rt.runtime.artifacts({ action: 'gc', dryRun: false, graceSec: 0 })
+  assert.equal(overdue.purged.length, 1)
+  assert.equal(internalStore.has(upB.digest), false)
+  assert.deepEqual((await rt.runtime.artifacts({ action: 'trash' })).trash, [])
+  assert.equal(internalStore.has(upA.digest), true, 'release 在用的字节始终不受影响')
+
+  // 引用撤掉之后才轮得到它：删的是「引用」而不是「一次判断」。
+  database.prepare('DELETE FROM releases').run()
+  const after = await rt.runtime.artifacts({ action: 'gc', dryRun: true })
+  assert.ok(after.trashed.some((item) => item.digest === upA.digest), '引用撤掉之后才轮得到它')
+
+  database.close()
+  await rt.close()
+})
+checkAsync('P5-6 tombstone：引用集算全才敢删，minAge 护住刚上传的字节', async () => {
+  const { createArtifactStore } = await import('../lib/artifacts.js')
+  // 账本引用由一个假 refsReader 提供，模拟 releases / promotions / 坐标这三类落盘指针之外的引用。
+  const ledger = []
+  const store = createArtifactStore({ dir: join(casRoot, 'cas-tomb'), refsReader: () => ledger })
+  const fromRelease = await store.putFile(casFile('rel.bin', 'running-in-prod'))
+  const fromPromotion = await store.putFile(casFile('promo.bin', 'promoted-to-prod'))
+  const fresh = await store.putFile(casFile('fresh.bin', 'just-uploaded'))
+  const dead = await store.putFile(casFile('dead.bin', 'nobody-knows-it'))
+
+  ledger.push({ digest: fromRelease.digest, why: 'release' })
+  ledger.push({ digest: fromPromotion.digest, why: 'promotion' })
+  const held = store.references()
+  assert.deepEqual(held.get(fromRelease.digest), ['release'])
+  assert.deepEqual(held.get(fromPromotion.digest), ['promotion'])
+  assert.equal(held.has(dead.digest), false)
+
+  // 刚上传的（按 age 算 0 秒）不能被 minAge 之外的任何理由误伤。
+  const guarded = store.gc({ dryRun: false, minAgeMs: 60 * 60 * 1000 })
+  assert.equal(guarded.trashed.length, 0, '一分钟前才上传的字节不能进回收站')
+  assert.equal(store.listTrash().length, 0)
+
+  const swept = store.gc({ dryRun: false })
+  assert.deepEqual(swept.trashed.map((item) => item.digest).sort(), [dead.digest, fresh.digest].sort())
+  assert.deepEqual(swept.kept.sort(), [fromRelease.digest, fromPromotion.digest].sort())
+  assert.equal(store.has(fromRelease.digest), true, 'release 还在引用的字节一律不碰')
+  assert.equal(store.has(fromPromotion.digest), true, '晋级记录引用的字节一律不碰')
+  assert.equal(store.has(dead.digest), false)
+
+  // held 说得出「为什么没删」，否则 prune 看起来总是在漏东西。
+  const reasons = new Map(swept.held.map((item) => [item.digest, item.why]))
+  assert.deepEqual(reasons.get(fromRelease.digest), ['release'])
+  assert.deepEqual(reasons.get(fromPromotion.digest), ['promotion'])
+
+  // 引用没了（release 被清理、晋级被撤回）之后，字节才有资格进下一轮回收。
+  ledger.length = 0
+  const nextRound = store.gc({ dryRun: true })
+  assert.deepEqual(nextRound.trashed.map((item) => item.digest).sort(), [fromPromotion.digest, fromRelease.digest].sort())
+
+  // 落盘指针与账本引用并存：两条路径都必须能按住同一份字节。
+  store.putRef('demo', 'latest', fromRelease.digest)
+  const withRef = store.gc({ dryRun: true })
+  assert.ok(withRef.kept.includes(fromRelease.digest))
+  assert.deepEqual(withRef.held.find((item) => item.digest === fromRelease.digest).why, ['ref:demo/latest'])
+  store.dispose()
+})
+checkAsync('P5-S5：指针（tag）只动引用 —— 指向不存在的 digest 被拒，GC 两段式且默认 dry-run', async () => {
+  const { createArtifactStore, DEFAULT_GRACE_MS } = await import('../lib/artifacts.js')
   const store = createArtifactStore({ dir: join(casRoot, 'cas-e') })
   const live = await store.putFile(casFile('live.bin', 'kept-by-tag'))
   const orphan = await store.putFile(casFile('orphan.bin', 'nobody-points-here'))
@@ -4234,17 +4340,39 @@ checkAsync('P5-S5：指针（tag）只动引用 —— 指向不存在的 digest
   assert.equal(ref.digest, live.digest)
   assert.equal(store.readRef('demo', 'latest').digest, live.digest)
 
-  // 默认 dry-run：算出要删什么，但一个字节都不动。
+  // 默认 dry-run：算出要做什么，但一个字节都不动，连 trash/ 都不建。
   const dry = store.gc()
   assert.equal(dry.dryRun, true)
-  assert.deepEqual(dry.removed.map((item) => item.digest), [orphan.digest])
+  assert.equal(dry.graceMs, DEFAULT_GRACE_MS)
+  assert.deepEqual(dry.trashed.map((item) => item.digest), [orphan.digest])
   assert.deepEqual(dry.kept, [live.digest])
   assert.equal(store.has(orphan.digest), true)
+  assert.equal(store.listTrash().length, 0, 'dry-run 不该往回收站里写东西')
 
+  // 第一段：无引用的进 trash，字节还在原 digest 的「墓碑」位置 —— 只是暂时搬了家。
   const real = store.gc({ dryRun: false })
-  assert.equal(real.removed.length, 1)
-  assert.equal(store.has(orphan.digest), false)
+  assert.equal(real.trashed.length, 1)
+  assert.equal(store.has(orphan.digest), false, 'blobs/ 里不该再有它')
   assert.equal(store.has(live.digest), true, '有指针的 blob 不能被回收')
+  assert.deepEqual(store.listTrash().map((item) => item.digest), [orphan.digest], '字节进了回收站，没有凭空消失')
+  assert.deepEqual(real.pending.map((item) => item.digest), [orphan.digest], '宽限期未到，只能等')
+  assert.equal(real.purged.length, 0)
+
+  // 宽限期之内 restore 得回来：这就是「误删可救」的全部意义。
+  const restored = store.restore(orphan.digest)
+  assert.equal(restored.digest, orphan.digest)
+  assert.equal(store.has(orphan.digest), true)
+  assert.equal(store.listTrash().length, 0)
+  assert.equal(store.restore(orphan.digest), null, '不在回收站里时明确返回 null')
+
+  // 第二段：真正的 purge 只有等到宽限期之后，且要显式再跑一次 gc。
+  store.gc({ dryRun: false })
+  assert.equal(store.has(orphan.digest), false)
+  const later = store.gc({ dryRun: false, now: Date.now() + DEFAULT_GRACE_MS + 1000 })
+  assert.equal(later.purged.length, 1)
+  assert.deepEqual(store.listTrash(), [])
+  assert.equal(store.restore(orphan.digest), null, '宽限期过了就真的没了')
+  assert.equal(store.has(live.digest), true)
   store.dispose()
 })
 

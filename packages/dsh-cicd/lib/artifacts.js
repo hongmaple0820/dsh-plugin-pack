@@ -9,12 +9,15 @@
  *   2. 单写入口、幂等去重 —— 同一 digest 重复 PUT 不产生第二份字节。
  *   3. 先写 `.tmp` 再 `rename` —— 半截文件永远不会出现在 `blobs/` 下。
  *   4. 上传时重算 sha256 —— 声明的 digest 与实际字节不符直接拒收（篡改 1 字节即失败）。
- *   5. 被 release 引用的 blob 不许被 GC 删掉（pinned / refcount 由调用方维护）。
+ *   5. 被任何东西引用着的 blob 不许被 GC 删掉（pinned 回调 + 指针），而不是「调用方记得别删」。
+ *   6. 删字节分两步 —— 先写一个 tombstone（改名进 trash/），宽限期过后才真删。
+ *      一步到位的删除没有任何后悔窗口：prune 写错一个条件，线上在跑的容器下次滚动就拉不到镜像。
  *
  * 磁盘布局：
  *   <casDir>/blobs/sha256/<aa>/<digest>        字节（只读、不可变）
  *   <casDir>/tmp/<random>                      写入中的临时文件
  *   <casDir>/refs/<owner>/<name>.json          指针（tag / release 引用）
+ *   <casDir>/trash/<digest>                    已 tombstone：字节还在，宽限期内可 restore
  */
 
 import { createHash } from 'node:crypto'
@@ -24,6 +27,8 @@ import { Readable } from 'node:stream'
 
 export const DIGEST_ALGORITHM = 'sha256'
 const DIGEST_RE = /^sha256:[a-f0-9]{64}$/i
+// tombstone 宽限期：制品进了 trash 也还能救回来 7 天。镜像/包被误回收的代价远高于多占几天磁盘。
+export const DEFAULT_GRACE_MS = 7 * 24 * 60 * 60 * 1000
 
 export function artifactError(code, message, extra = {}) {
   return Object.assign(new Error(message), { code }, extra)
@@ -43,6 +48,11 @@ export function digestPath(casDir, digest) {
   const normalized = normalizeDigest(digest)
   const hex = normalized.slice(7)
   return join(casDir, 'blobs', DIGEST_ALGORITHM, hex.slice(0, 2), hex)
+}
+
+/** trash 里同一个 digest 的位置：文件名只用 hex，目录名负责带的算法前缀。 */
+function trashPath(casDir, digest) {
+  return join(casDir, 'trash', normalizeDigest(digest).slice(DIGEST_ALGORITHM.length + 1))
 }
 
 function refPath(casDir, owner, name) {
@@ -85,10 +95,50 @@ async function streamToTemp(source, tmpDir) {
  * @param {object} [options.meta]  元数据表接口：{ put(row), has(digest), remove(digest) }，可选
  * @param {Function[]} [options.pinned]  额外的「不许删」判定，返回 true 表示该 digest 有活引用
  */
-export function createArtifactStore({ dir, meta = null, pinned = [] } = {}) {
+/**
+ * 内容寻址存储。
+ *
+ * `refsReader`：账本引用（releases / promotions / 坐标）的读取器，返回 [{ digest, why }]。
+ *   不传它 GC 就只能看见落盘指针 —— 那会把「某台机器正在跑的那份」当孤儿回收，
+ *   所以缺省值保守：一个都不删也可以接受，多删一个就是事故。
+ * `pinned`：零散的回调式保护（例如「当前部署的 digest」），与 refsReader 同义，留着是因为它更轻。
+ */
+export function createArtifactStore({ dir, meta = null, pinned = [], refsReader = null } = {}) {
   if (!dir) throw new Error('createArtifactStore 需要 dir')
   const tmpDir = join(dir, 'tmp')
   const blobsDir = join(dir, 'blobs', DIGEST_ALGORITHM)
+  const trashDir = join(dir, 'trash')
+
+  /**
+   * 每一份还活着的字节，以及「谁在引用它」。GC 只在这张表上判生死。
+   *
+   * 两类引用必须同时算：落盘指针（tag / OCI manifest）与账本引用（releases、promotions、
+   * artifact_packages）—— 后者根本不写成文件，只看 refs/ 就会把「某台机器正在跑的那份」当成孤儿。
+   * 返回值是 Map<digest, string[]>，原因一并带出来：删不掉的时候要能说清是被谁按住的。
+   */
+  function references() {
+    const live = new Map()
+    const add = (digest, why) => {
+      let value = ''
+      try { value = normalizeDigest(digest) } catch { return }
+      const list = live.get(value) || []
+      if (!list.includes(why)) list.push(why)
+      live.set(value, list)
+    }
+    for (const ref of listRefs()) add(ref.digest, `ref:${ref.owner || ''}/${ref.name || ''}`)
+    if (typeof refsReader === 'function') {
+      let extra = []
+      try { extra = refsReader() || [] } catch { /* 账本读不到就只按落盘指针判，但绝不因此多删 */ }
+      for (const item of extra) {
+        if (!item || !item.digest) continue
+        add(item.digest, String(item.why || 'ledger'))
+      }
+    }
+    for (const predicate of pinned) {
+      try { for (const digest of predicate() || []) add(digest, 'pinned') } catch { /* 引用方坏了按有引用处理 */ }
+    }
+    return live
+  }
   mkdirSync(blobsDir, { recursive: true })
 
   function has(digest) {
@@ -240,25 +290,90 @@ export function createArtifactStore({ dir, meta = null, pinned = [] } = {}) {
   }
 
   /**
-   * GC：只删「没有任何引用」的 blob。dryRun 默认 true —— 删除字节不可逆，
-   * 让调用方必须先看一眼要删什么。
+   * GC：两段式回收，对应 06-artifacts.md 的 I3。
+   *
+   * 第一段 prune：挑「没有指针、没有 pinned 引用、且静置够久」的 blob，**改名进 trash/** 而不是删。
+   * 改名是原子的，所以任何一次 prune 都不会留下半截文件；字节还在，误删可以在宽限期内 restore。
+   * 第二段 purge：trash 里躺够 graceMs 的才真删 —— 这一步之后才真的不可逆。
+   *
+   * 引用集算错是这类系统最贵的 bug，所以两个方向都算：被引用的一律不碰（keep 也给得出来），
+   * 只有明确没引用的才进 trash。dryRun 默认 true：删除不可逆，调用方必须先看一遍。
    */
-  function gc({ dryRun = true, now = Date.now(), minAgeMs = 0 } = {}) {
-    const referenced = new Set(listRefs().map((ref) => ref.digest))
-    for (const predicate of pinned) {
-      try { for (const digest of predicate() || []) referenced.add(normalizeDigest(digest)) } catch { /* 引用方坏了按有引用处理 */ }
-    }
-    const removed = []
+  function gc({ dryRun = true, now = Date.now(), graceMs = DEFAULT_GRACE_MS, minAgeMs = 0 } = {}) {
+    const live = references()
+    const ageLimit = Math.max(0, Number(minAgeMs) || 0)
+    const trashed = []
     const kept = []
     for (const blob of listBlobs()) {
-      if (referenced.has(blob.digest)) { kept.push(blob.digest); continue }
-      if (now - Date.parse(blob.createdAt) < minAgeMs) { kept.push(blob.digest); continue }
-      removed.push(blob)
+      if (live.has(blob.digest)) { kept.push(blob.digest); continue }
+      // 刚写完还没来得及被引用的 blob 同样危险：prune 与 release 落账之间有一个很短的窗口，
+      // 这段时间里它「确实没引用」，但删了就是删掉一次正在进行的发布。
+      if (now - Date.parse(blob.createdAt) < ageLimit) { kept.push(blob.digest); continue }
+      trashed.push(blob)
       if (!dryRun) {
-        try { unlinkSync(digestPath(dir, blob.digest)); meta?.remove?.(blob.digest) } catch { /* 已经被别处删了 */ }
+        try {
+          mkdirSync(trashDir, { recursive: true })
+          renameSync(digestPath(dir, blob.digest), trashPath(dir, blob.digest))
+        } catch { /* 已经被别处移走/删掉 */ }
       }
     }
-    return { dryRun, removed, kept, reclaimedBytes: removed.reduce((sum, item) => sum + item.bytes, 0) }
+
+    const purged = []
+    const pending = []
+    let purgedBytes = 0
+    const grace = Math.max(0, Number(graceMs) || 0)
+    for (const entry of listTrash()) {
+      if (now - entry.trashedAt < grace) { pending.push(entry); continue }
+      purged.push(entry)
+      purgedBytes += entry.bytes
+      if (!dryRun) {
+        try { unlinkSync(join(trashDir, entry.name)) } catch { /* 已经删了 */ }
+        meta?.remove?.(entry.digest)
+      }
+    }
+
+    return {
+      dryRun,
+      graceMs: grace,
+      trashed,
+      purged,
+      pending,
+      kept,
+      // 「为什么没删」要说得出原因，否则 prune 看起来总是在漏东西。
+      held: [...live.entries()].map(([digest, why]) => ({ digest, why })),
+      // 老字段保留：prune 的字节数。dryRun 时它同样是「这次会移走多少」。
+      removed: trashed,
+      reclaimedBytes: purgedBytes,
+    }
+  }
+
+  /** trash 清单：每个 entry 带 digest / bytes / trashedAt（毫秒）。不进 meta 索引 —— 它回答的是「删到哪一步了」。 */
+  function listTrash() {
+    let names = []
+    try { names = readdirSync(trashDir) } catch { return [] }
+    const out = []
+    for (const name of names) {
+      try {
+        const stat = statSync(join(trashDir, name))
+        if (!stat.isFile()) continue
+        out.push({ name, digest: `${DIGEST_ALGORITHM}:${name}`, bytes: stat.size, trashedAt: stat.mtimeMs })
+      } catch { /* 读不到的忽略 */ }
+    }
+    return out.sort((a, b) => a.trashedAt - b.trashedAt)
+  }
+
+  /**
+   * 把某个 digest 从 trash 里放回 blobs/。宽限期内才做得到，宽限期外字节已经没了。
+   * 返回 null 表示 trash 里没有它（要么从没进过，要么已经被 purge）。
+   */
+  function restore(digest) {
+    const normalized = normalizeDigest(digest)
+    const from = trashPath(dir, normalized)
+    if (!existsSync(from)) return null
+    const to = digestPath(dir, normalized)
+    mkdirSync(join(to, '..'), { recursive: true })
+    renameSync(from, to)
+    return { digest: normalized, bytes: statSync(to).size }
   }
 
   function stats() {
@@ -275,7 +390,7 @@ export function createArtifactStore({ dir, meta = null, pinned = [] } = {}) {
     return digestPath(dir, digest)
   }
 
-  return { dir, put, putFile, has, stat: statOf, open, createReadable, readRange, verify, putRef, readRef, removeRef, listRefs, listBlobs, gc, stats, pathOf, dispose }
+  return { dir, put, putFile, has, stat: statOf, open, createReadable, readRange, verify, putRef, readRef, removeRef, listRefs, listBlobs, references, gc, restore, listTrash, stats, pathOf, dispose }
 }
 
 /** `bytes=100-199` / `bytes=100-` / `bytes=-100`，越界或格式错返回 null（调用方按 200 全量返回）。 */
