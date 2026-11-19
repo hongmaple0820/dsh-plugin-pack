@@ -20,6 +20,7 @@
 import { createHash } from 'node:crypto'
 import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { Readable } from 'node:stream'
 
 export const DIGEST_ALGORITHM = 'sha256'
 const DIGEST_RE = /^sha256:[a-f0-9]{64}$/i
@@ -56,7 +57,11 @@ async function streamToTemp(source, tmpDir) {
   const tmp = join(tmpDir, `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}.part`)
   const hash = createHash(DIGEST_ALGORITHM)
   let bytes = 0
-  const input = typeof source === 'string' ? createReadStream(source) : source
+  // 调用方偶尔直接给字节（manifest、测试里的 Buffer）；统一收成可迭代流，避免 Buffer 被当成
+  // 「可迭代的数字序列」逐字节写进文件。
+  const input = typeof source === 'string'
+    ? createReadStream(source)
+    : (Buffer.isBuffer(source) || source instanceof Uint8Array ? Readable.from([Buffer.from(source)]) : source)
   const sink = createWriteStream(tmp)
   try {
     for await (const chunk of input) {
@@ -212,6 +217,14 @@ export function createArtifactStore({ dir, meta = null, pinned = [] } = {}) {
     return out
   }
 
+  /** 删一个指针。仓库里的「删 tag」就是它，字节留在 CAS 里等 GC 判。 */
+  function removeRef(owner, name) {
+    const path = refPath(dir, owner, name)
+    if (!existsSync(path)) return false
+    rmSync(path, { force: true })
+    return true
+  }
+
   function listBlobs() {
     const out = []
     if (!existsSync(blobsDir)) return out
@@ -257,7 +270,12 @@ export function createArtifactStore({ dir, meta = null, pinned = [] } = {}) {
     try { rmSync(tmpDir, { recursive: true, force: true }) } catch { /* tmp 清不掉不影响正确性 */ }
   }
 
-  return { dir, put, putFile, has, stat: statOf, open, createReadable, readRange, verify, putRef, readRef, listRefs, listBlobs, gc, stats, dispose }
+  // pathOf：manifest 要按 digest 读回 JSON，open/createReadable 都是流，读小文件不如直接给路径。
+  function pathOf(digest) {
+    return digestPath(dir, digest)
+  }
+
+  return { dir, put, putFile, has, stat: statOf, open, createReadable, readRange, verify, putRef, readRef, removeRef, listRefs, listBlobs, gc, stats, pathOf, dispose }
 }
 
 /** `bytes=100-199` / `bytes=100-` / `bytes=-100`，越界或格式错返回 null（调用方按 200 全量返回）。 */

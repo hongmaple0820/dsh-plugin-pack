@@ -16,9 +16,9 @@
  * 不引用任何外部 action —— pipe.yml 是 PR 可改的文件）。
  */
 
-import { createHash, timingSafeEqual } from 'node:crypto'
+import { createHash, timingSafeEqual, randomBytes } from 'node:crypto'
 import { Readable } from 'node:stream'
-import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync } from 'node:fs'
+import fs, { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, isAbsolute, join, relative } from 'node:path'
 import { parsePipe, planPipeline, interpolate, matchArtifacts, isHostSelector, parseHostSelector } from './lib/pipe.js'
@@ -60,6 +60,11 @@ import { createNativeActuator, NATIVE_COMMANDS, ACTUATOR_ERRORS, renderTemplate 
 import { createSlotStore, SLOT_ERRORS } from './lib/slots.js'
 import { runAction, ACTIONS as PIPELINE_ACTIONS, ACTION_NAMES, ACTION_ERRORS } from './lib/actions.js'
 import { runGit } from './lib/git.js'
+import {
+  OCI_ERRORS, ociStatus, ociError, parseRepository, parseOCIDigest, parseTag, parseReference,
+  canonicalJson, validateManifest, manifestReferences, isManifestType,
+  MEDIA_TYPES, createTokenIssuer, createUploadSessions, parseScope, scopeAllows,
+} from './lib/oci.js'
 
 export const name = '@local/dsh-cicd'
 export const inject = ['tools']
@@ -172,6 +177,9 @@ function normalizeConfig(config = {}, ctx) {
   // v3.0-P2：工具链托管。机器级只允许配「放哪儿、能不能联网、信任什么源」，
   // **不放版本**——同一份 pipe.yml 在装了 JDK21 的机器和装了 JDK17 的机器上必须跑出同样的结果。
   const rawToolchain = baseConfig.toolchain && typeof baseConfig.toolchain === 'object' ? baseConfig.toolchain : {}
+  // v3.0-P5-4：OCI 分发。token 密钥留空时启动生成一个随机密钥——它只保护「15 分钟内的一次 pull」，
+  // 进程重启后旧票自然失效，这比要求运维先配置一个密钥更不容易出错。
+  const rawRegistry = baseConfig.registry && typeof baseConfig.registry === 'object' ? baseConfig.registry : {}
   return {
     projects: projects.map((project) => ({
       id: String(project.id),
@@ -225,6 +233,12 @@ function normalizeConfig(config = {}, ctx) {
       verifyChecksum: rawToolchain.verifyChecksum !== false,
       // 断言每个语言真的跑在声明的版本上。关掉它的唯一理由是「这颗树是交叉编译产物、跑不起来」。
       verify: rawToolchain.verify !== false,
+    },
+    registry: {
+      enabled: rawRegistry.enabled !== false,
+      // 密钥可以为空：createRuntime 里没给就现生成一个（进程内有效即可，见上面的注释）。
+      secret: typeof rawRegistry.secret === 'string' ? rawRegistry.secret : '',
+      tokenTtlSec: clampInt(rawRegistry.tokenTtlSec, 900, 60, 3600),
     },
   }
 }
@@ -437,6 +451,21 @@ function createRuntime(ctx, config) {
       return rows.map((row) => row.artifact_digest).filter((digest) => digest && digest.startsWith('sha256:'))
     }],
   })
+  // v3.0-P5-4：OCI registry。manifest 存 artifact_blobs（media_type）并把仓库名放进 source_path，
+  // 字节仍由 artifactStore 持有——镜像层和构建产物是同一套 CAS，回滚按 digest 走同一条路。
+  const ociTokens = createTokenIssuer({
+    secret: options.registry.secret || randomBytes(32).toString('hex'),
+    ttlSec: options.registry.tokenTtlSec,
+  })
+  const ociUploads = createUploadSessions({
+    dir: join(artifactStore.dir, 'tmp'),
+    fs, join, randomId: () => randomBytes(16).toString('hex'),
+  })
+  const oci = {
+    tokens: ociTokens,
+    uploads: ociUploads,
+    enabled: options.registry.enabled,
+  }
   // V2-M5：RBAC（server 模式）——三角色 viewer/operator/admin + token TTL + 写操作审计
   const rbac = createRbac({ dir: options.workDir })
   // v3.0-P0：身份、授权、审计、部署锁。四者都挂在同一个 DB 句柄上，
@@ -2076,6 +2105,193 @@ function createRuntime(ctx, config) {
         : store.db.prepare('SELECT digest, bytes, project_id, run_id, source_path, created_at FROM artifact_blobs ORDER BY created_at DESC LIMIT ?').all(Number(args.limit || 50))
       return { ok: true, project: project?.id || '', artifacts: rows, refs: artifactStore.listRefs(project?.id || ''), stats: artifactStore.stats() }
     },
+    // ---- v3.0-P5-4：OCI 分发（docker push / pull） -------------------------------------------
+    // manifest 也是一个「制品」：它的字节进 CAS，digest 就是它的 sha256；tag 就是 refs/<repo>/<tag>。
+    // 这样 pull 一个镜像和下载一个构建产物走的是同一条读路径、同一套鉴权、同一个 GC 保留集。
+    ociEnabled() {
+      return oci.enabled !== false
+    },
+    /** 仓库目录：CAS 里所有 refs 的 owner 就是仓库名（去重）。 */
+    ociCatalog() {
+      return artifactStore.listRefs('')
+    },
+    ociToken(arg) {
+      const scopes = parseScope(arg?.scope || '')
+      // 空 scope 是合法的：`docker login` 探活时请求的就是「没有 scope 的票」。
+      const issued = ociTokens.issue({ subject: String(arg?.actorId || ''), scopes: scopes.map((item) => `repository:${item.name}:${[...item.actions].join(',')}`) })
+      return { ok: true, ...issued }
+    },
+    /** 校验请求带上来的 Bearer 票。返回的 scopes 决定这个请求能碰哪个仓库。 */
+    ociAuthorize(request) {
+      const header = String(request?.headers?.get?.('authorization') || '')
+      if (!header.toLowerCase().startsWith('bearer ')) return { ok: false, reason: '缺少 Bearer token' }
+      const verified = ociTokens.verify(header.slice(7).trim())
+      if (!verified.ok) return { ok: false, reason: verified.reason }
+      return { ok: true, payload: verified.payload, scopes: verified.scopes }
+    },
+    ociStartUpload({ repository = '', mount = '', from = '' } = {}) {
+      const repo = parseRepository(repository)
+      const mountDigest = mount || from
+      if (mountDigest) {
+        // 跨仓库挂载（`docker buildx` 常用）：源仓库里已经有这个 blob 就直接认，不再上传一次。
+        const digest = parseOCIDigest(mountDigest)
+        if (artifactStore.has(digest)) return { ok: true, id: digest, mounted: digest, exists: true }
+      }
+      const session = ociUploads.start({ repository: repo })
+      return { ok: true, id: session.id, mounted: '', exists: false }
+    },
+    ociAppendUpload({ id = '', source = null } = {}) {
+      const session = ociUploads.take(id)
+      if (session.mounted) throw ociError(OCI_ERRORS.UPLOAD_INVALID, '这个上传会话是挂载来的，没有可追加的内容')
+      const out = fs.openSync(session.file, 'a')
+      try {
+        const hash = createHash('sha256')
+        // 会话里可能已经有前一次 PATCH 的内容，所以整体重算而不是增量续算：
+        // 断点续传流在提交时只出现一次，续算一次更省代码，也少一个「半截哈希」的状态。
+        const existing = fs.createReadStream(session.file)
+        return new Promise((resolve, reject) => {
+          let bytes = 0
+          existing.on('data', (chunk) => { hash.update(chunk); bytes += chunk.length })
+          existing.on('error', reject)
+          existing.on('end', () => {
+            // request.body 已经是 Web ReadableStream；宿主换实现时也接受 Node 流。
+            const append = source ? (typeof source.getReader === 'function' ? source : Readable.toWeb(source)) : null
+            if (!append) { fs.closeSync(out); resolve({ ok: true, id: session.id, bytes }) ; return }
+            const reader = (append).getReader()
+            const pump = () => reader.read().then(({ done, value }) => {
+              if (done) {
+                fs.closeSync(out)
+                resolve({ ok: true, id: session.id, bytes })
+                return
+              }
+              const chunk = Buffer.from(value instanceof Uint8Array ? value : new Uint8Array(value))
+              fs.writeSync(out, chunk)
+              hash.update(chunk)
+              bytes += chunk.length
+              return pump()
+            }).catch(reject)
+            return pump()
+          })
+        })
+      } catch (error) {
+        try { fs.closeSync(out) } catch { /* already closed */ }
+        throw ociError(OCI_ERRORS.UPLOAD_INVALID, `写临时文件失败：${error.message}`)
+      }
+    },
+    async ociCommitUpload({ id = '', digest = '', repository = '', mediaType = '' } = {}) {
+      const repo = parseRepository(repository)
+      const session = ociUploads.take(id)
+      const expected = parseOCIDigest(digest)
+      if (session.mounted) {
+        if (!artifactStore.has(expected)) throw ociError(OCI_ERRORS.BLOB_UNKNOWN, `挂载的 ${expected} 不在 CAS 里`)
+        ociUploads.drop(id)
+        return { ok: true, digest: expected, mounted: true }
+      }
+      let result
+      try {
+        result = await artifactStore.putFile(session.file, {
+          expectDigest: expected,
+          meta: { projectId: repo, mediaType: mediaType || 'application/octet-stream' },
+        })
+      } finally {
+        ociUploads.drop(id)
+      }
+      return { ok: true, digest: result.digest, bytes: result.bytes, deduped: result.deduped }
+    },
+    ociDropUpload(id) {
+      return { ok: true, removed: ociUploads.drop(id) }
+    },
+    /** 读 manifest。`ref` 可以是 tag（走 refs）或 digest（直接读 CAS）。 */
+    _ociManifestDigest(repository, ref) {
+      const repo = parseRepository(repository)
+      const parsed = parseReference(ref)
+      if (parsed.kind === 'digest') return parsed.value
+      const record = artifactStore.readRef(repo, parsed.value)
+      if (!record?.digest) throw ociError(OCI_ERRORS.MANIFEST_UNKNOWN, `${repo}:${parsed.value} 没有这个 tag`)
+      return record.digest
+    },
+    ociGetManifest({ repository = '', ref = '', expectedDigest = '' } = {}) {
+      const digest = this._ociManifestDigest(repository, ref)
+      if (expectedDigest && parseOCIDigest(expectedDigest) !== digest) {
+        throw ociError(OCI_ERRORS.MANIFEST_UNKNOWN, `${repository}:${ref} 现在指向 ${digest}，不是预期的 ${expectedDigest}`)
+      }
+      const record = artifactStore.stat(digest)
+      if (!record) throw ociError(OCI_ERRORS.MANIFEST_UNKNOWN, `manifest ${digest} 不在 CAS 里`)
+      const text = fs.readFileSync(artifactStore.pathOf(digest), 'utf8')
+      let manifest
+      try { manifest = JSON.parse(text) } catch { throw ociError(OCI_ERRORS.MANIFEST_INVALID, `manifest ${digest} 不是合法 JSON`) }
+      return { ok: true, digest, bytes: record.bytes, manifest, mediaType: manifest.mediaType || MEDIA_TYPES.OCI_MANIFEST }
+    },
+    /**
+     * 收下一个 manifest。
+     *
+     * 三条判据按顺序：结构合法 → 引用的 blob 全都存在 → digest 与客户端声明的一致。
+     * 第二条是这里最重要的：收下一个引用缺失层的 manifest，等于把一个必然拉不下来的镜像
+     * 存进仓库，而失败会推迟到「上线那一刻」才发生。
+     */
+    async ociPutManifest({ repository = '', ref = '', manifest = null, raw = '', contentType = '' } = {}) {
+      const repo = parseRepository(repository)
+      const parsed = parseReference(ref)
+      const body = manifest || (() => {
+        try { return JSON.parse(String(raw || '')) } catch { throw ociError(OCI_ERRORS.MANIFEST_INVALID, 'manifest 不是合法 JSON') }
+      })()
+      validateManifest(body)
+      if (contentType && isManifestType(contentType) && body.mediaType !== contentType) {
+        // Content-Type 与 body.mediaType 不一致时以 body 为准，但要记下来：某些旧客户端会发错。
+        body.mediaType = body.mediaType || contentType
+      }
+      const canonical = canonicalJson(body)
+      const digest = `sha256:${createHash('sha256').update(canonical).digest('hex')}`
+      if (parsed.kind === 'digest' && parsed.value !== digest) {
+        throw ociError(OCI_ERRORS.MANIFEST_INVALID, `manifest 的 digest 是 ${digest}，与 URL 声明的 ${parsed.value} 不符`)
+      }
+      const refs = manifestReferences(body)
+      const missing = []
+      if (refs.config && !artifactStore.has(refs.config)) missing.push(refs.config)
+      for (const blob of refs.blobs) if (!artifactStore.has(blob)) missing.push(blob)
+      for (const child of refs.manifests) if (!artifactStore.has(child.digest)) missing.push(child.digest)
+      if (missing.length > 0) {
+        // detail 直接拼进 error（ociError 的第三个参数就是 detail），响应体里 errors[0].detail.missing 能直接读。
+        throw ociError(OCI_ERRORS.MANIFEST_BLOB_UNKNOWN, `manifest 引用了 ${missing.length} 个还没上传的对象（第一个：${missing[0]}）`, { missing: missing.slice(0, 20) })
+      }
+      // put 是 async（流式哈希）：不 await 会让紧接着的 putRef 看不到这个 blob。
+      await artifactStore.put(Buffer.from(canonical, 'utf8'), {
+        expectDigest: digest,
+        meta: { projectId: repo, mediaType: body.mediaType },
+      })
+      let tag = ''
+      if (parsed.kind === 'tag') {
+        tag = parsed.value
+        artifactStore.putRef(repo, tag, digest, { projectId: repo })
+        try {
+          store.db.prepare('INSERT OR REPLACE INTO artifact_refs (owner, name, digest, previous, project_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(
+            repo, tag, digest, '', repo, new Date().toISOString(),
+          )
+        } catch { /* 指针文件是事实来源 */ }
+      }
+      return { ok: true, digest, tag, mediaType: body.mediaType, bytes: Buffer.byteLength(canonical) }
+    },
+    ociListTags({ repository = '', limit = 100 } = {}) {
+      const repo = parseRepository(repository)
+      const tags = artifactStore.listRefs(repo).map((item) => item.name).sort()
+      const n = Number(limit) > 0 ? Number(limit) : 100
+      return { ok: true, name: repo, tags: tags.slice(0, n) }
+    },
+    /** 删 tag；按 digest 删会把所有指向它的 tag 一起删掉（规范允许，且这是唯一有意义的「删镜像」）。 */
+    ociDeleteManifest({ repository = '', ref = '' } = {}) {
+      const repo = parseRepository(repository)
+      const parsed = parseReference(ref)
+      if (parsed.kind === 'tag') {
+        const removed = artifactStore.removeRef(repo, parsed.value)
+        return { ok: true, removedTags: removed ? [parsed.value] : [] }
+      }
+      const owned = artifactStore.listRefs(repo).filter((item) => item.digest === parsed.value)
+      for (const item of owned) artifactStore.removeRef(repo, item.name)
+      return { ok: true, removedTags: owned.map((item) => item.name) }
+    },
+    ociStats() {
+      return { ok: true, uploads: ociUploads.size(), sessions: ociUploads.sweep().length ? 'swept' : 'idle', stats: artifactStore.stats() }
+    },
     environments(projectId = '') {
       const project = pickProject(options, projectId)
       const pipe = readPipe(project)
@@ -3508,6 +3724,61 @@ function registerTools(ctx, runtime) {
     },
   })
 
+
+  register({
+    name: 'cicd_registry',
+    description: 'OCI 镜像仓库（docker push/pull）：查仓库与 tag、按 digest 取 manifest、删 tag。推拉请直接用 docker，这里给的是运维侧视图（审计、对账、回滚前查证）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['catalog', 'tags', 'manifest', 'delete', 'stats'], description: 'catalog=仓库列表；tags=某仓库的 tag；manifest=读 manifest；delete=删 tag；stats=用量' },
+        repository: { type: 'string', description: '仓库名，如 demo/web（小写，不允许大写）' },
+        ref: { type: 'string', description: 'tag 或 sha256 digest' },
+        limit: { type: 'number' },
+      },
+      required: [],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          repositories: { type: 'array', items: { type: 'string' } },
+          tags: { type: 'array', items: { type: 'string' } },
+          digest: { type: 'string' },
+          mediaType: { type: 'string' },
+          manifest: { type: 'object' },
+          removedTags: { type: 'array', items: { type: 'string' } },
+          stats: { type: 'object' },
+        },
+      },
+      render(_args, value) {
+        if (value.repositories) return textBlocks(`仓库 ${value.repositories.length} 个：\n${value.repositories.map((item) => `- ${item}`).join('\n') || '- （空）'}`)
+        if (value.tags) return textBlocks(`${value.name || '仓库'} 的 tag：${value.tags.length ? value.tags.join(', ') : '（空）'}`)
+        if (value.manifest) return textBlocks(`${value.digest}（${value.mediaType}）\n${JSON.stringify(value.manifest, null, 2)}`)
+        if (value.removedTags) return textBlocks(value.removedTags.length ? `已删除 tag：${value.removedTags.join(', ')}` : '没有匹配的 tag')
+        return textBlocks(value.stats ? `仓库用量：${value.stats.count} 个 blob，${value.stats.bytes} 字节，${value.stats.refs} 个指针` : '完成')
+      },
+    },
+    async execute(args = {}) {
+      const action = args.action || 'catalog'
+      const repository = args.repository || ''
+      if (action === 'catalog') {
+        const owners = [...new Set(runtime.ociCatalog().map((item) => item.owner))].sort()
+        return { ok: true, repositories: owners }
+      }
+      if (action === 'stats') return { ok: true, stats: runtime.artifacts({ action: 'stats' }).stats }
+      if (!repository) throw ociError(OCI_ERRORS.NAME_INVALID, '需要 repository（如 demo/web）')
+      if (action === 'tags') return runtime.ociListTags({ repository, limit: args.limit })
+      if (action === 'manifest') return runtime.ociGetManifest({ repository, ref: args.ref || '' })
+      if (action === 'delete') {
+        if (!args.ref) throw ociError(OCI_ERRORS.MANIFEST_UNKNOWN, '需要 ref（tag 或 digest）')
+        return runtime.ociDeleteManifest({ repository, ref: args.ref })
+      }
+      throw ociError(OCI_ERRORS.UNSUPPORTED, `未知的 action ${action}`)
+    },
+  })
+
   register({
     name: 'cicd_toolchain',
     description: '工具链托管（JDK / Node / Python / Maven / Gradle / Go）：查看已装、解析会装什么、安装、写锁、清理。版本只由 pipe.yml 的 toolchain: 决定，机器上装了什么版本不影响结果。',
@@ -4182,6 +4453,219 @@ async function approvalsResource(request, runtime) {
  * POST `/artifacts?action=verify&digest=`              全量重算（人工巡检）
  * POST `/artifacts?action=gc[&dryRun=0]`               回收无引用 blob（默认 dry-run）
  */
+/**
+ * OCI Distribution v2（`/v2/`）。docker / nerdctl / skopeo 都按这份规范说话，所以这里不发明形状。
+ *
+ * 鉴权走 Bearer challenge：未带票 → 401 + `www-authenticate: Bearer realm=…,service=…`，
+ * 客户端拿 realm 去换票再来。票由 runtime.ociToken 签发，scope 写死票里，服务端不信任客户端自报。
+ *
+ * 这层的「仓库」不是独立存储：manifest 和层都是 CAS 里的 blob，tag 是 refs/<repo>/<tag>。
+ * 好处是 pull 一个镜像、拉一个构建产物、回滚一次发布，三条路读的是同一份字节、同一个 GC 保留集。
+ */
+async function ociResource(request, runtime, pathname) {
+  const method = String(request.method || 'GET').toUpperCase()
+  const params = queryOf(request)
+  const rest = String(pathname || '').slice(`${ROUTE_PREFIX}/v2`.length).replace(/^\/+/, '').replace(/\/+$/, '')
+  const realm = '/api/plugins/cicd/v2/token'
+  const challenge = (scope) => new Response(JSON.stringify({ errors: [{ code: 'UNAUTHORIZED', message: 'authentication required' }] }), {
+    status: 401,
+    headers: { ...baseJsonHeaders(), 'www-authenticate': `Bearer realm="${realm}",service="dsh-cicd",scope="${scope}"` },
+  })
+
+  if (!runtime.ociEnabled()) {
+    return json({ errors: [{ code: 'UNSUPPORTED', message: 'registry 已被配置关闭' }] }, 405)
+  }
+
+  // /v2/token：换票。没有身份就不能换票（客户端会用 docker login 存下来的账号密码 basic auth）。
+  if (rest === 'token') {
+    const bundle = runtime.authBundle(request)
+    if (bundle.error) return json({ errors: [{ code: 'UNAUTHORIZED', message: '需要先登录' }] }, 401)
+    const actor = bundle.actor || {}
+    // 只签「问到的 scope」里 actor 真有权限的那部分：`docker login` 会问 *,actions=*，
+    // 全签等于给所有仓库开写权限。这里按 policy 里真实角色收敛。
+    const requested = parseScope(params.get('scope') || '')
+    const granted = []
+    for (const item of requested) {
+      const actions = [...item.actions].filter((action) => ociActionAllowed(actor, action))
+      if (actions.length > 0) granted.push(`repository:${item.name}:${actions.join(',')}`)
+    }
+    const issued = runtime.ociToken({ scope: granted.join(' '), actorId: actor.id || actor.email || '' })
+    return json({ token: issued.token, access_token: issued.token, expires_in: issued.expiresIn, issued_at: issued.issuedAt })
+  }
+
+  const authorized = runtime.ociAuthorize(request)
+  const repoOf = () => {
+    const match = /^([a-z0-9][^/]*(?:\/[a-z0-9][^/]*)*)\/(manifests|blobs|tags)\//.exec(rest)
+    return match ? match[1] : ''
+  }
+  if (!authorized.ok) return challenge(repoOf() ? `repository:${repoOf()}:pull,push` : 'registry:catalog:*')
+  const allowed = (repository, action) => authorizeOciScope(authorized, repository, action)
+
+  // GET /v2/ —— 探活。docker login 的第一步，只需一张合法票。
+  if (rest === '') return json({})
+
+  // GET /v2/_catalog
+  if (rest === '_catalog') {
+    const owners = new Set()
+    for (const ref of runtime.ociCatalog()) owners.add(ref.owner)
+    return json({ repositories: [...owners].sort() })
+  }
+
+  // /v2/<name>/tags/list
+  const tagsMatch = /^(.*)\/tags\/list$/.exec(rest)
+  if (tagsMatch) {
+    if (method !== 'GET') return json({ errors: [{ code: 'UNSUPPORTED', message: '只支持 GET' }] }, 405)
+    if (!allowed(tagsMatch[1], 'pull')) return challenge(`repository:${tagsMatch[1]}:pull`)
+    // 名字合法性放在鉴权之后判：先校验会让不合法的名字得到与「无权限」不同的响应，等于给了个探测口。
+    try { parseRepository(tagsMatch[1]) } catch (error) { return ociErrorJson(error) }
+    try { return json(stripOk(runtime.ociListTags({ repository: tagsMatch[1], limit: params.get('n') || 100 }))) } catch (error) { return ociErrorJson(error) }
+  }
+
+  // /v2/<name>/manifests/<ref>
+  const manifestMatch = /^(.*)\/manifests\/(.+)$/.exec(rest)
+  if (manifestMatch) {
+    const repository = manifestMatch[1]
+    const ref = decodeURIComponent(manifestMatch[2])
+    if (method === 'GET' || method === 'HEAD') {
+      if (!allowed(repository, 'pull')) return challenge(`repository:${repository}:pull`)
+      try {
+        const result = runtime.ociGetManifest({ repository, ref, expectedDigest: '' })
+        const body = canonicalJson(result.manifest)
+        return new Response(method === 'HEAD' ? null : body, {
+          status: 200,
+          headers: {
+            'content-type': result.mediaType,
+            'content-length': String(Buffer.byteLength(body)),
+            'docker-content-digest': result.digest,
+            etag: `"${result.digest}"`,
+          },
+        })
+      } catch (error) { return ociErrorJson(error) }
+    }
+    if (method === 'PUT') {
+      if (!allowed(repository, 'push')) return challenge(`repository:${repository}:push`)
+      const raw = await request.text()
+      try {
+        const parsed = JSON.parse(raw)
+        const result = await runtime.ociPutManifest({ repository, ref, manifest: parsed, raw, contentType: request.headers?.get?.('content-type') || '' })
+        return json(stripOk(result), 201, { 'docker-content-digest': result.digest })
+      } catch (error) { return ociErrorJson(error) }
+    }
+    if (method === 'DELETE') {
+      // 删 manifest 会让镜像拉不下来，按 push 权限管（OCI 的 delete 动作不是所有客户端都会申请）。
+      if (!allowed(repository, 'push')) return challenge(`repository:${repository}:push`)
+      try { return json(stripOk(runtime.ociDeleteManifest({ repository, ref }))) } catch (error) { return ociErrorJson(error) }
+    }
+    return json({ errors: [{ code: 'UNSUPPORTED', message: '只支持 GET/HEAD/PUT/DELETE' }] }, 405)
+  }
+
+  // /v2/<name>/blobs/uploads/ —— 开一次上传会话
+  const uploadStart = /^(.*)\/blobs\/uploads\/?$/.exec(rest)
+  if (uploadStart) {
+    const repository = uploadStart[1]
+    if (method === 'POST') {
+      if (!allowed(repository, 'push')) return challenge(`repository:${repository}:push`)
+      try {
+        const result = runtime.ociStartUpload({ repository, mount: params.get('mount') || '', from: params.get('from') || '' })
+        if (result.mounted) {
+          // 挂载成功：规范要求直接 201，Location 指回 blob。
+          return json({}, 201, { location: `/api/plugins/cicd/v2/${repository}/blobs/${result.mounted}`, 'docker-content-digest': result.mounted })
+        }
+        return json({}, 202, { location: `/api/plugins/cicd/v2/${repository}/blobs/uploads/${encodeURIComponent(result.id)}`, 'docker-upload-uuid': result.id, range: '0-0' })
+      } catch (error) { return ociErrorJson(error) }
+    }
+    return json({ errors: [{ code: 'UNSUPPORTED', message: '只支持 POST' }] }, 405)
+  }
+
+  // /v2/<name>/blobs/uploads/<uuid> —— PATCH 追加 / PUT 提交 / DELETE 放弃 / GET 查进度
+  const uploadMatch = /^(.*)\/blobs\/uploads\/([^/]+)$/.exec(rest)
+  if (uploadMatch) {
+    const repository = uploadMatch[1]
+    const id = decodeURIComponent(uploadMatch[2])
+    if (!allowed(repository, 'push')) return challenge(`repository:${repository}:push`)
+    try {
+      if (method === 'PATCH' || method === 'PUT') {
+        const wrote = await runtime.ociAppendUpload({ id, source: request.body })
+        if (method === 'PATCH') {
+          return json({}, 202, { location: `/api/plugins/cicd/v2/${repository}/blobs/uploads/${encodeURIComponent(id)}`, range: `0-${Math.max(0, wrote.bytes - 1)}` })
+        }
+        // 一次性 PUT（`docker push` 常用它把整层一次交上来，并带 ?digest=）
+        const committed = await runtime.ociCommitUpload({ id, digest: params.get('digest') || '', repository, mediaType: '' })
+        return json(stripOk(committed), 201, { location: `/api/plugins/cicd/v2/${repository}/blobs/${committed.digest}`, 'docker-content-digest': committed.digest })
+      }
+      if (method === 'DELETE') return json(stripOk(runtime.ociDropUpload(id)), 204)
+      if (method === 'GET') return json({}, 204, { location: `/api/plugins/cicd/v2/${repository}/blobs/uploads/${encodeURIComponent(id)}` })
+      return json({ errors: [{ code: 'UNSUPPORTED', message: '只支持 PATCH/PUT/DELETE' }] }, 405)
+    } catch (error) { return ociErrorJson(error) }
+  }
+
+  // /v2/<name>/blobs/<digest> —— GET/HEAD 拉层，DELETE 删层（只删 tag 之外没人引用的，规范如此）
+  const blobMatch = /^(.*)\/blobs\/(.+)$/.exec(rest)
+  if (blobMatch) {
+    const repository = blobMatch[1]
+    const digest = decodeURIComponent(blobMatch[2])
+    if (!allowed(repository, method === 'GET' || method === 'HEAD' ? 'pull' : 'push')) {
+      return challenge(`repository:${repository}:pull,push`)
+    }
+    try {
+      if (method === 'GET' || method === 'HEAD') {
+        const slice = runtime.artifactStream(digest, request.headers?.get?.('range') || '')
+        const headers = {
+          'content-type': 'application/octet-stream',
+          'content-length': String(slice.end - slice.start + 1),
+          'accept-ranges': 'bytes',
+          'docker-content-digest': slice.digest,
+          etag: `"${slice.digest}"`,
+        }
+        if (slice.status === 206) headers['content-range'] = `bytes ${slice.start}-${slice.end}/${slice.bytes}`
+        return new Response(method === 'HEAD' ? null : Readable.toWeb(slice.stream()), { status: slice.status, headers })
+      }
+      if (method === 'DELETE') {
+        // 直接删字节会让同一个 digest 的其他引用失效，这里只允许删「没有任何 tag 指向的 manifest 层」，
+        // 其余交给 GC —— 删 tag + GC 是两个动作，合并成一个会让回滚窗口被悄悄清掉。
+        return json({ errors: [{ code: 'UNSUPPORTED', message: '请用 DELETE /manifests/<tag> 删标签，字节请走 GC' }] }, 405)
+      }
+      return json({ errors: [{ code: 'UNSUPPORTED', message: '只支持 GET/HEAD' }] }, 405)
+    } catch (error) { return ociErrorJson(error) }
+  }
+
+  return json({ errors: [{ code: 'UNSUPPORTED', message: `未知的 OCI 路径 ${rest}` }] }, 404)
+}
+
+
+/** 票里写死的 scope 是否覆盖 <repository>:<action>。票里没写的仓库一律不放行。 */
+function authorizeOciScope(authorized, repository, action) {
+  return scopeAllows(authorized.scopes || [], repository, action)
+}
+
+/** 生成票时用：角色对某个 OCI 动作有没有权限（push/delete 走 MANAGE_PROJECT，pull 走 READ）。 */
+function ociActionAllowed(actor, action) {
+  // pull 是读，push/delete 是写。写一律按 MANAGE_PROJECT 判：能推镜像就能改部署内容，那是项目级权限。
+  const needed = action === 'pull' ? ACTIONS.READ : ACTIONS.MANAGE_PROJECT
+  try {
+    return can(actor, needed, { type: 'artifact', id: '' }).allow === true
+  } catch { return false }
+}
+
+/** 仓库层返回的对象都带 ok:true，HTTP 响应体不需要它。 */
+function stripOk(value) {
+  if (!value || typeof value !== 'object') return value
+  const rest = { ...value }
+  delete rest.ok
+  return rest
+}
+
+function baseJsonHeaders() {
+  return { 'content-type': 'application/json; charset=utf-8' }
+}
+
+function ociErrorJson(error) {
+  const code = error?.code || 'UNKNOWN'
+  // CAS 的错（上传/提交时冒出来的）用 artifact 的映射，其余走 OCI 规范的状态码。
+  const status = code.startsWith('ARTIFACT_') ? errorStatus(error) : (ociStatus(code) || 500)
+  return json({ errors: [{ code, message: String(error?.message || 'registry error'), detail: error?.extra || undefined }] }, status)
+}
+
 async function artifactsResource(request, runtime) {
   const params = queryOf(request)
   const method = String(request.method || 'GET').toUpperCase()
@@ -4514,6 +4998,9 @@ function registerHttpRoutes(ctx, runtime) {
     { kind: 'exact', path: `${ROUTE_PREFIX}/artifacts`, resource: (request) => artifactsResource(request, runtime) },
     // 入站 webhook 是路径带项目名的前缀路由：/hooks/<project>
     { kind: 'prefix', path: `${ROUTE_PREFIX}/hooks`, resource: (request) => hookResource(request, runtime) },
+    // v3.0-P5-4：OCI Distribution v2。整段 /v2/ 是一条前缀路由——路径形状是规范定死的，
+    // 拆成 exact 只会让 <repo>/manifests/<ref> 这类多段路径没处放。
+    { kind: 'prefix', path: `${ROUTE_PREFIX}/v2`, resource: (request) => ociResource(request, runtime, new URL(request.url).pathname) },
   ]
   for (const route of routes) {
     try {

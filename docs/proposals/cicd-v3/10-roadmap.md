@@ -180,7 +180,7 @@ P1+P2+P3 ─→ P5 制品库(3w) ─→ P6 体验(4w) ─→ P7 加固(持续)
 | P5-1 ✅ | CAS | `lib/artifacts.js`：流式 sha256 → `.tmp` → `rename` 原子提交；磁盘布局 `blobs/sha256/<aa>/<hex>`；单区间 Range；`verify()` 全量重算 | 篡改 1 字节被拒（`P5-S2` 声明 digest 不符直接拒收、`P5-S3` 改盘后 verify 立即证伪）✅ |
 | P5-2 ✅ | 上传/下载 API | `/api/plugins/cicd/artifacts`（GET 下载 + Range、GET 列表、POST upload/tag/verify/gc）+ 工具 `cicd_artifacts`；DB v10 加 `artifact_blobs` / `artifact_refs` | 幂等、去重（`P5-S1` 同内容二次 PUT 返回 `deduped:true` 且只有一份 blob）✅ |
 | P5-3 | Maven/npm/PyPI 只读 | 元数据生成 | `mvn deploy` 能用 |
-| P5-4 | OCI 兼容层 | `/v2/…` + token 认证 | `docker pull` 可用 |
+| P5-4 ✅ | OCI 兼容层 | `lib/oci.js`（仓库名/digest/manifest 校验、HS256 短票、上传会话）+ `/v2/` 前缀路由（`/v2/`、`_catalog`、`tags/list`、`manifests/<ref>` GET/HEAD/PUT/DELETE、`blobs/uploads[/<uuid>]`、`blobs/<digest>`）+ 工具 `cicd_registry`。manifest 与层都落在同一个 CAS，tag 就是 `refs/<repo>/<tag>` | 401 带 Bearer challenge（`P5-OCR1`）· push→pull 字节一致（`P5-OCR2`）· 引用了未上传层的 manifest 被拒 `OCI_MANIFEST_BLOB_UNKNOWN` 且旧 digest 回滚可取（`P5-OCR3`）· 只有 pull 票推不上去、scope 不跨仓库（`P5-OCR4`）· 非法仓库名/未知端点 4xx（`P5-OCR5`）✅ |
 | P5-5 | Promotion | digest 恒等校验 | 跨环境不复制字节 |
 | P5-6 ⏳ | GC/保留 | `gc({dryRun:true})` 默认只列不删；保留集 = 指针文件 + `releases.artifact_digest`（pinned）。tombstone 与 refcount 列未做 | 被 release/指针引用的不删（`P5-S5`）✅ · tombstone 缺 |
 

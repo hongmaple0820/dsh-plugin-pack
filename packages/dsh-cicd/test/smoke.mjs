@@ -767,12 +767,12 @@ function callPath(pathname, query = '', { headers = {} } = {}) {
   return route.resource(new Request(`http://x${pathname}${query}`, { headers }))
 }
 
-check('apply：注册 27 个工具、35 条路由（34 exact + 1 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
-  assert.equal(ctx.toolsList.length, 27)
+check('apply：注册 28 个工具、36 条路由（34 exact + 2 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
+  assert.equal(ctx.toolsList.length, 28)
   assert.deepEqual(ctx.toolsList.map((tool) => tool.name).sort(), [
     'cicd_approve', 'cicd_artifacts', 'cicd_audit', 'cicd_auth', 'cicd_cancel', 'cicd_dora', 'cicd_environments', 'cicd_locks',
     'cicd_logs', 'cicd_pipe_save', 'cicd_plan', 'cicd_project_create', 'cicd_project_meta', 'cicd_projects',
-    'cicd_rbac', 'cicd_releases', 'cicd_rollback', 'cicd_run', 'cicd_runners', 'cicd_secrets', 'cicd_status',
+    'cicd_rbac', 'cicd_registry', 'cicd_releases', 'cicd_rollback', 'cicd_run', 'cicd_runners', 'cicd_secrets', 'cicd_status',
     'cicd_targets', 'cicd_tokens', 'cicd_toolchain', 'cicd_triggers', 'cicd_users', 'cicd_validate',
   ])
   for (const tool of ctx.toolsList) {
@@ -782,7 +782,7 @@ check('apply：注册 27 个工具、35 条路由（34 exact + 1 prefix）、1 �
     assert.equal(typeof tool.output.render, 'function')
     assert.equal(typeof tool.execute, 'function')
   }
-  assert.equal(ctx.routes.length, 35)
+  assert.equal(ctx.routes.length, 36)
   assert.deepEqual(ctx.routes.filter((route) => route.kind === 'exact').map((route) => route.path).sort(), [
     '/api/plugins/cicd/approvals', '/api/plugins/cicd/approve', '/api/plugins/cicd/artifacts', '/api/plugins/cicd/audit', '/api/plugins/cicd/auth',
     '/api/plugins/cicd/cancel', '/api/plugins/cicd/dora', '/api/plugins/cicd/environments', '/api/plugins/cicd/locks',
@@ -793,7 +793,7 @@ check('apply：注册 27 个工具、35 条路由（34 exact + 1 prefix）、1 �
     '/api/plugins/cicd/runners', '/api/plugins/cicd/runs', '/api/plugins/cicd/secrets', '/api/plugins/cicd/targets',
     '/api/plugins/cicd/tokens', '/api/plugins/cicd/toolchain', '/api/plugins/cicd/triggers', '/api/plugins/cicd/users', '/api/plugins/cicd/validate',
   ])
-  assert.deepEqual(ctx.routes.filter((route) => route.kind === 'prefix').map((route) => route.path), ['/api/plugins/cicd/hooks'])
+  assert.deepEqual(ctx.routes.filter((route) => route.kind === 'prefix').map((route) => route.path), ['/api/plugins/cicd/hooks', '/api/plugins/cicd/v2'])
   assert.ok(ctx.routes.every((route) => typeof route.resource === 'function' && !route.handler))
   assert.equal(ctx.upgrades.length, 1)
   assert.equal(ctx.upgrades[0].path, '/api/plugins/cicd/log-ws')
@@ -822,7 +822,7 @@ check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补�
   assert.ok(typeof scopeFn === 'function', 'apply 应把路由注册挂到 ctx.inject 上')
   // 模拟 webServer 就绪：cordis 以一个能 get 到服务的 scope 触发回调（真实环境由服务就绪事件驱动）。
   scopeFn({ get: (key) => (key === 'webServer' ? coldWeb : undefined), effect() {} })
-  assert.equal(coldRoutes.length, 35, '就绪后应补注册 34 条 exact + 1 条 hooks prefix 路由')
+  assert.equal(coldRoutes.length, 36, '就绪后应补注册 34 条 exact + 2 条 prefix 路由')
   assert.equal(coldRoutes.filter((route) => route.kind === 'exact').length, 34)
   assert.equal(coldUpgrades.length, 1, '就绪后应补注册 /log-ws upgrade 路由')
 
@@ -1028,7 +1028,7 @@ checkAsync('routes：operations 时间线、notify-test 未配置与写保护', 
 })
 
 check('routes：所有资源都走 resource，没有 handler/POST 形态', () => {
-  assert.equal(ctx.routes.length, 35)
+  assert.equal(ctx.routes.length, 36)
   for (const route of ctx.routes) {
     assert.equal(route.handler, undefined)
     assert.ok(route.kind === 'exact' || route.kind === 'prefix')
@@ -4030,6 +4030,171 @@ checkAsync('P5-S10：写操作一律要 confirm 与 x-dsh-cicd 头，缺一即�
   } finally {
     runtime.dispose()
   }
+})
+
+// ---------------------------------------------------------------------------------------------
+// P5-4 · OCI Distribution v2（docker push / pull）
+
+/** 走 /v2 前缀路由：pathname 是规范里的原始路径，鉴权靠 Bearer 票。 */
+function ociCall(pathname, { method = 'GET', headers = {}, body = null } = {}) {
+  const route = ctx.routes.find((item) => pathname.startsWith(`${item.path}/`) || pathname === item.path)
+  assert.ok(route, `prefix route for ${pathname} registered`)
+  return route.resource(new Request(`http://x${pathname}`, { method, headers, body }))
+}
+
+/** 引导期没有账号：authBundle 会把请求当成 bootstrap 主体，直接换票即可。 */
+async function ociToken(scope) {
+  const res = await ociCall(`${internals.ROUTE_PREFIX}/v2/token?scope=${encodeURIComponent(scope)}`)
+  assert.equal(res.status, 200)
+  return (await res.json()).token
+}
+
+function ociDigest(buffer) {
+  return `sha256:${createHash('sha256').update(buffer).digest('hex')}`
+}
+
+checkAsync('P5-OCR1：/v2/ 不带票 → 401 + Bearer challenge；换到票后探活 200', async () => {
+  const bare = await ociCall(`${internals.ROUTE_PREFIX}/v2/`)
+  assert.equal(bare.status, 401)
+  assert.match(bare.headers.get('www-authenticate') || '', /^Bearer realm="\/api\/plugins\/cicd\/v2\/token",service="dsh-cicd"/)
+  // 票里写死 scope：换票时没要的仓库，服务端不会给。
+  const pullToken = await ociToken('repository:demo/web:pull')
+  const ok = await ociCall(`${internals.ROUTE_PREFIX}/v2/`, { headers: { authorization: `Bearer ${pullToken}` } })
+  assert.equal(ok.status, 200)
+  // 被篡改的票不认（HMAC 校验）。
+  const tampered = await ociCall(`${internals.ROUTE_PREFIX}/v2/`, { headers: { authorization: `Bearer ${pullToken.slice(0, -4)}AAAA` } })
+  assert.equal(tampered.status, 401)
+})
+
+checkAsync('P5-OCR2：push 全流程 —— POST 开会话 → PATCH 追加 → PUT 提交；层 digest 由服务端重算', async () => {
+  const token = await ociToken('repository:demo/web:pull,push')
+  const auth = { authorization: `Bearer ${token}` }
+  const layer = Buffer.from('layer-bytes-for-demo')
+  const digest = ociDigest(layer)
+
+  const started = await ociCall(`${internals.ROUTE_PREFIX}/v2/demo/web/blobs/uploads/`, { method: 'POST', headers: auth })
+  assert.equal(started.status, 202)
+  const location = started.headers.get('location')
+  assert.match(location, /\/v2\/demo\/web\/blobs\/uploads\/[0-9a-f]+$/)
+
+  const patched = await ociCall(`http://x${location}`.replace('http://x', ''), { method: 'PATCH', headers: auth, body: layer })
+  assert.equal(patched.status, 202)
+  assert.equal(patched.headers.get('range'), `0-${layer.length - 1}`)
+
+  // 声明的 digest 与实际上传的字节不符 → 400，且什么都没进 CAS。
+  const wrong = await ociCall(`${location}?digest=${encodeURIComponent(`sha256:${'0'.repeat(64)}`)}`, { method: 'PUT', headers: auth })
+  assert.equal(wrong.status, 409)
+  assert.equal((await wrong.json()).errors[0].code, 'ARTIFACT_DIGEST_MISMATCH')
+
+  // 重新传一次并提交正确的 digest。
+  const again = await ociCall(`${internals.ROUTE_PREFIX}/v2/demo/web/blobs/uploads/`, { method: 'POST', headers: auth })
+  const againLoc = again.headers.get('location')
+  await ociCall(againLoc, { method: 'PATCH', headers: auth, body: layer })
+  const committed = await ociCall(`${againLoc}?digest=${encodeURIComponent(digest)}`, { method: 'PUT', headers: auth })
+  assert.equal(committed.status, 201)
+  assert.equal(committed.headers.get('docker-content-digest'), digest)
+
+  // pull 回来字节一致（GET blob）。
+  const pulled = await ociCall(`${internals.ROUTE_PREFIX}/v2/demo/web/blobs/${digest}`, { headers: auth })
+  assert.equal(pulled.status, 200)
+  assert.equal(Buffer.from(await pulled.arrayBuffer()).toString(), layer.toString())
+})
+
+checkAsync('P5-OCR3：PUT /manifests/<tag> —— 引用了没上传的层必须拒（否则拉不下来时才炸）', async () => {
+  const token = await ociToken('repository:demo/web:pull,push')
+  const auth = { authorization: `Bearer ${token}`, 'content-type': 'application/vnd.oci.image.manifest.v1+json' }
+  const layer = Buffer.from('manifest-layer')
+  const layerDigest = ociDigest(layer)
+  const configDigest = ociDigest(Buffer.from('{}'))
+  const manifest = {
+    schemaVersion: 2,
+    mediaType: 'application/vnd.oci.image.manifest.v1+json',
+    config: { mediaType: 'application/vnd.oci.image.config.v1+json', digest: configDigest, size: 2 },
+    layers: [{ mediaType: 'application/vnd.oci.image.layer.v1.tar+gzip', digest: layerDigest, size: layer.length }],
+  }
+
+  const missing = await ociCall(`${internals.ROUTE_PREFIX}/v2/demo/web/manifests/v1`, { method: 'PUT', headers: auth, body: JSON.stringify(manifest) })
+  // 规范里 MANIFEST_BLOB_UNKNOWN 是 400（不是 404）：body 合法，只是引用了没上传的对象。
+  assert.equal(missing.status, 400)
+  const missingBody = await missing.json()
+  assert.equal(missingBody.errors[0].code, 'OCI_MANIFEST_BLOB_UNKNOWN')
+  assert.equal(missingBody.errors[0].detail.missing.length, 2, 'config 与 layer 都算缺失')
+
+  // 补齐两个 blob 后再放 manifest。
+  for (const [bytes, digest] of [[layer, layerDigest], [Buffer.from('{}'), configDigest]]) {
+    const started = await ociCall(`${internals.ROUTE_PREFIX}/v2/demo/web/blobs/uploads/`, { method: 'POST', headers: auth })
+    const loc = started.headers.get('location')
+    await ociCall(loc, { method: 'PATCH', headers: auth, body: bytes })
+    const done = await ociCall(`${loc}?digest=${encodeURIComponent(digest)}`, { method: 'PUT', headers: auth })
+    assert.equal(done.status, 201, JSON.stringify(await done.clone().json()))
+  }
+
+  const pushed = await ociCall(`${internals.ROUTE_PREFIX}/v2/demo/web/manifests/v1`, { method: 'PUT', headers: auth, body: JSON.stringify(manifest) })
+  assert.equal(pushed.status, 201, JSON.stringify(await pushed.clone().json()))
+  const manifestDigest = pushed.headers.get('docker-content-digest')
+  assert.match(manifestDigest, /^sha256:[0-9a-f]{64}$/)
+
+  const fetched = await ociCall(`${internals.ROUTE_PREFIX}/v2/demo/web/manifests/v1`, { headers: auth })
+  assert.equal(fetched.status, 200)
+  assert.equal(fetched.headers.get('docker-content-digest'), manifestDigest)
+  assert.deepEqual(await fetched.json(), manifest)
+
+  // 按 digest 取同一份，tags/list 里能看到 v1。
+  const byDigest = await ociCall(`${internals.ROUTE_PREFIX}/v2/demo/web/manifests/${manifestDigest}`, { headers: auth })
+  assert.equal(byDigest.status, 200)
+  const tags = await ociCall(`${internals.ROUTE_PREFIX}/v2/demo/web/tags/list`, { headers: auth })
+  assert.deepEqual((await tags.json()).tags, ['v1'])
+
+  // 重推同一个 tag 到别的 manifest：tag 移动，旧 manifest 仍按 digest 可取（回滚能力）。
+  const v2 = { ...manifest, annotations: { note: 'second' } }
+  const rePushed = await ociCall(`${internals.ROUTE_PREFIX}/v2/demo/web/manifests/v1`, { method: 'PUT', headers: auth, body: JSON.stringify(v2) })
+  assert.equal(rePushed.status, 201)
+  const movedDigest = rePushed.headers.get('docker-content-digest')
+  assert.notEqual(movedDigest, manifestDigest)
+  const old = await ociCall(`${internals.ROUTE_PREFIX}/v2/demo/web/manifests/${manifestDigest}`, { headers: auth })
+  assert.equal(old.status, 200, '旧 digest 必须还能取：容器回滚只换 digest')
+  assert.equal((await ociCall(`${internals.ROUTE_PREFIX}/v2/demo/web/manifests/v1`, { headers: auth })).headers.get('docker-content-digest'), movedDigest)
+
+  // DELETE tag 只摘指针，字节还在；按 digest 仍可读。
+  const removed = await ociCall(`${internals.ROUTE_PREFIX}/v2/demo/web/manifests/v1`, { method: 'DELETE', headers: auth })
+  assert.equal(removed.status, 200)
+  const goneTag = await ociCall(`${internals.ROUTE_PREFIX}/v2/demo/web/manifests/v1`, { headers: auth })
+  assert.equal(goneTag.status, 404)
+  assert.equal((await ociCall(`${internals.ROUTE_PREFIX}/v2/demo/web/manifests/${movedDigest}`, { headers: auth })).status, 200)
+})
+
+checkAsync('P5-OCR4：只有 pull 票推不上去 —— 写仓库要 push scope', async () => {
+  const pull = await ociToken('repository:demo/other:pull')
+  const auth = { authorization: `Bearer ${pull}` }
+  const res = await ociCall(`${internals.ROUTE_PREFIX}/v2/demo/other/blobs/uploads/`, { method: 'POST', headers: auth })
+  assert.equal(res.status, 401)
+  // challenge 只报缺口：这次缺的是 push，非要 pull,push 会让客户端去要已经有过的权限。
+  assert.match(res.headers.get('www-authenticate') || '', /scope="repository:demo\/other:push"/)
+  // scope 不跨仓库：demo/web 的票碰不到 demo/other。
+  const webToken = await ociToken('repository:demo/web:pull')
+  const crossRepo = await ociCall(`${internals.ROUTE_PREFIX}/v2/demo/other/tags/list`, { headers: { authorization: `Bearer ${webToken}` } })
+  assert.equal(crossRepo.status, 401)
+})
+
+checkAsync('P5-OCR5：仓库名与路径非法一律 4xx —— 大写、穿越、未知端点', async () => {
+  const token = await ociToken('repository:demo/web:pull,push')
+  const auth = { authorization: `Bearer ${token}` }
+  // 大写仓库名不在票的 scope 里 → 先被鉴权挡下（否则大小写不一致就成了绕过 scope 的洞）。
+  const upper = await ociCall(`${internals.ROUTE_PREFIX}/v2/Demo/Web/tags/list`, { headers: auth })
+  assert.equal(upper.status, 401)
+  // 名字非法（票覆盖了这个名字）→ 400 NAME_INVALID，而不是当成未知端点 404。
+  const badToken = await ociToken('repository:demo/_bad_:pull')
+  const badName = await ociCall(`${internals.ROUTE_PREFIX}/v2/demo/_bad_/tags/list`, { headers: { authorization: `Bearer ${badToken}` } })
+  assert.equal(badName.status, 400)
+  assert.equal((await badName.json()).errors[0].code, 'OCI_NAME_INVALID')
+  const unknown = await ociCall(`${internals.ROUTE_PREFIX}/v2/demo/web/whatever`, { headers: auth })
+  assert.equal(unknown.status, 404)
+})
+
+check('P5-OCR6：/v2 只有一条前缀路由，且 routing 不落在 exact 表里', () => {
+  const prefixes = ctx.routes.filter((route) => route.kind === 'prefix').map((route) => route.path)
+  assert.deepEqual(prefixes, [`${internals.ROUTE_PREFIX}/hooks`, `${internals.ROUTE_PREFIX}/v2`])
+  assert.ok(!ctx.routes.some((route) => route.kind === 'exact' && route.path.startsWith(`${internals.ROUTE_PREFIX}/v2`)))
 })
 
 check('P5-S11：DB —— 制品表随 v10 迁出，artifact_blobs 只存索引不存字节', () => {
