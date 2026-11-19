@@ -11,6 +11,9 @@
  *     schedule:
  *       - cron: '0 3 * * *'
  *         target: prod                 # 可选：指定部署目标（缺省用 pipe 的 defaultTarget）
+ *     watch:
+ *       debounceSec: 5             # 可选：pipe.yml 改动后安静多久才触发（默认 0）
+ *       target: staging            # 可选：目标（缺省用 pipe 的 defaultTarget）
  *     manual: true
  *
  * - push 的 branches/tags 用 glob（`*` 匹配任意字符，含 `/`，与文件 glob 的跨目录语义一致）。
@@ -55,7 +58,7 @@ function asStringArray(value, label) {
 /** 解析并规范化 triggers 段；root 没有 triggers 时返回默认（manual-only）。 */
 export function normalizeTriggers(root) {
   if (root.triggers === undefined || root.triggers === null) {
-    return { push: null, schedule: [], manual: true, hasPush: false, hasSchedule: false }
+    return { push: null, schedule: [], watch: null, manual: true, hasPush: false, hasSchedule: false }
   }
   if (typeof root.triggers !== 'object' || Array.isArray(root.triggers)) {
     throw new PipeError('triggers 必须是 map')
@@ -92,18 +95,35 @@ export function normalizeTriggers(root) {
     }
   }
 
+  let watch = null
+  if (triggers.watch !== undefined && triggers.watch !== null && triggers.watch !== false) {
+    if (triggers.watch === true) {
+      watch = { debounceSec: 0, target: '' }
+    } else {
+      if (typeof triggers.watch !== 'object' || Array.isArray(triggers.watch)) throw new PipeError('triggers.watch 必须是 map 或 true')
+      const raw = triggers.watch.debounceSec
+      const debounceSec = raw === undefined || raw === null ? 0 : Number(raw)
+      if (!Number.isFinite(debounceSec) || debounceSec < 0 || debounceSec > 3600) {
+        throw new PipeError('triggers.watch.debounceSec 必须是 0–3600 的秒数')
+      }
+      const target = triggers.watch.target === undefined || triggers.watch.target === null ? '' : String(triggers.watch.target).trim()
+      watch = { debounceSec, target }
+    }
+  }
+
   const manual = triggers.manual === undefined || triggers.manual === null ? true : Boolean(triggers.manual)
-  return { push, schedule, manual, hasPush: Boolean(push), hasSchedule: schedule.length > 0 }
+  return { push, schedule, manual, watch, hasPush: Boolean(push), hasSchedule: schedule.length > 0 }
 }
 
 /** 面板/工具输出用的摘要。 */
 export function triggerSummary(triggers) {
-  if (!triggers) return { push: false, branches: [], tags: [], schedules: [], manual: true }
+  if (!triggers) return { push: false, branches: [], tags: [], schedules: [], watch: null, manual: true }
   return {
     push: triggers.hasPush,
     branches: triggers.push?.branches || [],
     tags: triggers.push?.tags || [],
     schedules: triggers.schedule || [],
+    watch: triggers.watch || null,
     manual: triggers.manual,
   }
 }

@@ -206,6 +206,11 @@ P1+P2+P3 ─→ P5 制品库(3w) ─→ P6 体验(4w) ─→ P7 加固(持续)
 - 混沌：runner 掉线、DB 锁、磁盘满、网络分区。
 - 兼容：v1 pipe.yml 长期支持；DB 迁移可回滚。
 - 可观测：run 耗时 P50/P95、排队时长、缓存命中率、部署成功率（DORA 已有基础）。
+  - ✅ **run 耗时 / 排队 / 拥堵 / 阶段占比 / 重跑**：`lib/dora.js:summarizeRunQuality`（P50/P95 用最近秩法，取真实观测值而不是插值）+ `/metrics` + `cicd_metrics`。
+  - ✅ **磁盘占用**：`/storage` 递归统计 logs / artifacts / cache / 数据库各自的字节数与文件数（制品无上限增长，运维要能回答「离满还有多远」）。
+  - ✅ **通知投递台账**：`/notify-ledger`（进程内滚动 50 条）。通知是 best-effort，过去「发没发出去」只留在会被覆盖的日志里。
+  - ✅ **配置文件变更触发**：`triggers.watch` + `lib/scheduler.js:watchOnce`，首次只建基线、安静期后才触发、内容未变不重复；与手动运行走同一条 run() 路径。
+  - ⏳ 缓存命中率（toolchain 缓存已在用，未单列指标）。
 
 ---
 

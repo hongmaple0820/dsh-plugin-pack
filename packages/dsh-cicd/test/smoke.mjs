@@ -773,13 +773,14 @@ function callPath(pathname, query = '', { headers = {} } = {}) {
   return route.resource(new Request(`http://x${pathname}${query}`, { headers }))
 }
 
-check('apply：注册 29 个工具、39 条路由（35 exact + 4 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
-  assert.equal(ctx.toolsList.length, 29)
+check('apply：注册 32 个工具、42 条路由（38 exact + 4 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
+  assert.equal(ctx.toolsList.length, 32)
   assert.deepEqual(ctx.toolsList.map((tool) => tool.name).sort(), [
     'cicd_approve', 'cicd_artifacts', 'cicd_audit', 'cicd_auth', 'cicd_cancel', 'cicd_dora', 'cicd_environments', 'cicd_locks',
-    'cicd_logs', 'cicd_pipe_save', 'cicd_plan', 'cicd_project_create', 'cicd_project_meta', 'cicd_projects', 'cicd_promotions',
+    'cicd_logs', 'cicd_metrics', 'cicd_notify_ledger', 'cicd_pipe_save', 'cicd_plan', 'cicd_project_create', 'cicd_project_meta',
+    'cicd_projects', 'cicd_promotions',
     'cicd_rbac', 'cicd_registry', 'cicd_releases', 'cicd_rollback', 'cicd_run', 'cicd_runners', 'cicd_secrets', 'cicd_status',
-    'cicd_targets', 'cicd_tokens', 'cicd_toolchain', 'cicd_triggers', 'cicd_users', 'cicd_validate',
+    'cicd_storage', 'cicd_targets', 'cicd_tokens', 'cicd_toolchain', 'cicd_triggers', 'cicd_users', 'cicd_validate',
   ])
   for (const tool of ctx.toolsList) {
     assert.equal(typeof tool.description, 'string')
@@ -788,15 +789,17 @@ check('apply：注册 29 个工具、39 条路由（35 exact + 4 prefix）、1 �
     assert.equal(typeof tool.output.render, 'function')
     assert.equal(typeof tool.execute, 'function')
   }
-  assert.equal(ctx.routes.length, 39)
+  assert.equal(ctx.routes.length, 42)
   assert.deepEqual(ctx.routes.filter((route) => route.kind === 'exact').map((route) => route.path).sort(), [
     '/api/plugins/cicd/approvals', '/api/plugins/cicd/approve', '/api/plugins/cicd/artifacts', '/api/plugins/cicd/audit', '/api/plugins/cicd/auth',
     '/api/plugins/cicd/cancel', '/api/plugins/cicd/dora', '/api/plugins/cicd/environments', '/api/plugins/cicd/locks',
-    '/api/plugins/cicd/log', '/api/plugins/cicd/notify-test', '/api/plugins/cicd/operations', '/api/plugins/cicd/pipe-save',
+    '/api/plugins/cicd/log', '/api/plugins/cicd/metrics', '/api/plugins/cicd/notify-ledger', '/api/plugins/cicd/notify-test',
+    '/api/plugins/cicd/operations', '/api/plugins/cicd/pipe-save',
     '/api/plugins/cicd/plan', '/api/plugins/cicd/project-create', '/api/plugins/cicd/project-meta', '/api/plugins/cicd/projects',
     '/api/plugins/cicd/promotions', '/api/plugins/cicd/rbac', '/api/plugins/cicd/releases', '/api/plugins/cicd/rollback', '/api/plugins/cicd/run',
     '/api/plugins/cicd/runner-log', '/api/plugins/cicd/runner-poll', '/api/plugins/cicd/runner-register', '/api/plugins/cicd/runner-result',
-    '/api/plugins/cicd/runners', '/api/plugins/cicd/runs', '/api/plugins/cicd/secrets', '/api/plugins/cicd/targets',
+    '/api/plugins/cicd/runners', '/api/plugins/cicd/runs', '/api/plugins/cicd/secrets', '/api/plugins/cicd/storage',
+    '/api/plugins/cicd/targets',
     '/api/plugins/cicd/tokens', '/api/plugins/cicd/toolchain', '/api/plugins/cicd/triggers', '/api/plugins/cicd/users', '/api/plugins/cicd/validate',
   ])
   assert.deepEqual(ctx.routes.filter((route) => route.kind === 'prefix').map((route) => route.path), [
@@ -808,7 +811,7 @@ check('apply：注册 29 个工具、39 条路由（35 exact + 4 prefix）、1 �
   assert.equal(typeof ctx.upgrades[0].handler, 'function')
 })
 
-check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补注册 35+4 条；remote() 惰性取 port', () => {
+check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补注册 38+4 条；remote() 惰性取 port', () => {
   const coldRoutes = []
   const coldUpgrades = []
   const coldWeb = {
@@ -830,8 +833,8 @@ check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补�
   assert.ok(typeof scopeFn === 'function', 'apply 应把路由注册挂到 ctx.inject 上')
   // 模拟 webServer 就绪：cordis 以一个能 get 到服务的 scope 触发回调（真实环境由服务就绪事件驱动）。
   scopeFn({ get: (key) => (key === 'webServer' ? coldWeb : undefined), effect() {} })
-  assert.equal(coldRoutes.length, 39, '就绪后应补注册 35 条 exact + 4 条 prefix 路由')
-  assert.equal(coldRoutes.filter((route) => route.kind === 'exact').length, 35)
+  assert.equal(coldRoutes.length, 42, '就绪后应补注册 38 条 exact + 4 条 prefix 路由')
+  assert.equal(coldRoutes.filter((route) => route.kind === 'exact').length, 38)
   assert.equal(coldUpgrades.length, 1, '就绪后应补注册 /log-ws upgrade 路由')
 
   // remote() 惰性解析：apply 时拿不到 port（remoteBase 为空），就绪后首次调用应取到 55470。
@@ -1036,7 +1039,7 @@ checkAsync('routes：operations 时间线、notify-test 未配置与写保护', 
 })
 
 check('routes：所有资源都走 resource，没有 handler/POST 形态', () => {
-  assert.equal(ctx.routes.length, 39)
+  assert.equal(ctx.routes.length, 42)
   for (const route of ctx.routes) {
     assert.equal(route.handler, undefined)
     assert.ok(route.kind === 'exact' || route.kind === 'prefix')
@@ -1726,12 +1729,13 @@ checkAsync('V2-M1 scheduler：cron 每分钟去重、state 落盘与 start/stop 
     run: async () => ({}),
     tickSec: 20,
     pollSec: 0,
+    watchSec: 0,
     setIntervalImpl: (fn, ms) => { scheduled.push(ms); return { id: scheduled.length } },
     clearIntervalImpl: () => { scheduled.push('cleared') },
   })
   assert.equal(timers.start(), true)
   assert.equal(timers.start(), false, '重复 start 应返回 false')
-  assert.deepEqual(scheduled, [20000], 'pollSec=0 时只挂 tick 定时器')
+  assert.deepEqual(scheduled, [20000], `pollSec=0 时只挂 tick 定时器，实际 ${JSON.stringify(scheduled)}`)
   timers.stop()
   assert.equal(timers.started, false)
   assert.equal(scheduled.includes('cleared'), true)
@@ -1975,7 +1979,7 @@ checkAsync('V2-M1 cancel：运行中取消 → canceled 记录、activeRuns 清�
   } finally { runtime.dispose() }
 })
 
-checkAsync('V2-M1 DORA：四指标计算、dry_run 排除、MTTR 恢复、空窗口与路由校验', async () => {
+checkAsync('V2-M1 DORA：四指标计算、dry_run 排除、MTTR 恢复、空窗口与路由校验；P7 指标/存储/通知台账', async () => {
   const now = Date.parse('2026-01-06T12:00:00.000Z')
   const runs = [
     { project_id: 'p', target: 'prod', status: 'success', commit_sha: 'a1', started_at: '2026-01-05T08:00:00.000Z', finished_at: '2026-01-05T10:00:00.000Z' },
@@ -2026,7 +2030,63 @@ checkAsync('V2-M1 DORA：四指标计算、dry_run 排除、MTTR 恢复、空窗
   assert.equal(triggersBody.webhook, null)
   assert.equal((await call('/triggers', '?project=ghost')).status, 404)
   assert.equal((await call('/triggers', '?extra=1')).status, 400)
+})
 
+checkAsync('v3.0-P7 可观测：运行质量指标、磁盘占用、通知台账', async () => {
+  const now = Date.parse('2026-01-06T12:00:00.000Z')
+  // ---- v3.0-P7：运行质量指标（metrics） ------------------------------------------------
+  const qRuns = [
+    { id: 'q1', project_id: 'p', target: 'prod', status: 'success', started_at: '2026-01-05T08:00:00.000Z', finished_at: '2026-01-05T08:00:10.000Z', config_hash: 'h1' },
+    { id: 'q2', project_id: 'p', target: 'prod', status: 'success', started_at: '2026-01-05T08:00:05.000Z', finished_at: '2026-01-05T08:01:05.000Z', config_hash: 'h1' },
+    { id: 'q3', project_id: 'p', target: 'prod', status: 'failed', started_at: '2026-01-05T09:00:00.000Z', finished_at: '2026-01-05T09:03:00.000Z', config_hash: 'h2', queued_at: '2026-01-05T08:59:30.000Z' },
+  ]
+  const qSteps = {
+    q1: [{ stage_id: 'build', duration_ms: 4000, status: 'success' }, { stage_id: 'deploy', duration_ms: 6000, status: 'success' }],
+    q2: [{ stage_id: 'build', duration_ms: 30000, status: 'success' }],
+    q3: [{ stage_id: 'build', duration_ms: 20000, status: 'failed' }],
+  }
+  const quality = internals.summarizeRunQuality({ runs: qRuns, steps: qSteps, now, days: 30 })
+  assert.equal(quality.total, 3)
+  assert.equal(quality.durationSec.samples, 3)
+  assert.equal(quality.durationSec.max, 180, '最慢一次是 q3 的 3 分钟')
+  assert.equal(quality.durationSec.p50, 60, 'P50 用最近秩法取真实观测值 60s')
+  assert.equal(quality.longest.id, 'q3')
+  // q1 与 q2 在 08:00:05 之后到 08:00:10 之间同时在跑——峰值必须是 2，不是 1。
+  assert.equal(quality.concurrency.peak, 2)
+  // 只有 q3 记了 queued_at：排队样本 1 个、30 秒。
+  assert.equal(quality.queueSec.samples, 1)
+  assert.equal(quality.queueSec.p50, 30)
+  assert.equal(quality.stages[0].stage, 'build', 'build 累计 54s，占大头')
+  assert.equal(quality.stages[0].failed, 1)
+  assert.equal(quality.repeated.length, 1, 'config_hash h1 跑了两次')
+  assert.equal(quality.repeated[0].runs, 2)
+  const emptyQuality = internals.summarizeRunQuality({ runs: [], now, days: 7 })
+  assert.equal(emptyQuality.durationSec.p50, null)
+  assert.equal(emptyQuality.concurrency.peak, 0)
+  assert.deepEqual(emptyQuality.stages, [])
+
+  const metricsRes = await call('/metrics', '?days=7')
+  const metricsBody = await metricsRes.json()
+  assert.equal(metricsBody.ok, true, `/metrics 失败：${metricsRes.status} ${JSON.stringify(metricsBody)}`)
+  assert.equal(metricsBody.windowDays, 7)
+  assert.equal(metricsBody.total, 0, '夹具里没有真实运行，窗口内样本必须为 0（形状照旧返回 null）')
+  assert.equal(metricsBody.durationSec.p95, null, '没有样本时 P95 是 null 而不是 0——0 会被读成「都跑得很快」')
+  assert.equal(metricsBody.concurrency.peak, 0)
+  assert.equal(typeof metricsBody.windowDays, 'number')
+  assert.equal((await call('/metrics', '?days=0')).status, 400)
+  assert.equal((await call('/metrics', '?extra=1')).status, 400)
+
+  // /storage：真实目录树，报出的字节数必须等于自己数出来的一份。
+  const storageBody = await call('/storage', '').then((response) => response.json())
+  assert.equal(storageBody.ok, true)
+  assert.ok(storageBody.total.bytes >= storageBody.logs.bytes, '合计不小于其中的日志部分')
+  assert.ok(storageBody.database.bytes > 0, '数据库文件必须存在')
+
+  // /notify-ledger：没配置 webhook 时是空列表，不是 500。
+  const ledger = await call('/notify-ledger', '').then((response) => response.json())
+  assert.equal(ledger.ok, true)
+  assert.deepEqual(ledger.entries, [])
+  assert.equal((await call('/notify-ledger', '?limit=0')).status, 400)
   // prefix 路由：demo 没有 triggers.push → 403 WEBHOOK_DISABLED
   const disabled = await callPath('/api/plugins/cicd/hooks/demo', '?ref=refs/heads/main&token=x')
   assert.equal(disabled.status, 403)
@@ -2039,6 +2099,44 @@ checkAsync('V2-M1 DORA：四指标计算、dry_run 排除、MTTR 恢复、空窗
   assert.equal((await call('/cancel', '?runId=ghost&confirm=1', { headers: { 'x-dsh-cicd': '1' } })).status, 404)
 })
 
+checkAsync('P7 触发：pipe.yml 的 triggers.watch 让「改配置」也能触发一次运行，且只在安静期后触发', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-cicd-watch-'))
+  const pipe = join(root, 'pipe.yml')
+  writeFileSync(pipe, 'version: 1\nname: w\ntargets:\n  staging:\n    hosts: [h]\n    path: /srv/w\nstages:\n  - id: build\n    steps:\n      - run: echo hi\n', 'utf8')
+  const fired = []
+  const scheduler = internals.createScheduler({
+    getProjects: () => [{ id: 'w', name: 'w', path: root, pipe }],
+    readPipe: () => ({ name: 'w', triggers: { watch: { debounceSec: 5, target: 'staging' }, manual: true } }),
+    run: async (args) => { fired.push(args); return { status: 'success' } },
+    defaultTarget: 'staging',
+    stateDir: join(root, 'state'),
+    tickSec: 3600,
+    pollSec: 0,
+    watchSec: 0,
+  })
+  assert.equal(scheduler.snapshot().watchSec, 0, 'watchSec=0 表示不启定时器')
+  // 第一次看到这个项目只建立基线：插件刚启动不该把当前配置当成一次改动。
+  const first = await scheduler.watchOnce(Date.now())
+  assert.deepEqual(first.fired, [])
+  assert.equal(fired.length, 0)
+  // 改动 pipe 后立刻调用：还在安静期内，不触发。
+  writeFileSync(pipe, `${readFileSync(pipe, 'utf8')}# touched\n`, 'utf8')
+  const during = await scheduler.watchOnce(Date.now() + 1000)
+  assert.deepEqual(during.fired, [], '安静期内不该触发')
+  // 安静期过后再调：触发一次，trigger 记成 watch。
+  const after = await scheduler.watchOnce(Date.now() + 20000)
+  assert.equal(after.fired.length, 1)
+  assert.equal(fired.length, 1)
+  assert.equal(fired[0].trigger, 'watch')
+  assert.equal(fired[0].target, 'staging')
+  assert.equal(fired[0].project.id, 'w')
+  // 内容没再变：同一份文件不重复触发。
+  const again = await scheduler.watchOnce(Date.now() + 40000)
+  assert.deepEqual(again.fired, [])
+  assert.equal(fired.length, 1)
+  scheduler.stop()
+  rmSync(root, { recursive: true, force: true })
+})
 check('工具 render 函数对典型值不抛错', () => {
   const projects = ctx.toolsList.find((tool) => tool.name === 'cicd_projects')
   const status = ctx.toolsList.find((tool) => tool.name === 'cicd_status')

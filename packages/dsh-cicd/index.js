@@ -23,6 +23,7 @@ import { homedir } from 'node:os'
 import { basename, isAbsolute, join, relative } from 'node:path'
 import { parsePipe, planPipeline, interpolate, matchArtifacts, isHostSelector, parseHostSelector } from './lib/pipe.js'
 import { createStore, DEFAULT_WORK_DIR } from './lib/store.js'
+import { DB_FILE_NAME } from './lib/db.js'
 import { runPipeline, makeRunId } from './lib/runner.js'
 import { createRemote } from './lib/remote.js'
 import { deployRelease, rollbackRelease, readReleaseDigest, verifyRemoteArtifact } from './lib/deploy.js'
@@ -35,7 +36,7 @@ import { performHandshake, LogSocket, encodeFrame, refuseUpgrade } from './lib/w
 import { normalizeTriggers, matchPushRef, triggerSummary } from './lib/triggers.js'
 import { cronMatches, minuteKey } from './lib/cron.js'
 import { createScheduler } from './lib/scheduler.js'
-import { summarizeDora } from './lib/dora.js'
+import { summarizeDora, summarizeRunQuality } from './lib/dora.js'
 import { createTaskBroker, createRemoteExecutor, joinTokenMatches } from './lib/executors.js'
 import { createSecretStore } from './lib/secrets.js'
 import { createArtifactStore, normalizeDigest, digestPath, parseRange, artifactError } from './lib/artifacts.js'
@@ -211,6 +212,8 @@ function normalizeConfig(config = {}, ctx) {
       enabled: rawScheduler.enabled !== false,
       tickSec: clampInt(rawScheduler.tickSec, 20, 1, 3600),
       pollSec: clampInt(rawScheduler.pollSec, 60, 0, 3600),
+      // P7：pipe.yml 变更触发的轮询间隔。0 关闭（只想手动跑的项目不必付出 stat 成本）。
+      watchSec: clampInt(rawScheduler.watchSec, 10, 0, 3600),
       allowProd: rawScheduler.allowProd === true,
     },
     auth: {
@@ -440,6 +443,8 @@ function uniqueProjectId(projects, base) {
 function createRuntime(ctx, config) {
   const options = normalizeConfig(config, ctx)
   const store = createStore({ dir: options.workDir })
+  // 数据库文件的实际路径：storage() 要按字节报它，而不是按目录。
+  const storeFile = options.storeFile || join(options.workDir, DB_FILE_NAME);
   // v2.0-M0：把向导创建并持久化的项目并入启动配置里的项目（按 id 去重，配置里的优先）。
   const configuredIds = new Set(options.projects.map((project) => project.id))
   for (const row of store.projects()) {
@@ -1085,6 +1090,9 @@ function createRuntime(ctx, config) {
     }
   }
 
+  // v3.0-P7：最近的通知投递记录（进程内，滚动 50 条）。
+  const notifyHistory = []
+
   async function notifyEvent(event, payload) {
     if (!options.notifyWebhooks.length) return []
     let results = []
@@ -1093,6 +1101,18 @@ function createRuntime(ctx, config) {
     } catch (error) {
       results = [{ index: -1, ok: false, status: 0, error: error.message }]
     }
+    const okCount = results.filter((item) => item && item.ok).length
+    notifyHistory.unshift({
+      at: new Date().toISOString(),
+      event,
+      project: payload.project || '',
+      runId: payload.runId || '',
+      configured: options.notifyWebhooks.length,
+      delivered: okCount,
+      failed: results.length - okCount,
+      errors: results.filter((item) => item && !item.ok).map((item) => String(item.error || item.status || '')).filter(Boolean).slice(0, 3),
+    })
+    if (notifyHistory.length > 50) notifyHistory.length = 50
     for (const item of results) {
       try {
         store.appendOperation({
@@ -1900,6 +1920,62 @@ function createRuntime(ctx, config) {
     }
     return { project: projectId || '', ...summarizeDora({ runs, commitAt, now: Date.now(), days: windowDays }) }
   }
+  /**
+   * v3.0-P7：运行质量（排队/时长/拥堵/阶段占比/重跑）。
+   *
+   * 与 DORA 分开算是有意的：DORA 的窗口语义是「交付节奏」，指标一变就得重跑它对别人也没影响；
+   * 塞进同一个函数会让一个新增的 P95 悄悄改变 DORA 的样本集。
+   */
+  function metrics({ project: projectId = '', days = 30 } = {}) {
+    const windowDays = Number.isInteger(days) ? Math.max(1, Math.min(365, days)) : 30
+    const runs = store.runs({ project: projectId, limit: 5000 })
+    const cutoff = Date.now() - windowDays * 24 * 60 * 60 * 1000
+    const steps = {}
+    for (const run of runs) {
+      const finished = Date.parse(String(run.finished_at || run.started_at || ''))
+      if (!Number.isFinite(finished) || finished < cutoff) continue
+      // 只给窗口内的运行取步骤：窗口外运行的 steps 对任何一条指标都没有贡献。
+      steps[run.id] = store.stepsOf(run.id)
+    }
+    return {
+      project: projectId || '',
+      ...summarizeRunQuality({ runs, steps, now: Date.now(), days: windowDays }),
+      scheduler: scheduler ? scheduler.snapshot() : null,
+    }
+  }
+
+  /** v3.0-P7：磁盘里「哪些东西在长」——工作目录、日志目录、制品库、缓存、数据库。 */
+  function storage() {
+    const dir = (target) => {
+      let bytes = 0
+      let files = 0
+      const walk = (current) => {
+        let entries = []
+        try { entries = readdirSync(current, { withFileTypes: true }) } catch { return }
+        for (const entry of entries) {
+          const full = join(current, entry.name)
+          if (entry.isDirectory()) { walk(full); continue }
+          if (!entry.isFile()) continue
+          try { bytes += statSync(full).size; files += 1 } catch { /* 被删掉的文件不该让统计失败 */ }
+        }
+      }
+      walk(target)
+      return { path: target, bytes, files }
+    }
+    const database = (() => {
+      try { return statSync(storeFile).size } catch { return 0 }
+    })()
+    return {
+      workDir: options.workDir,
+      logs: dir(join(options.workDir, 'logs')),
+      artifacts: dir(options.artifacts.dir || join(options.workDir, 'artifacts')),
+      cache: options.cache?.dir ? dir(options.cache.dir) : null,
+      database: { path: storeFile, bytes: database },
+      // 磁盘告警线：日志与制品是无上限增长的，这一条用来回答「现在离满还有多远」。
+      total: dir(options.workDir),
+    }
+  }
+
 
   /**
    * V2-M1：入站 webhook（`/hooks/<project>?ref=refs/heads/main&token=...`）。
@@ -1970,9 +2046,10 @@ function createRuntime(ctx, config) {
         confirmProd: options.scheduler.allowProd,
       }),
       defaultTarget: options.defaultTarget,
-      stateFile: join(options.workDir, 'scheduler-state.json'),
+      stateDir: join(options.workDir, 'scheduler'),
       tickSec: options.scheduler.tickSec,
       pollSec: options.scheduler.pollSec,
+      watchSec: options.scheduler.watchSec,
     })
     : null
 
@@ -2223,6 +2300,9 @@ function createRuntime(ctx, config) {
     get scheduler() { return scheduler },
     triggers: projectTriggers,
     dora,
+    // v3.0-P7：运行质量与磁盘占用（指标的分母换过一次就不该和 DORA 混在一个窗口里算）
+    metrics,
+    storage,
     hook: runHook,
     // v3.0-P0：runner 列表以 DB 注册表为准（broker 只负责任务队列/在跑计数），
     // 这样重启后机器还在、吊销后立刻消失，不会再出现「面板说 online 但其实早没了」。
@@ -3308,6 +3388,16 @@ function createRuntime(ctx, config) {
         return { ok: false, error: error.message || String(error), code: error.code || 'PIPE_INVALID', line: error.line || 0 }
       }
     },
+    /**
+     * v3.0-P7：通知投递台账（进程内滚动窗口）。
+     *
+     * 通知是 best-effort，所以「发没发出去」过去只留在日志里——而日志会被下一个人覆盖。
+     * 这里给最近 50 次投递一条能查的记录：哪个事件、给了几个 endpoint、成了几个、失败原因。
+     * 不落库：这只是运维现场的体温计，不是审计（审计在 audit_events，那里记的是谁做了什么）。
+     */
+    notifyLedger({ limit = 20 } = {}) {
+      return { entries: notifyHistory.slice(0, Math.max(1, Math.min(50, Number(limit) || 20))) }
+    },
     async notifyTest() {
       const configured = options.notifyWebhooks.length
       if (configured === 0) return { ok: true, configured: 0, webhooks: [] }
@@ -3909,6 +3999,102 @@ function registerTools(ctx, runtime) {
       },
     },
     async execute(args = {}) { return runtime.dora({ project: args.project, days: args.days }) },
+  })
+
+  register({
+    name: 'cicd_metrics',
+    description: '运行质量指标：排队时长、耗时分位数（P50/P95/最慢）、并发峰值、时间花在哪个 stage、同一份配置重跑了几次。DORA 回答「交付好不好」，这个回答「机器忙不忙」。',
+    parameters: {
+      type: 'object',
+      properties: {
+        project: PROJECT_PARAM,
+        days: { type: 'number', description: '统计窗口天数（1-365，默认 30）' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          project: { type: 'string' }, windowDays: { type: 'number' }, total: { type: 'number' },
+          concurrency: { type: 'object', properties: { peak: { type: 'number' }, average: { type: 'number' } } },
+          durationSec: { type: 'object', properties: { p50: { type: 'number' }, p95: { type: 'number' }, max: { type: 'number' }, samples: { type: 'number' } } },
+          queueSec: { type: 'object', properties: { p50: { type: 'number' }, p95: { type: 'number' }, samples: { type: 'number' } } },
+          longest: { type: 'object', properties: { id: { type: 'string' }, projectId: { type: 'string' }, durationMs: { type: 'number' } } },
+          stages: { type: 'array', items: { type: 'object', properties: { stage: { type: 'string' }, steps: { type: 'number' }, durationMs: { type: 'number' }, share: { type: 'number' }, failed: { type: 'number' } } } },
+          repeated: { type: 'array', items: { type: 'object', properties: { projectId: { type: 'string' }, target: { type: 'string' }, runs: { type: 'number' } } } },
+        },
+      },
+      render(_args, value) {
+        const sec = (ms) => (ms === null || ms === undefined ? '无样本' : `${Math.round(ms / 100) / 10}s`)
+        const lines = [
+          `运行质量 · 最近 ${value.windowDays} 天${value.project ? ` · 项目 ${value.project}` : ''}（${value.total} 次）`,
+          `耗时：P50 ${sec(value.durationSec?.p50)} · P95 ${sec(value.durationSec?.p95)} · 最慢 ${sec(value.durationSec?.max)}`,
+          `排队：P50 ${sec(value.queueSec?.p50)} · P95 ${sec(value.queueSec?.p95)}（样本 ${value.queueSec?.samples ?? 0}）`,
+          `并发峰值：${value.concurrency?.peak ?? 0}（平均 ${value.concurrency?.average ?? 0}）`,
+        ]
+        if (value.longest?.id) lines.push(`最慢的一次：${value.longest.id}${value.longest.projectId ? `（${value.longest.projectId}）` : ''} ${sec(value.longest.durationMs)}`)
+        if (Array.isArray(value.stages) && value.stages.length) {
+          lines.push('阶段占比：', ...value.stages.slice(0, 5).map((item) => `  ${item.stage}：${Math.round((item.share || 0) * 100)}%（${sec(item.durationMs)}，${item.steps} 步${item.failed ? `，失败 ${item.failed}` : ''}）`))
+        }
+        if (Array.isArray(value.repeated) && value.repeated.length) {
+          lines.push(`同一份配置重跑：${value.repeated.slice(0, 3).map((item) => `${item.projectId}${item.target ? `→${item.target}` : ''} ×${item.runs}`).join('、')}`)
+        }
+        return textBlocks(lines.join('\n'))
+      },
+    },
+    async execute(args = {}) { return runtime.metrics({ project: args.project, days: args.days }) },
+  })
+
+  register({
+    name: 'cicd_storage',
+    description: '磁盘占用：工作目录、日志、制品库、缓存、数据库各占多少字节与文件数，用来回答「离满还有多远」。',
+    parameters: { type: 'object', properties: {} },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          workDir: { type: 'string' },
+          total: { type: 'object', properties: { path: { type: 'string' }, bytes: { type: 'number' }, files: { type: 'number' } } },
+          logs: { type: 'object', properties: { path: { type: 'string' }, bytes: { type: 'number' }, files: { type: 'number' } } },
+          artifacts: { type: 'object', properties: { path: { type: 'string' }, bytes: { type: 'number' }, files: { type: 'number' } } },
+          cache: { type: 'object', properties: { path: { type: 'string' }, bytes: { type: 'number' }, files: { type: 'number' } } },
+          database: { type: 'object', properties: { path: { type: 'string' }, bytes: { type: 'number' } } },
+        },
+      },
+      render(_args, value) {
+        const mb = (bytes) => `${Math.round((Number(bytes) || 0) / 1024 / 102.4) / 10} MB`
+        const row = (label, entry) => `${label}：${entry ? `${mb(entry.bytes)}${entry.files === undefined ? '' : `（${entry.files} 个文件）`}` : '未配置'}`
+        return textBlocks([
+          `磁盘占用 · ${value.workDir}`,
+          row('合计', value.total),
+          row('日志', value.logs),
+          row('制品库', value.artifacts),
+          row('构建缓存', value.cache),
+          row('数据库', value.database),
+        ].join('\n'))
+      },
+    },
+    async execute() { return runtime.storage() },
+  })
+
+  register({
+    name: 'cicd_notify_ledger',
+    description: '最近的通知投递记录：哪个事件、给了几个 endpoint、成了几个、失败原因（进程内滚动 50 条）。',
+    parameters: { type: 'object', properties: { limit: { type: 'number', description: '返回条数（1-50，默认 20）' } } },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          entries: { type: 'array', items: { type: 'object', properties: { at: { type: 'string' }, event: { type: 'string' }, project: { type: 'string' }, configured: { type: 'number' }, delivered: { type: 'number' }, failed: { type: 'number' }, errors: { type: 'array', items: { type: 'string' } } } } },
+        },
+      },
+      render(_args, value) {
+        const list = Array.isArray(value.entries) ? value.entries : []
+        if (!list.length) return textBlocks('还没有通知投递记录（未配置 webhook，或还没跑过运行）')
+        return textBlocks(['通知投递：', ...list.slice(0, 10).map((item) => `  ${item.at} ${item.event} ${item.delivered}/${item.configured}${item.failed ? ` 失败 ${item.failed}：${(item.errors || []).join(' / ')}` : ''}`)].join('\n'))
+      },
+    },
+    async execute(args = {}) { return runtime.notifyLedger({ limit: args.limit }) },
   })
 
   register({
@@ -5116,6 +5302,47 @@ async function doraResource(request, runtime) {
   try { return json({ ok: true, ...runtime.dora({ project: params.get('project') || '', days }) }) } catch (error) { return errorJson(error) }
 }
 
+/** v3.0-P7：`/metrics` —— 运行质量（窗口内真实运行的排队/时长/拥堵）。 */
+async function metricsResource(request, runtime) {
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
+  const params = queryOf(request)
+  const bad = unsupportedParams(params, new Set(['project', 'days']))
+  if (bad) return json({ ok: false, error: bad }, 400)
+  const raw = params.get('days')
+  const days = raw === null || raw === '' ? undefined : Number(raw)
+  if (days !== undefined && (!Number.isInteger(days) || days < 1 || days > 365)) {
+    return json({ ok: false, error: 'days 必须是 1-365 的整数' }, 400)
+  }
+  const project = params.get('project') || ''
+  const guard = authorizeRead(request, params, { runtime, resource: { type: 'project', id: project, projectId: project } })
+  if (guard) return guard
+  try { return json({ ok: true, ...runtime.metrics({ project, days }) }) } catch (error) { return errorJson(error) }
+}
+
+/** v3.0-P7：`/storage` —— 工作目录各部分的字节数与文件数。 */
+async function storageResource(request, runtime) {
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
+  const params = queryOf(request)
+  const bad = unsupportedParams(params, new Set([]))
+  if (bad) return json({ ok: false, error: bad }, 400)
+  const guard = authorizeRead(request, params, { runtime, action: ACTIONS.AUDIT_READ, resource: { type: 'project', id: '' } })
+  if (guard) return guard
+  try { return json({ ok: true, ...runtime.storage() }) } catch (error) { return errorJson(error) }
+}
+
+/** v3.0-P7：`/notify-ledger` —— 最近的通知投递记录（只读）。 */
+async function notifyLedgerResource(request, runtime) {
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
+  const params = queryOf(request)
+  const bad = unsupportedParams(params, new Set(['limit']))
+  if (bad) return json({ ok: false, error: bad }, 400)
+  const guard = authorizeRead(request, params, { runtime, action: ACTIONS.READ, resource: { type: 'notify', id: '' } })
+  if (guard) return guard
+  const limit = intParam(params, 'limit', { fallback: 20, min: 1, max: 50 })
+  if (limit.error) return json({ ok: false, error: limit.error }, 400)
+  try { return json({ ok: true, ...runtime.notifyLedger({ limit: limit.value }) }) } catch (error) { return errorJson(error) }
+}
+
 async function triggersResource(request, runtime) {
   if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
   const params = queryOf(request)
@@ -6045,6 +6272,10 @@ function registerHttpRoutes(ctx, runtime) {
     { kind: 'exact', path: `${ROUTE_PREFIX}/notify-test`, resource: (request) => notifyTestResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/cancel`, resource: (request) => cancelResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/dora`, resource: (request) => doraResource(request, runtime) },
+    // v3.0-P7：可观测（运行质量 / 磁盘占用 / 通知投递台账）
+    { kind: 'exact', path: `${ROUTE_PREFIX}/metrics`, resource: (request) => metricsResource(request, runtime) },
+    { kind: 'exact', path: `${ROUTE_PREFIX}/storage`, resource: (request) => storageResource(request, runtime) },
+    { kind: 'exact', path: `${ROUTE_PREFIX}/notify-ledger`, resource: (request) => notifyLedgerResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/triggers`, resource: (request) => triggersResource(request, runtime) },
     // V2-M2：远端 runner 拉取式协议
     { kind: 'exact', path: `${ROUTE_PREFIX}/runner-register`, resource: (request) => runnerRegisterResource(request, runtime) },
@@ -6147,6 +6378,7 @@ export const internals = {
   strategyDeployRelease,
   createScheduler,
   summarizeDora,
+  summarizeRunQuality,
   createLiveHub,
   normalizeTriggers,
   cronMatches,
@@ -6182,6 +6414,7 @@ export const internals = {
     runnerRegisterResource, runnerPollResource, runnerResultResource, runnerLogResource, runnersResource,
     approveResource, approvalsResource, secretsResource, environmentsResource, rbacResource,
     authResource, usersResource, tokensResource, auditResource, locksResource, toolchainResource,
+    metricsResource, storageResource, notifyLedgerResource,
   },
   // v3.0-P2：工具链（解析 / 安装 / 注入 / 断言）
   toolchain: { createToolchain, envFor, assertVersions, inferFromFiles, writeDualLocks, TOOLCHAIN_ERRORS, LANGS: TOOLCHAIN_LANGS },

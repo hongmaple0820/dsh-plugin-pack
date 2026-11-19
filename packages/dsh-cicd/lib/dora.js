@@ -69,6 +69,14 @@ function rateMttr(hours) {
   return rateLeadTime(hours)
 }
 
+function percentile(values, p) {
+  if (!values.length) return null
+  const sorted = [...values].sort((a, b) => a - b)
+  // 最近秩法（nearest-rank）：对 20 个样本求 P95 时，插值会给出一个从没发生过的数——
+  // 运维问的是「最慢的那几次有多慢」，答案必须是一次真实观测。
+  const rank = Math.ceil((Math.max(0, Math.min(100, p)) / 100) * sorted.length)
+  return sorted[Math.max(0, rank - 1)]
+}
 function buildSeries(rows, { now, windowDays }) {
   const buckets = Math.min(windowDays, 60)
   const series = []
@@ -89,6 +97,130 @@ function buildSeries(rows, { now, windowDays }) {
   return series
 }
 
+/**
+ * v3.0-P7：运行质量指标（纯函数，输入同样是 store.runs() 的行）。
+ *
+ * 与 DORA 的分工：DORA 回答「交付好不好」（频率/前置时间/失败率/恢复时间），
+ * 这里回答「机器忙不忙」——排队多久、跑多久、时间花在哪个 stage、同一份配置重跑了几次。
+ * 两者都从同一批行算，不引入新的采集管道：一次性任务的监控数据，最贵的部分从来不是计算，是埋点。
+ */
+export function summarizeRunQuality({ runs = [], steps = {}, now = Date.now(), days = 30 } = {}) {
+  const windowDays = Number.isInteger(days) ? Math.max(1, Math.min(365, days)) : 30
+  const from = now - windowDays * DAY_MS
+  const busy = []
+  const queueMs = []
+  const reRuns = new Map()
+  let longest = null
+
+  for (const run of Array.isArray(runs) ? runs : []) {
+    if (!run) continue
+    const started = toTime(run.started_at || run.startedAt)
+    const finished = toTime(run.finished_at || run.finishedAt)
+    if (!Number.isFinite(started) || !Number.isFinite(finished) || finished < from) continue
+    const id = String(run.id || '')
+    const durationMs = Math.max(0, finished - started)
+    const row = {
+      id,
+      projectId: String(run.project_id || run.projectId || ''),
+      target: String(run.target || ''),
+      status: String(run.status || ''),
+      trigger: String(run.trigger || ''),
+      startedAt: started,
+      finishedAt: finished,
+      durationMs,
+    }
+    busy.push(row)
+    if (!longest || durationMs > longest.durationMs) longest = row
+
+    // 排队时长 = started_at − 该次运行「被要求开始」的时刻。没有 queued_at 列时
+    // 只有重跑能算出这一段（重跑行记录了源运行），所以样本数会明显少于总运行数——
+    // 报 samples 而不是让人误以为 0 就是「从不排队」。
+    const queuedAt = toTime(run.queued_at || run.queuedAt)
+    if (Number.isFinite(queuedAt) && started >= queuedAt) queueMs.push(started - queuedAt)
+
+    const snapshot = String(run.config_hash || run.configHash || '')
+    if (snapshot) {
+      const key = `${row.projectId}\u0000${row.target}\u0000${snapshot}`
+      const list = reRuns.get(key) || []
+      list.push(row)
+      reRuns.set(key, list)
+    }
+  }
+
+  busy.sort((a, b) => a.startedAt - b.startedAt)
+  const durations = busy.map((row) => row.durationMs / 1000)
+
+  // 拥堵度：窗口内「同时在跑」的峰值。用扫描线（开始 +1 / 结束 -1）而不是按分钟打表格，
+  // 运行数上万时前者的代价只跟运行数有关，跟窗口长度无关。
+  const events = []
+  for (const row of busy) {
+    events.push([row.startedAt, 1])
+    events.push([row.finishedAt, -1])
+  }
+  events.sort((a, b) => (a[0] - b[0]) || (a[1] - b[1]))
+  let live = 0
+  let peak = 0
+  for (const [, delta] of events) {
+    live += delta
+    if (live > peak) peak = live
+  }
+
+  const stageTotals = new Map()
+  for (const row of busy) {
+    const list = steps?.[row.id]
+    if (!Array.isArray(list)) continue
+    for (const step of list) {
+      if (!step) continue
+      const name = String(step.stage_id ?? step.stageId ?? '')
+      if (!name) continue
+      const ms = Number(step.duration_ms ?? step.durationMs) || 0
+      const entry = stageTotals.get(name) || { stage: name, steps: 0, durationMs: 0, failed: 0 }
+      entry.steps += 1
+      entry.durationMs += ms
+      if (String(step.status || '') === 'failed') entry.failed += 1
+      stageTotals.set(name, entry)
+    }
+  }
+  const stages = [...stageTotals.values()]
+    .map((entry) => ({ ...entry, durationMs: Math.round(entry.durationMs), share: 0 }))
+    .sort((a, b) => b.durationMs - a.durationMs)
+  const stageTotal = stages.reduce((total, entry) => total + entry.durationMs, 0)
+  for (const entry of stages) entry.share = stageTotal > 0 ? round(entry.durationMs / stageTotal) : 0
+
+  // 同一份配置（config_hash 相同）跑第二次以上，说明第一次没跑通或结果不被信——
+  // 这是「流水线本身不稳」最直接的证据，比失败率更早出现。
+  const repeated = [...reRuns.entries()]
+    .filter(([, list]) => list.length > 1)
+    .map(([, list]) => ({
+      projectId: list[0].projectId,
+      target: list[0].target,
+      runs: list.length,
+      firstStartedAt: new Date(list[0].startedAt).toISOString(),
+    }))
+    .sort((a, b) => b.runs - a.runs)
+
+  return {
+    windowDays,
+    from: new Date(from).toISOString(),
+    to: new Date(now).toISOString(),
+    total: busy.length,
+    concurrency: { peak, average: round(busy.length > 0 ? busy.reduce((t, row) => t + row.durationMs, 0) / (windowDays * DAY_MS) : 0) },
+    durationSec: {
+      p50: round(percentile(durations, 50)),
+      p95: round(percentile(durations, 95)),
+      max: round(durations.length ? Math.max(...durations) : null),
+      samples: durations.length,
+    },
+    queueSec: {
+      p50: round(percentile(queueMs.map((ms) => ms / 1000), 50)),
+      p95: round(percentile(queueMs.map((ms) => ms / 1000), 95)),
+      samples: queueMs.length,
+    },
+    longest: longest ? { ...longest, startedAt: new Date(longest.startedAt).toISOString(), finishedAt: new Date(longest.finishedAt).toISOString() } : null,
+    stages,
+    repeated,
+  }
+}
 /**
  * @param {object} options
  * @param {Array<object>} options.runs store.runs() 的原始行（snake_case 或 camelCase 均可）
