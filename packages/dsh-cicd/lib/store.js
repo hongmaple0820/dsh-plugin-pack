@@ -94,13 +94,14 @@ export function createStore({ dir = DEFAULT_WORK_DIR, file = '' } = {}) {
     selectSteps: db.prepare('SELECT * FROM steps WHERE run_id = ? ORDER BY started_at ASC, job_id ASC, idx ASC'),
     insertArtifact: db.prepare('INSERT INTO artifacts (run_id, path, bytes, sha256, created_at) VALUES (?, ?, ?, ?, ?)'),
     selectArtifacts: db.prepare('SELECT * FROM artifacts WHERE run_id = ? ORDER BY id ASC'),
-    upsertRelease: db.prepare(`INSERT INTO releases (id, project_id, target, host, env, run_id, commit_sha, status, created_at, activated_at, deactivated_at, manifest_path, revisions_offset, previous, artifact_sha256, artifact_digest, mode, strategy, instances, operator)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    upsertRelease: db.prepare(`INSERT INTO releases (id, project_id, target, host, env, run_id, commit_sha, status, created_at, activated_at, deactivated_at, manifest_path, revisions_offset, previous, artifact_sha256, artifact_digest, mode, strategy, instances, operator, version)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET project_id = excluded.project_id, target = excluded.target, host = excluded.host, env = excluded.env, run_id = excluded.run_id,
         commit_sha = excluded.commit_sha, status = excluded.status, created_at = excluded.created_at, activated_at = excluded.activated_at,
         deactivated_at = excluded.deactivated_at, manifest_path = excluded.manifest_path, revisions_offset = excluded.revisions_offset,
         previous = excluded.previous, artifact_sha256 = excluded.artifact_sha256, artifact_digest = excluded.artifact_digest,
-        mode = excluded.mode, strategy = excluded.strategy, instances = excluded.instances, operator = excluded.operator`),
+        mode = excluded.mode, strategy = excluded.strategy, instances = excluded.instances, operator = excluded.operator,
+        version = excluded.version`),
     selectReleases: db.prepare("SELECT * FROM releases WHERE (? = '' OR target = ?) AND (? = '' OR host = ?) AND (? = '' OR env = ?) ORDER BY created_at DESC LIMIT ?"),
     selectRelease: db.prepare('SELECT * FROM releases WHERE id = ?'),
     selectActive: db.prepare(`SELECT * FROM releases WHERE status = 'active' AND (? = '' OR target = ?) AND (? = '' OR host = ?)
@@ -243,6 +244,7 @@ export function createStore({ dir = DEFAULT_WORK_DIR, file = '' } = {}) {
           ? release.instances
           : JSON.stringify(Array.isArray(release.instances) ? release.instances : []),
         text(release.operator),
+        text(release.version),
       )
       return release
     },

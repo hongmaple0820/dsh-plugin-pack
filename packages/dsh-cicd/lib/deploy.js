@@ -32,6 +32,60 @@ function releaseDir(target, releaseId) {
   return `${String(target.path || '').replace(/\/+$/, '')}/releases/${releaseId}`
 }
 
+/**
+ * v3.0-P5-5：回滚必须作用在「当时验过的那份字节」上，而不是当前软链或 manifest 里写的字符串。
+ *
+ * 从 release 自己的 manifest 读 digest，再把磁盘上那份制品读回来重算一遍：
+ * 只有改过的字节会让它不匹配，而那正是最该拦住回滚的情况（回滚到一份已损坏的包等于把事故延长一次）。
+ * manifest 缺失或 digest 形状不对时按「无法核对」处理 —— 宁可不回滚，也不猜。
+ */
+export async function readReleaseDigest({ remote, host, releaseDir }) {
+  const out = await remote.exec(host, `cat ${shellQuote(`${releaseDir}/.dsh-manifest.json`)} 2>/dev/null || true`)
+  const text = String(out?.stdout || '').trim()
+  if (!text) {
+    const error = new Error(`[${host}] release 目录里没有 .dsh-manifest.json，无法确认要回滚到哪份字节`)
+    error.code = 'RELEASE_NOT_FOUND'
+    throw error
+  }
+  let manifest
+  try {
+    manifest = JSON.parse(text)
+  } catch {
+    const error = new Error(`[${host}] .dsh-manifest.json 不是合法 JSON，无法确认要回滚到哪份字节`)
+    error.code = 'MANIFEST_INVALID'
+    throw error
+  }
+  const artifact = manifest?.artifact || {}
+  const digest = String(artifact.digest || '')
+  if (!/^sha256:[0-9a-f]{64}$/.test(digest)) {
+    const error = new Error(`[${host}] manifest 里没有可用的 sha256 digest，无法确认要回滚到哪份字节`)
+    error.code = 'MANIFEST_INVALID'
+    error.digest = digest
+    throw error
+  }
+  return { digest, path: String(artifact.path || ''), bytes: Number(artifact.bytes || 0), manifest }
+}
+
+/** 把 stage 到主机上的制品读回来重算 sha256。读不到也算不匹配（“拿不到”不等于“没被改过”）。 */
+export async function verifyRemoteArtifact({ remote, host, artifactPath, digest }) {
+  const out = await remote.exec(host, `sha256sum ${shellQuote(artifactPath)} 2>/dev/null || true`)
+  const actual = String(out?.stdout || '').trim().split(/\s+/)[0] || ''
+  if (!actual) {
+    const error = new Error(`[${host}] 回滚目标制品 ${artifactPath} 不存在或读不出来，无法核对 digest`)
+    error.code = 'ARTIFACT_CORRUPTED'
+    error.digest = digest
+    throw error
+  }
+  if (`sha256:${actual}` !== digest) {
+    const error = new Error(`[${host}] 回滚目标制品的字节已被改动（磁盘 ${actual.slice(0, 12)}… ≠ manifest ${digest.slice(7, 19)}…）`)
+    error.code = 'ARTIFACT_CORRUPTED'
+    error.digest = digest
+    error.actual = `sha256:${actual}`
+    throw error
+  }
+  return { ok: true, digest, actual: `sha256:${actual}`, artifactPath }
+}
+
 function parsePrevious(stdout) {
   const text = String(stdout || '').trim()
   if (!text) return ''
@@ -134,6 +188,7 @@ export async function deployOne({
   target,
   host,
   artifactPath,
+  artifactDigest = '',
   releaseId,
   keep,
   commit,
@@ -164,6 +219,22 @@ export async function deployOne({
 
   const stamp = new Date().toISOString()
   await remote.exec(host, `echo ${shellQuote(`${stamp} ${releaseId} ${commit}`)} >> ${shellQuote(`${targetPath}/revisions.log`)}`)
+
+  // v3.0-P5-5：native 路径也要留下「这一版装的是哪份字节」。
+  // 没有这份 manifest，回滚就只能信 current 软链，而软链证明不了目录里的包没被换过。
+  if (artifactDigest) {
+    const artifactName = artifactPath ? String(artifactPath).split(/[\\/]/).filter(Boolean).pop() : ''
+    const manifest = {
+      version: 1,
+      mode: 'native',
+      releaseId,
+      previous,
+      target: { name: target.name || '', path: targetPath, host },
+      artifact: { path: artifactName ? `${dir}/${artifactName}` : '', name: artifactName, digest: artifactDigest, commit },
+      activatedAt: stamp,
+    }
+    await remote.exec(host, `printf '%s\\n' ${shellQuote(JSON.stringify(manifest))} > ${shellQuote(`${dir}/.dsh-manifest.json`)}`)
+  }
 
   const restarted = await restartTarget({ remote, host, target, onLog })
   const health = await healthCheck({ remote, host, target, onLog })
@@ -200,6 +271,7 @@ export async function deployOne({
     health,
     cleaned,
     activated_at: stamp,
+    artifactDigest,
     error: '',
     code: '',
   }
@@ -245,6 +317,7 @@ export async function deployRelease({
   targetName = '',
   host = '',
   artifactPath = '',
+  artifactDigest = '',
   releaseId,
   keep = 5,
   commit = '',
@@ -286,7 +359,7 @@ export async function deployRelease({
     }
     logLine(onLog, `[${current}] deploy ${release} 开始（${index + 1}/${hosts.length}，batch ${batch}）`)
     try {
-      results.push(await deployOne({ remote, target, host: current, artifactPath, releaseId: release, keep: keepCount, commit, batch, onLog }))
+      results.push(await deployOne({ remote, target, host: current, artifactPath, artifactDigest, releaseId: release, keep: keepCount, commit, batch, onLog }))
     } catch (error) {
       const failed = failureResult(current, error, batch)
       results.push(failed)
@@ -363,10 +436,14 @@ export async function rollbackOne({ remote, target, host, releaseId, commit, onL
       imageReference: '', containers: [], instances: [],
       previous: wanted, previousImage: '', pids: [], activatedAt: stamp,
     }
-    const recorded = await remote.exec(host, `cat ${shellQuote(`${dir}/.dsh-manifest.json`)} 2>/dev/null || true`)
+    // v3.0-P5-5：容器回滚同样只认 manifest 里的 digest。镜像字节本身由 registry 按 digest 寻址，
+    // 但「回滚到哪一版」这件事只能从那一版的 manifest 读，不能从 tag 或本次参数推。
+    let artifactDigest = ''
     try {
+      const recorded = await remote.exec(host, `cat ${shellQuote(`${dir}/.dsh-manifest.json`)} 2>/dev/null || true`)
       const artifact = JSON.parse(String(recorded?.stdout || '').trim() || '{}').artifact || {}
       handle.previousImage = String(artifact.reference || (artifact.image && artifact.digest ? `${artifact.image}@${artifact.digest}` : ''))
+      artifactDigest = String(artifact.digest || '')
     } catch { /* 老 release 没有 manifest：revert 会用 CONTAINER_IMAGE_INVALID 明说，而不是按 tag 猜 */ }
     const reverted = await actuator.revert(handle, { drainSec: target.instances?.drain?.seconds || 0 })
     logLine(onLog, `[${host}] current -> releases/${wanted}（回滚）`)
@@ -389,14 +466,39 @@ export async function rollbackOne({ remote, target, host, releaseId, commit, onL
       previous: '',
       cleaned: false,
       activated_at: stamp,
+      artifactDigest,
       instances: (reverted?.instances || handle.instances || []),
       error: '',
       code: '',
     }
   }
+  // v3.0-P5-5：切软链之前先核对字节。native 的 release 目录里躺着一份制品，
+  // 它是回滚现场唯一的实体；这份实体被换掉而软链照切，就是「回滚到一个别的版本」。
+  //
+  // 核对是「能核对就必须对得上」，不是「必须有 manifest」：v3.0 之前的 release 目录里
+  // 没有 .dsh-manifest.json，而那些发布正是此刻最可能被回滚到的东西。没有 manifest 时退回
+  // 库里那一行的 digest，仍然拿磁盘字节重算一遍；两处都没有记录才放过 —— 那种情况下
+  // 拦住回滚只会让人在事故里手工 ln -sfn，反而更危险。记录在、字节对不上，就一律拦。
+  const expectedDigest = String(target.digest || '')
+  let manifestDigest = ''
+  let manifestPath = ''
+  try {
+    const target0 = await readReleaseDigest({ remote, host, releaseDir: dir })
+    manifestDigest = target0.digest
+    manifestPath = String(target0.path || '')
+  } catch (error) {
+    if (error.code !== 'RELEASE_NOT_FOUND' && error.code !== 'MANIFEST_INVALID') throw error
+    logLine(onLog, `[${host}] releases/${wanted} 没有可用的 manifest（${error.code}），改用账本里的 digest 核对`)
+  }
+  const pinnedDigest = expectedDigest || manifestDigest
+  if (pinnedDigest) {
+    // manifest 里没有绝对路径时，按 actuator.stage 的落盘约定推回来：<release dir>/<原文件名>。
+    const stagedName = String(manifestPath || '').split(/[\\/]/).filter(Boolean).pop() || ''
+    await verifyRemoteArtifact({ remote, host, artifactPath: `${dir}/${stagedName}`, digest: pinnedDigest })
+  }
   await remote.exec(host, `ln -sfn ${shellQuote(`releases/${wanted}`)} ${shellQuote(currentLink)}`)
   await remote.exec(host, `echo ${shellQuote(`${stamp} rollback:${wanted} ${commit}`)} >> ${shellQuote(`${targetPath}/revisions.log`)}`)
-  logLine(onLog, `[${host}] current -> releases/${wanted}（回滚）`)
+  logLine(onLog, `[${host}] current -> releases/${wanted}（回滚，${pinnedDigest ? pinnedDigest.slice(0, 19) + '… 已核对' : '无 digest 记录，跳过核对'}）`)
   const restarted = await restartTarget({ remote, host, target, onLog })
   const health = await healthCheck({ remote, host, target, onLog })
   if (health === 'failed') {
@@ -417,6 +519,7 @@ export async function rollbackOne({ remote, target, host, releaseId, commit, onL
     previous: '',
     cleaned: false,
     activated_at: stamp,
+    artifactDigest: pinnedDigest,
     error: '',
     code: '',
   }

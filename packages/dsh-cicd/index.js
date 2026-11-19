@@ -25,7 +25,7 @@ import { parsePipe, planPipeline, interpolate, matchArtifacts, isHostSelector, p
 import { createStore, DEFAULT_WORK_DIR } from './lib/store.js'
 import { runPipeline, makeRunId } from './lib/runner.js'
 import { createRemote } from './lib/remote.js'
-import { deployRelease, rollbackRelease } from './lib/deploy.js'
+import { deployRelease, rollbackRelease, readReleaseDigest, verifyRemoteArtifact } from './lib/deploy.js'
 import { deployRelease as strategyDeployRelease } from './lib/strategy.js'
 import { dispatchNotifications } from './lib/notify.js'
 import { readGitMeta, fetchQuiet, cloneRepo, isGitRepo, fetchAsync, remoteHead, pullFastForward, remoteBranches, commitDate } from './lib/git.js'
@@ -46,6 +46,10 @@ import {
 } from './lib/packages.js'
 import { createApprovalGate } from './lib/approval.js'
 import { normalizeEnvironments, promotionPath, isProtected, requiresApproval } from './lib/environments.js'
+import {
+  PROMOTION_ERRORS, promotionError, envRequiresPromotion, findSourceRelease,
+  currentPointer, isPromoted, listPromotions, recordPromotion, promotionView,
+} from './lib/promotions.js'
 import { createRbac } from './lib/rbac.js'
 import { createAuth, SESSION_COOKIE, ROLES, readSessionId } from './lib/auth.js'
 import { createAudit } from './lib/audit.js'
@@ -578,6 +582,42 @@ function createRuntime(ctx, config) {
     throw Object.assign(new Error(`target “${name}” 不在任何项目的 pipe 里`), { code: 'TARGET_NOT_FOUND' })
   }
 
+  /**
+   * 一个 target 真正住在哪个项目（v3.0-P5-5）。
+   *
+   * 同名 target 可以同时存在于多个项目的 pipe 里，而调用方传进来的 project 只是它自己
+   * 选中的那一个。权限、晋级、以及账本都该按"target 住的那个项目"算，否则
+   * 「在 A 里当 owner」就能改 B 的生产环境。
+   */
+  function targetProject(project, targetName) {
+    if (!targetName) return project
+    try {
+      const pipe = readPipe(project)
+      if (pipe.targets && pipe.targets[targetName]) return project
+    } catch { /* 读不出来就按调用方给的算 */ }
+    for (const candidate of options.projects) {
+      let pipe
+      try { pipe = readPipe(candidate) } catch { continue }
+      if (pipe.targets && pipe.targets[targetName]) return candidate
+    }
+    return project
+  }
+
+  // 宿主（host 清单）定义的环境名。项目自己的 pipe 里没有这个 target，环境依然是真实存在的：
+  // 「这份字节被验过」是环境的事实，不是某个 pipe 的事实。
+  function hostEnvironmentNames(catalogSnapshot) {
+    const names = (catalogSnapshot?.envs || []).map((item) => item?.name).filter(Boolean)
+    return normalizeEnvironments(Object.fromEntries(names.map((name) => [name, { hosts: [] }])))
+  }
+
+  // prod 是"约定即存在"的环境：不在任何 pipe 里也仍是受保护环境（envRequiresPromotion 这么认）。
+  // 补齐它，否则"直接从构建进入 prod"会在第一道关口被一句"不在 pipe 里"挡掉。
+  function promotionOnlyEnvironment(names) {
+    const list = new Set(names.map((name) => String(name || '').toLowerCase()))
+    if (list.has('prod')) return {}
+    return normalizeEnvironments({ prod: { hosts: [] } })
+  }
+
   function markPreviousSuperseded(targetName, host) {
     const previous = store.activeRelease({ target: targetName, host })
     if (previous && previous.id) {
@@ -586,12 +626,24 @@ function createRuntime(ctx, config) {
     return previous
   }
 
-  function recordArtifact(runId, filePath) {
+  /**
+   * 把这次发布要送出去的字节收进 CAS，并记一行 artifacts。
+   *
+   * 部署与晋级必须指向同一份字节：只有内容地址能同时说清"发的是哪个包"和"验过的是哪个包"。
+   * 收不进去不算致命（老路径照样能发），但会留下一条 warn —— 受保护环境随后会因为
+   * "digest 不在 CAS 里"被闸门拦下，那时这条日志就是唯一的线索。
+   */
+  async function recordArtifact(runId, filePath) {
     try {
       const stat = statSync(filePath)
       if (!stat.isFile()) return null
       const sha256 = createHash('sha256').update(readFileSync(filePath)).digest('hex')
       store.appendArtifact({ run_id: runId, path: filePath, bytes: stat.size, sha256 })
+      try {
+        const putRes = await artifactStore.putFile(filePath, { meta: { projectId: '', runId, sourcePath: filePath } })
+      } catch (error) {
+        artifactWarnings.push(`制品 ${filePath} 收进 CAS 失败（${error?.code || 'UNKNOWN'}）：${error?.message || ''}`)
+      }
       return { path: filePath, bytes: stat.size, sha256 }
     } catch { return null }
   }
@@ -599,6 +651,11 @@ function createRuntime(ctx, config) {
   // ---- v0.5：env/group/tag 选择器展开 + 生产护栏 + 部署锁 --------------------------------
   // v3.0-P0：`deployLocks` 从进程内 Map 换成 SQLite 表（lib/locks.js）。原来的 Map 在
   // 进程重启或多副本下完全失效，是「两个人同时点部署 prod 都成功」的直接原因。
+  // runtime 对象在 createRuntime 里一次性构造，而制品闸门挂在它上面（见 runtime.artifactGate）；
+  // 部署函数在 runtime 之前就定义了，所以走一个运行期才填的转发器，而不是把闸门逻辑抄第二遍。
+  const runtimeSeen = { gate: async () => { throw Object.assign(new Error('制品闸门尚未就绪'), { code: 'GATE_NOT_READY' }) } }
+  // CAS 收件失败不拦发布，但必须留痕（受保护环境的闸门随后会以 ARTIFACT_NOT_PROMOTED / CORRUPTED 拒绝）。
+  const artifactWarnings = []
   const CATALOG_TTL_MS = 5000
   let catalogCache = null
   let catalogAt = 0
@@ -848,7 +905,7 @@ function createRuntime(ctx, config) {
         const files = matchArtifacts(paths, walkFiles(project.path))
         let bytes = 0
         for (const rel of files) {
-          const saved = recordArtifact(runId, join(project.path, rel))
+          const saved = await recordArtifact(runId, join(project.path, rel))
           if (saved) bytes += saved.bytes
         }
         try {
@@ -925,7 +982,30 @@ function createRuntime(ctx, config) {
     if (!artifactPath) {
       throw Object.assign(new Error(`stage 的 deploy.artifacts 没有匹配到任何文件（target ${targetName}）`), { code: 'ARTIFACT_NOT_FOUND' })
     }
-    const digest = recordArtifact(runId, artifactPath)
+    const digest = await recordArtifact(runId, artifactPath)
+        const artifactDigest = digest?.digest || (digest?.sha256 ? 'sha256:' + digest.sha256 : '')
+    // v3.0-P5-5：受保护环境只接受被晋级过的那份字节。判据按 **每台主机自己的 env** 取，
+    // 而且用的是 target 所属项目（不是调用方自报的 project），所以"拿 A 项目触发 B 项目的
+    // 同名 prod target"这条绕过路径在这里断掉。必须在任何主机被改动之前跑完。
+    const hosting = targetProject(project, targetName)
+    const hostingEnvs = normalizeEnvironments(readPipe(hosting).targets)
+    const protectedEnv = deployTarget.hosts.map((name) => expanded.meta.get(name)?.env || '').find((name) => envRequiresPromotion(hostingEnvs, name)) || ''
+    // 收件失败的那几条必须在上闸门之前露出来：闸门只说"digest 不在 CAS"，原因在更早一步。
+    while (artifactWarnings.length > 0) log?.(artifactWarnings.shift())
+    if (protectedEnv) {
+      try {
+        await runtimeSeen.gate({
+          projectId: hosting.id,
+          env: protectedEnv,
+          digest: artifactDigest,
+        })
+      } catch (error) {
+        // 台账里要能看见「为什么这次发布没落到 prod」，否则闸门在运维眼里就是莫名失败。
+        if (log) log('制品闸门拦下 [受保护环境 ' + protectedEnv + '] ' + (error?.code || 'UNKNOWN') + '：' + (error?.message || ''))
+        throw error
+      }
+      log?.('制品闸门：受保护环境 ' + protectedEnv + ' 只接受已晋级的 digest ' + (artifactDigest || '(缺失)'))
+    }
     // v3.0-P3：声明了 instances 的 target 走四阶段事务（stage → activate → verify → commit/abort）。
     // 这是「先全部解包好、再统一切流」与「一台机器 N 个端口各一个进程」唯一诚实的实现路径：
     // 老的 deploy.js 逐台 ln -sfn + restart，第 2 台失败时第 1 台已经在新版本上服务了。
@@ -981,6 +1061,7 @@ function createRuntime(ctx, config) {
           target: deployTarget,
           targetName,
           artifactPath,
+          artifactDigest,
           releaseId: runId,
           keep: step.deploy?.keep || target.keep || 5,
           commit,
@@ -1021,7 +1102,8 @@ function createRuntime(ctx, config) {
         manifest_path: host.releaseDir,
         revisions_offset: 0,
         previous: host.previous || publicReleaseId(previous) || '',
-        artifact_digest: digest?.digest || (digest?.sha256 ? `sha256:${digest.sha256}` : ''),
+        artifact_digest: artifactDigest,
+        version: '',
         mode: deployTarget.mode || 'native',
         strategy: deployTarget.strategy?.type || '',
         instances: host.instances || [],
@@ -1067,6 +1149,19 @@ function createRuntime(ctx, config) {
    */
   async function deployStepTransaction({ project, step, runId, commit, log, targetName, target, artifactPath, digest, envOf }) {
     const operator = step.operator || ''
+    // v3.0-P5-5：事务路径同样在改动任何主机之前过制品闸门 —— 两条路径必须给出一致的答案，
+    // 否则「加不加 instances」就变成了绕过晋级校验的开关。
+    const hosting = targetProject(project, targetName)
+    const hostingEnvs = normalizeEnvironments(readPipe(hosting).targets)
+    const targetEnv = typeof envOf === 'function' ? (target.hosts.map((name) => envOf(name)).find((name) => envRequiresPromotion(hostingEnvs, name)) || '') : ''
+    if (targetEnv) {
+      await runtimeSeen.gate({
+        projectId: hosting.id,
+        env: targetEnv,
+        digest: digest?.digest || (digest?.sha256 ? 'sha256:' + digest.sha256 : ''),
+      })
+      log?.('制品闸门：受保护环境 ' + targetEnv + ' 只接受已晋级的 digest')
+    }
     const result = await deployTransaction({
       remote: remote(),
       project,
@@ -1113,6 +1208,7 @@ function createRuntime(ctx, config) {
         commit,
         artifact_sha256: digest?.sha256 || '',
         artifact_digest: result.artifactDigest || digest?.digest || '',
+        version: result.version || '',
         mode: target.mode || 'native',
         strategy: result.strategy?.type || '',
         instances: host.instances || [],
@@ -1399,7 +1495,7 @@ function createRuntime(ctx, config) {
         for (const stageInfo of run.stages) {
           for (const step of stageInfo.steps) {
             if (!Array.isArray(step.artifact) || step.artifact.length === 0) continue
-            for (const file of matchArtifacts(step.artifact, walkFiles(project.path))) recordArtifact(run.runId, file)
+            for (const file of matchArtifacts(step.artifact, walkFiles(project.path))) await recordArtifact(run.runId, file)
           }
         }
       }
@@ -1695,7 +1791,7 @@ function createRuntime(ctx, config) {
     })
     : null
 
-  return {
+  const runtime = {
     // ---------------------------------------------------------------------------------------
     // v3.0-P0：身份、审计、部署锁——三个新内核的对外面
     // ---------------------------------------------------------------------------------------
@@ -1706,6 +1802,28 @@ function createRuntime(ctx, config) {
       } catch (error) {
         return { actor: null, error: { code: error.code || 'AUTH_INVALID', message: error.message || '认证失败' } }
       }
+    },
+    /**
+     * 某个 actor 在某个项目里的角色（v3.0-P5-5）。
+     *
+     * authorize() 判的是「调用方选中的那个项目」，但 target 可以住在别的项目里；
+     * 那种情况下权限必须按宿主项目重新取角色——与 auth.roleOf 同一套规则
+     * （项目级优先、否则全局 *），bootstrap 主体沿用 auth 给的 owner。
+     */
+    /** 一个 target 真正住在哪个项目（v3.0-P5-5）——路由层据此判权限。 */
+    projectOfTarget(targetName, fallback = '') {
+      if (!targetName) return fallback
+      try {
+        const project = pickProject(options, fallback)
+        const pipe = readPipe(project)
+        if (pipe.targets && pipe.targets[targetName]) return project.id
+      } catch { /* 落回全局查找 */ }
+      try { return findTargetAnywhere(targetName).project.id } catch { return fallback }
+    },
+    roleForProject(actor, projectId) {
+      if (!actor || !actor.id) return ''
+      if (actor.authMethod === 'bootstrap') return actor.role || 'owner'
+      return auth.roleOf(actor.id, String(projectId || ''))
     },
     /** 写审计。调用方一律 try/catch 包住——审计失败不能改变业务结果。 */
     auditRecord(event) {
@@ -2473,6 +2591,121 @@ function createRuntime(ctx, config) {
       const path = promotionPath(envs, fromName)
       return { project: project.id, environments: Object.values(envs).sort((a, b) => a.order - b.order), promotionPath: path }
     },
+    // ---------------------------------------------------------------------------------------
+    // v3.0-P5-5：环境晋级（promotion）—— 跨环境只移指针，字节永远只有 CAS 里那一份
+    // ---------------------------------------------------------------------------------------
+    /**
+     * 把"某份已经被验证过的字节"晋级到下一个环境。
+     *
+     * 必须能指名来源：fromEnv 或 releaseId 二选一。刻意不支持"自动取 staging 最新"——
+     * 那种默认值会让一次手滑的 POST 把某个陌生 digest 送进生产，而调用方以为自己什么都没选。
+     */
+    async promote(args = {}) {
+      const project = pickProject(options, args.project || '')
+      const pipe = readPipe(project)
+      const envs = normalizeEnvironments(pipe.targets)
+      // 环境不一定在项目自己的 pipe 里：宿主（host 清单 / 分组）定义的环境对它同样成立，
+      // 而 prod 更是默认存在的 —— 不这么算，"直接从构建进入 prod"在第一道关口就被挡掉。
+      let hostEnvs = {}
+      try { hostEnvs = hostEnvironmentNames(await catalog()) } catch { /* 主机清单取不到时只按 pipe 判 */ }
+      // prod 是"约定即存在"的环境（envRequiresPromotion 也这么认），这里必须一致。
+      const known = { ...promotionOnlyEnvironment([...Object.keys(hostEnvs), ...Object.keys(envs)]), ...hostEnvs, ...envs }
+      const toEnv = String(args.toEnv || args.env || project.defaultTarget || '')
+      if (!toEnv) throw promotionError(PROMOTION_ERRORS.PATH_INVALID, '必须指定要晋级到的环境 toEnv')
+      if (!known[toEnv]) throw promotionError(PROMOTION_ERRORS.PATH_INVALID, `环境 ${toEnv} 不在项目 ${project.id} 的 pipe 里`)
+      const fromEnv = String(args.fromEnv || '')
+      const releaseId = String(args.releaseId || '')
+      if (!fromEnv && !releaseId) {
+        throw promotionError(PROMOTION_ERRORS.SOURCE_REQUIRED, '晋级必须指名来源：给 fromEnv（源环境）或 releaseId（源发布）')
+      }
+      // 源环境只是「这份字节上一次被验证过的那个地方」，字节本来就在 CAS 里，
+      // 所以缺了中间那一级也只是少一次人工确认，不构成新的风险：判据始终是 digest 恒等，
+      // 而不是路径上摆着几个环境名。fromEnv 不在 pipe 里时按「直接从构建进入 toEnv」处理。
+      if (fromEnv && known[fromEnv]) {
+        if (!promotionPath(known, fromEnv).includes(toEnv)) {
+          throw promotionError(PROMOTION_ERRORS.PATH_INVALID, `晋级路径不允许 ${fromEnv} -> ${toEnv}（可选：${promotionPath(known, fromEnv).join(' / ') || '无'}）`)
+        }
+      }
+      const source = findSourceRelease(store.db, { projectId: project.id, fromEnv, releaseId, target: String(args.target || '') })
+      if (!source) {
+        throw promotionError(PROMOTION_ERRORS.SOURCE_NOT_FOUND, `没有找到${fromEnv ? `环境 ${fromEnv} 里` : ''}${releaseId ? `发布 ${releaseId}` : ''}的活跃发布`)
+      }
+      const digest = normalizeDigest(source.artifact_digest || '')
+      if (!digest) throw promotionError(PROMOTION_ERRORS.DIGEST_REQUIRED, `发布 ${source.id} 没有记录 artifact digest，不能晋级`)
+      if (args.digest && normalizeDigest(args.digest) !== digest) {
+        throw promotionError(PROMOTION_ERRORS.NOT_PROMOTED, `声明的 digest ${normalizeDigest(args.digest)} 与源发布 ${source.id} 的 ${digest} 不同`, { expected: digest })
+      }
+      // 字节必须真的在这儿并且没被改：digest 存在但磁盘上少一个字节，和不存在一样危险。
+      const verified = await artifactStore.verify(digest)
+      if (!verified.ok) {
+        throw artifactError('ARTIFACT_CORRUPTED', `digest ${digest} 的字节与内容地址不符（实际 ${verified.actual || '读取失败'}）`, { digest, actual: verified.actual })
+      }
+      const existing = isPromoted(store.db, { projectId: project.id, env: toEnv, digest })
+      if (existing) {
+        return { ok: true, promotionId: existing.id, project: project.id, digest, fromEnv: existing.from_env, toEnv, env: toEnv, created: false, promotedAt: existing.created_at }
+      }
+      const now = new Date().toISOString()
+      const id = 'promo-' + createHash('sha256').update(project.id + '|' + toEnv + '|' + digest + '|' + now + '|' + randomBytes(4).toString('hex')).digest('hex').slice(0, 20)
+      const row = recordPromotion(store.db, {
+        id, projectId: project.id, digest, fromEnv: source.env || fromEnv, toEnv,
+        target: source.target || '', host: source.host || '', releaseId: source.id,
+        runId: source.run_id || '', approvedBy: String(args.actor || ''), approvedAt: args.approvalId ? now : '',
+        createdAt: now,
+      })
+      try {
+        audit.record({
+          action: 'artifact.promote', actorId: String(args.actor || ''), authMethod: String(args.authMethod || ''),
+          resourceType: 'artifact', resourceId: digest, projectId: project.id, result: 'allow',
+          reason: (row.from_env || '?') + ' -> ' + toEnv + ' (release ' + source.id + ')',
+          sourceIp: '', requestId: '',
+        })
+      } catch { /* 审计失败不改变晋级结果 */ }
+      return { ok: true, promotionId: row.id, project: project.id, digest, fromEnv: row.from_env, toEnv, env: toEnv, created: true, promotedAt: row.created_at, releaseId: row.release_id }
+    },
+    promotions(args = {}) {
+      const project = pickProject(options, args.project || '')
+      if (args.action === 'current') {
+        const env = String(args.env || args.toEnv || project.defaultTarget || '')
+        const pointer = currentPointer(store.db, { projectId: project.id, env })
+        return { ok: true, project: project.id, env, digest: pointer ? pointer.digest : '', promotionId: pointer ? pointer.id : '', promotedAt: pointer ? pointer.created_at : '' }
+      }
+      const pipe = readPipe(project)
+      const envs = normalizeEnvironments(pipe.targets)
+      const env = String(args.env || '')
+      return {
+        ok: true,
+        project: project.id,
+        env,
+        promotions: listPromotions(store.db, { projectId: project.id, env, limit: Number(args.limit) || 50 }).map((row) => ({
+          id: row.id, digest: row.digest, fromEnv: row.from_env, toEnv: row.to_env, target: row.target, host: row.host,
+          releaseId: row.release_id, approvedBy: row.approved_by, createdAt: row.created_at,
+        })),
+        environments: promotionView(store.db, { projectId: project.id, environments: envs }),
+      }
+    },
+    /**
+     * 部署闸门（v3.0-P5-5）：受保护环境只接受被晋级过的 digest，且每次部署前重新验字节。
+     *
+     * 放在主机级别的调用点上（deployStep 里按主机 env 判）而不是 executeRun 入口：
+     * 调用方可以拿自己项目的 project 名去触发别的项目的同名 target，主机级判定不依赖
+     * 调用方自报的项目，绕不过去。
+     */
+    async artifactGate({ projectId = '', env = '', digest = '', host = '' } = {}) {
+      const project = options.projects.find((item) => item.id === projectId) || null
+      if (!project) throw promotionError(PROMOTION_ERRORS.SOURCE_NOT_FOUND, '项目 ' + projectId + ' 不存在')
+      const pipe = readPipe(project)
+      const envs = normalizeEnvironments(pipe.targets)
+      if (!envRequiresPromotion(envs, env)) return { required: false, digest }
+      const isEmptyDigest = !String(digest || '').trim()
+      if (isEmptyDigest) throw promotionError(PROMOTION_ERRORS.DIGEST_REQUIRED, '部署到受保护环境 ' + env + ' 必须带 artifact digest')
+      const normal = normalizeDigest(digest)
+      const verified = await artifactStore.verify(normal)
+      if (!verified.ok) throw artifactError('ARTIFACT_CORRUPTED', 'digest ' + normal + ' 的字节与内容地址不符', { digest: normal, actual: verified.actual })
+      if (!isPromoted(store.db, { projectId, env, digest: normal })) {
+        throw promotionError(PROMOTION_ERRORS.NOT_PROMOTED, 'digest ' + normal + ' 没有被晋级到 ' + env + '（先用 cicd_promotions promote 晋级）', { digest: normal, env, host })
+      }
+      return { required: true, digest: normal }
+    },
     // V2-M5：RBAC（server 模式三角色 + token TTL + 审计）
     rbac(args = {}) {
       const { user = '', role = '', projects = ['*'], ttlSec = 0, action = '' } = args
@@ -2562,6 +2795,16 @@ function createRuntime(ctx, config) {
       }
       const resolution = await expandTarget(found.targetName, found.target)
       if (resolution.prodHosts.length > 0 && !confirmProd) throw prodGuardError(resolution.prodHosts, '回滚')
+      // v3.0-P5-5：回滚同样是「把一份字节放回生产」，所以它也要过的门不比其他门松：
+      // 被回滚到的那份 digest 必须曾被晋级到该环境，且磁盘上的字节现在仍然对得上。
+      // 回滚常常发生在事故里，正是字节最可能已经被就地改过的时刻 —— 恰恰是必须验的那一次。
+      const hostingEnvs = normalizeEnvironments(readPipe(found.project).targets)
+      const rollbackEnv = resolution.hosts.map((name) => resolution.meta.get(name)?.env || '').find((name) => envRequiresPromotion(hostingEnvs, name)) || ''
+      if (rollbackEnv) {
+        const targetRow = releaseId ? store.release(`${releaseId}@${host || resolution.hosts[0]}`) : null
+        const rollbackDigest = normalizeDigest(targetRow?.artifactDigest || targetRow?.artifact_digest || '')
+        if (rollbackDigest) await runtime.artifactGate({ projectId: found.project.id, env: rollbackEnv, digest: rollbackDigest, host })
+      }
       const result = await rollbackRelease({
         remote: remote(),
         target: { ...found.target, hosts: resolution.hosts },
@@ -2573,7 +2816,9 @@ function createRuntime(ctx, config) {
       for (const item of result.hosts.filter((entry) => entry.ok)) {
         markPreviousSuperseded(found.targetName, item.host)
         const deployed = store.release(`${item.releaseId}@${item.host}`)
-        const artifactDigest = deployed?.artifactDigest || deployed?.artifact_digest || ''
+        // 账本里的 digest 必须以主机上实际钉住的那份为准（rollbackOne 从 .dsh-manifest.json 读出来），
+        // 只有旧 release 没有 manifest 时才退回库里那一行。
+        const artifactDigest = item.artifactDigest || deployed?.artifactDigest || deployed?.artifact_digest || ''
         store.appendRelease({
           id: `${item.releaseId}@${item.host}`,
           project_id: found.project.id,
@@ -2855,6 +3100,11 @@ function createRuntime(ctx, config) {
       store.close()
     },
   }
+  // 部署函数早于 runtime 定义，而制品闸门挂在 runtime 上：这里把那条缝接起来，
+  // 免得在 deployStep 里把闸门逻辑抄第二遍（两份实现迟早给出两个答案）。
+  runtimeSeen.gate = (args) => runtime.artifactGate(args)
+  return runtime
+
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3837,7 +4087,11 @@ function registerTools(ctx, runtime) {
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['list', 'upload', 'tag', 'verify', 'gc', 'stats', 'publish', 'packages', 'catalog'], description: '默认 list；publish=登记一个坐标（Maven/npm/PyPI），packages=已登记坐标清单，catalog=各生态仓库视图' },
+        action: { type: 'string', enum: ['list', 'upload', 'tag', 'verify', 'gc', 'stats', 'publish', 'packages', 'catalog', 'promote'], description: '默认 list；publish=登记一个坐标（Maven/npm/PyPI），packages=已登记坐标清单，catalog=各生态仓库视图，promote=晋级到下一个环境（等价于 cicd_promotions）' },
+        toEnv: { type: 'string', description: 'action=promote：目标环境名（如 prod）' },
+        fromEnv: { type: 'string', description: 'action=promote：源环境名（与 releaseId 二选一）' },
+        releaseId: { type: 'string', description: 'action=promote：源发布 id（与 fromEnv 二选一）' },
+        target: { type: 'string', description: 'action=promote：限定某个 target 的发布' },
         project: PROJECT_PARAM,
         path: { type: 'string', description: 'action=upload 时必填：构建机上的文件路径（不接受目录）' },
         digest: { type: 'string', description: 'sha256:<64 hex>；upload 时作为校验值，tag/verify/publish 时作为目标' },
@@ -3883,6 +4137,10 @@ function registerTools(ctx, runtime) {
       },
       render(_args, value) {
         // publish / packages / catalog 三种形态各自有话说，排在前面的 digest 分支会抢走它们。
+        // promote 的返回值也带 created，且没有 ecosystem——必须先判掉，否则会被当成 publish。
+        if (value.created !== undefined && !value.ecosystem) {
+          return textBlocks(`已晋级 ${value.digest}：${value.fromEnv || '?'} → ${value.toEnv}${value.created ? '' : '（该环境此前已晋级过这份 digest，未重复写入）'}`)
+        }
         if (value.ecosystem && value.created !== undefined) {
           const label = value.scope ? `${value.scope}/${value.name}` : value.name
           return textBlocks(`已登记 ${value.ecosystem}：${label}@${value.version} → ${value.digest}${value.created ? '' : '（坐标已存在且指向同一份字节，未重复写入）'}`)
@@ -3914,6 +4172,12 @@ function registerTools(ctx, runtime) {
       },
     },
     async execute(args = {}) {
+      if ((args.action || '') === 'promote') {
+        return runtime.promote({
+          project: args.project || '', toEnv: args.toEnv || '', fromEnv: args.fromEnv || '',
+          releaseId: args.releaseId || '', target: args.target || '', digest: args.digest || '',
+        })
+      }
       return runtime.artifacts({
         action: args.action || 'list',
         project: args.project || '', path: args.path || '', digest: args.digest || '',
@@ -3926,6 +4190,71 @@ function registerTools(ctx, runtime) {
     },
   })
 
+
+  // v3.0-P5-5：环境晋级。跨环境只写一行记录 + 移指针，字节永远只有 CAS 里那一份。
+  register({
+    name: 'cicd_promotions',
+    description: '环境晋级（promotion）：把某个环境里验证过的 digest 晋级到下一个环境，只移指针、不复制字节。受保护环境（prod）的部署只接受被晋级过的 digest，部署与回滚前都会重验字节。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'promote', 'current'], description: '默认 list（历史 + 各环境指针）；promote=晋级；current=只看某环境当前指针' },
+        project: PROJECT_PARAM,
+        toEnv: { type: 'string', description: 'action=promote: 目标环境名（如 prod）' },
+        fromEnv: { type: 'string', description: 'action=promote: 源环境名（与 releaseId 二选一，必须给一个）' },
+        releaseId: { type: 'string', description: 'action=promote: 源发布 id（与 fromEnv 二选一）' },
+        target: { type: 'string', description: 'action=promote: 限定某个 target 的发布' },
+        digest: { type: 'string', description: 'action=promote: 断言要晋级的 digest；与源发布记录不一致时拒绝（ARTIFACT_NOT_PROMOTED）' },
+        env: { type: 'string', description: 'action=list/current: 只看某个环境' },
+        limit: { type: 'number', description: 'action=list: 最多返回多少条' },
+      },
+      required: [],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          project: { type: 'string' },
+          digest: { type: 'string' },
+          fromEnv: { type: 'string' },
+          toEnv: { type: 'string' },
+          promotionId: { type: 'string' },
+          created: { type: 'boolean' },
+          promotions: { type: 'array', items: { type: 'object' } },
+          environments: { type: 'array', items: { type: 'object' } },
+        },
+      },
+      render(_args, value) {
+        if (value.created !== undefined) {
+          return textBlocks('已晋级 ' + value.digest + ': ' + (value.fromEnv || '?') + ' -> ' + value.toEnv + (value.created ? '' : '（这份 digest 此前已在该环境晋级过，未重复写入）'))
+        }
+        const rows = value.promotions || []
+        const envs = value.environments || []
+        if (rows.length === 0 && envs.length === 0) {
+          return textBlocks(value.digest ? value.env + ' 当前指针: ' + value.digest + '（' + (value.promotedAt || '') + '）' : (value.env || '') + ' 还没有任何晋级记录')
+        }
+        const lines = []
+        for (const env of envs) {
+          lines.push(env.name.padEnd(8) + ' ' + (env.protected ? '[protected] ' : '') + (env.digest || '（空）') + (env.promotedAt ? '  ' + env.promotedAt : ''))
+        }
+        if (rows.length > 0) {
+          lines.push('最近晋级 ' + rows.length + ' 条:')
+          for (const row of rows) lines.push('- ' + row.createdAt + ' ' + (row.fromEnv || '?') + ' -> ' + row.toEnv + ' ' + row.digest + (row.releaseId ? ' (' + row.releaseId + ')' : ''))
+        }
+        return textBlocks(lines.length ? lines.join('\n') : '（没有晋级记录）')
+      },
+    },
+    async execute(args = {}) {
+      if ((args.action || '') === 'promote') {
+        return runtime.promote({
+          project: args.project || '', toEnv: args.toEnv || '', fromEnv: args.fromEnv || '',
+          releaseId: args.releaseId || '', target: args.target || '', digest: args.digest || '',
+        })
+      }
+      return runtime.promotions({ project: args.project || '', env: args.env || '', limit: args.limit, action: args.action || '' })
+    },
+  })
 
   register({
     name: 'cicd_registry',
@@ -4088,6 +4417,11 @@ function errorStatus(error) {
   if (code === 'PACKAGE_NOT_FOUND') return 404
   if (code === 'PACKAGE_INVALID') return 400
   if (code === 'PACKAGE_DUPLICATE' || code === 'PACKAGE_IMMUTABLE') return 409
+  // v3.0-P5-5：晋级。"没指名来源/路径不对" 是 400；"这份字节没被晋级过" 是 409 ——
+  // 调用方要补一次 promote，盲目重试同一个请求永远还是这个答案。
+  if (code === 'PROMOTION_SOURCE_REQUIRED' || code === 'PROMOTION_PATH_INVALID' || code === 'PROMOTION_DIGEST_REQUIRED') return 400
+  if (code === 'PROMOTION_SOURCE_NOT_FOUND') return 404
+  if (code === 'ARTIFACT_NOT_PROMOTED') return 409
   if (code.startsWith('PIPE_') || code === 'COMMAND_INVALID') return 400
   return 500
 }
@@ -4160,6 +4494,39 @@ function authorize(request, params, { runtime, action, resource = {}, confirm = 
   }
   const actor = { ...bundle.actor, sourceIp: sourceIpOf(request), requestId: requestIdOf(request) }
   const target = { type: resource.type || 'project', id: resource.id || '', projectId: resource.projectId || '', env: resource.env || '', protected: Boolean(resource.protected) }
+  // v3.0-P5-5：被操作的对象如果是别的项目的 target（同名 target 可以在多个项目里存在），
+  // 权限必须按 **hosting 项目的角色** 判，而不是调用方自己选的那个项目 ——
+  // 否则「在 A 项目当 owner」就能晋级 / 回滚 B 项目定义的生产 target。
+  if (resource.hostingProjectId && resource.hostingProjectId !== target.projectId) {
+    const hostingRole = runtime.roleForProject ? runtime.roleForProject(actor, resource.hostingProjectId) : ''
+    if (!hostingRole) {
+      try {
+        runtime.auditRecord?.({
+          action: 'policy.deny', actorId: actor.id, authMethod: actor.authMethod || '', tokenId: actor.tokenId || '',
+          resourceType: target.type, resourceId: target.id, projectId: resource.hostingProjectId,
+          result: 'deny', reason: 'no_role_in_hosting_project', sourceIp: actor.sourceIp, requestId: actor.requestId,
+        })
+      } catch { /* 审计失败不改变响应 */ }
+      return json({ ok: false, error: `没有权限执行 ${action}：target 属于项目 ${resource.hostingProjectId}，而你没有该项目的角色`, code: 'POLICY_DENY', action, reason: 'no_role_in_hosting_project' }, 403)
+    }
+    const hosted = { ...target, projectId: resource.hostingProjectId }
+    const decision = can(actor, action, hosted, { role: hostingRole })
+    try {
+      runtime.auditRecord?.({
+        action: decision.allow ? `${action}.allow` : 'policy.deny',
+        actorId: actor.id, authMethod: actor.authMethod, tokenId: actor.tokenId || '',
+        resourceType: hosted.type, resourceId: hosted.id, projectId: hosted.projectId,
+        result: decision.allow ? 'allow' : 'deny',
+        reason: decision.allow ? `${decision.reason} (hosting:${resource.hostingProjectId})` : `${decision.reason} (${decision.policyId})`,
+        sourceIp: actor.sourceIp, requestId: actor.requestId,
+      })
+    } catch { /* 审计失败不改变响应 */ }
+    if (!decision.allow) {
+      return json({ ok: false, error: `没有权限执行 ${action}：${decision.reason}`, code: 'POLICY_DENY', action, reason: decision.reason, policyId: decision.policyId }, 403)
+    }
+    request.__cicdActor = actor
+    return null
+  }
   const decision = can(actor, action, target, { role: resource.role })
   try {
     runtime.auditRecord?.({
@@ -5077,6 +5444,69 @@ async function secretsResource(request, runtime) {
   } catch (error) { return errorJson(error) }
 }
 
+/**
+ * /promotions —— 环境晋级（v3.0-P5-5）。
+ *
+ * 读：viewer 就能看每个环境的指针与历史。
+ * 写：MANAGE_ENV（admin 起）。晋级到受保护环境等于把一份字节送进生产，
+ * 所以权限按 **target 所属项目** 判（hostingProjectId），而不是调用方自选的项目。
+ */
+async function promotionsResource(request, runtime) {
+  const params = queryOf(request)
+  const method = String(request?.method || 'GET').toUpperCase()
+  const body = method === 'GET' || method === 'HEAD' ? {} : await jsonBodyOf(request)
+  const project = body.project || params.get('project') || ''
+  const toEnv = body.toEnv || body.env || params.get('toEnv') || params.get('env') || ''
+  const targetName = body.target || params.get('target') || ''
+  const hosting = runtime.projectOfTarget ? runtime.projectOfTarget(targetName, project) : ''
+  if (method === 'GET' || method === 'HEAD') {
+    const guard = authorizeRead(request, params, {
+      runtime, action: ACTIONS.READ,
+      resource: { type: 'environment', id: project, projectId: project },
+    })
+    if (guard) return guard
+    try {
+      return json(await runtime.promotions({ project, env: toEnv, limit: params.get('limit') || body.limit, action: params.get('view') || body.view || '' }))
+    } catch (error) { return errorJson(error) }
+  }
+  if (method !== 'POST') return json({ ok: false, error: '只接受 GET / POST', code: 'METHOD_NOT_ALLOWED' }, 405)
+  const guard = authorize(request, params, {
+    runtime,
+    action: ACTIONS.MANAGE_ENV,
+    confirm: true,
+    resource: {
+      type: 'environment',
+      id: project + ':' + (toEnv || ''),
+      projectId: project,
+      hostingProjectId: hosting && hosting !== project ? hosting : '',
+    },
+  })
+  if (guard) return guard
+  try {
+    const result = await runtime.promote({
+      project, toEnv, fromEnv: body.fromEnv || params.get('fromEnv') || '',
+      releaseId: body.releaseId || params.get('releaseId') || '',
+      target: targetName,
+      digest: body.digest || params.get('digest') || '',
+      actor: request.__cicdActor ? request.__cicdActor.id : '',
+      authMethod: request.__cicdActor ? request.__cicdActor.authMethod : '',
+      approvalId: body.approvalId || params.get('approvalId') || '',
+    })
+    if (result.created) {
+      try {
+        runtime.auditRecord?.({
+          action: 'promotion.created', actorId: request.__cicdActor ? request.__cicdActor.id : '',
+          authMethod: request.__cicdActor ? request.__cicdActor.authMethod : '',
+          resourceType: 'artifact', resourceId: result.digest, projectId: result.project,
+          result: 'allow', reason: result.fromEnv + ' -> ' + result.toEnv,
+          sourceIp: sourceIpOf(request), requestId: requestIdOf(request),
+        })
+      } catch { /* best effort */ }
+    }
+    return json(result)
+  } catch (error) { return errorJson(error) }
+}
+
 // V2-M4：environments 路由——/environments 列出环境（dev/staging/prod）与晋升路径。
 async function environmentsResource(request, runtime) {
   if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
@@ -5310,6 +5740,8 @@ function registerHttpRoutes(ctx, runtime) {
     { kind: 'exact', path: `${ROUTE_PREFIX}/toolchain`, resource: (request) => toolchainResource(request, runtime) },
     // v3.0-P5：制品 CAS（上传 / 下载 / 指针 / GC）
     { kind: 'exact', path: `${ROUTE_PREFIX}/artifacts`, resource: (request) => artifactsResource(request, runtime) },
+    // v3.0-P5-5：环境晋级（GET 看指针与历史 / POST 晋级）
+    { kind: 'exact', path: `${ROUTE_PREFIX}/promotions`, resource: (request) => promotionsResource(request, runtime) },
     // 入站 webhook 是路径带项目名的前缀路由：/hooks/<project>
     { kind: 'prefix', path: `${ROUTE_PREFIX}/hooks`, resource: (request) => hookResource(request, runtime) },
     // v3.0-P5-4：OCI Distribution v2。整段 /v2/ 是一条前缀路由——路径形状是规范定死的，

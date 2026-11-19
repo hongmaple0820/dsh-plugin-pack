@@ -29,8 +29,11 @@ export const DB_FILE_NAME = 'cicd.db'
  * 11 — v3.0-P5-3：artifact_refs 重建为 WITHOUT ROWID（owner,name 就是主键），
  *     并新增 artifact_packages —— Maven/npm/PyPI 的坐标（生态 + 名字 + 版本）指向 digest。
  *     没有这张表，`/repository/maven/...` 只能靠扫目录猜版本顺序，maven-metadata.xml 也就无从生成。
+ * 12 — v3.0-P5-5：promotions（环境晋级）。一行 = 「这份 digest 在哪个环境验过、被谁晋级到哪个环境」。
+ *     它是 prod 部署闸门的唯一凭据，也是环境指针（某个 to_env 的最新一行），所以不可能从 releases 反推：
+ *     releases 只记「哪台机器上现在跑着什么」，记不了「谁批准了这份字节去生产」。
  */
-export const SCHEMA_VERSION = 11
+export const SCHEMA_VERSION = 12
 
 const DDL = [
   `CREATE TABLE IF NOT EXISTS runs (
@@ -284,6 +287,24 @@ const DDL = [
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_artifact_packages_key ON artifact_packages (ecosystem, scope, name, version, classifier, extension)`,
   `CREATE INDEX IF NOT EXISTS idx_artifact_packages_name ON artifact_packages (ecosystem, scope, name, created_at DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_artifact_packages_digest ON artifact_packages (digest)`,
+  // v3.0-P5-5：晋级记录。不存环境指针表 —— 某个 (project_id, to_env) 的最新一行就是指针，
+  // 多一份指针就多一个会与事实脱节的真相。
+  `CREATE TABLE IF NOT EXISTS promotions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL DEFAULT '',
+    digest TEXT NOT NULL DEFAULT '',
+    from_env TEXT NOT NULL DEFAULT '',
+    to_env TEXT NOT NULL DEFAULT '',
+    target TEXT NOT NULL DEFAULT '',
+    host TEXT NOT NULL DEFAULT '',
+    release_id TEXT NOT NULL DEFAULT '',
+    run_id TEXT NOT NULL DEFAULT '',
+    approved_by TEXT NOT NULL DEFAULT '',
+    approved_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT ''
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_promotions_digest ON promotions (digest, to_env)`,
+  `CREATE INDEX IF NOT EXISTS idx_promotions_env ON promotions (project_id, to_env, created_at DESC)`,
 ]
 
 const OPERATION_COLUMNS = [
@@ -408,7 +429,8 @@ function migrate(db) {
   }
   // v8 → v9：releases 增加回滚现场五列。老行留空串——它们确实没有这些信息，
   // 编一个默认值（比如 mode='native'）会让「这条记录到底有没有实例信息」变得不可判断。
-  for (const name of ['artifact_digest', 'mode', 'strategy', 'instances', 'operator']) {
+  // v11 → v12：再加 version —— 制品自己的版本号（pip 版本化发布据此排序），与 commit 无关。
+  for (const name of ['artifact_digest', 'mode', 'strategy', 'instances', 'operator', 'version']) {
     if (!hasColumn(db, 'releases', name)) {
       db.exec(`ALTER TABLE releases ADD COLUMN ${name} TEXT NOT NULL DEFAULT ''`)
     }

@@ -15,6 +15,7 @@ import {
 } from '../index.js'
 import { parsePipe, planPipeline, interpolate, matchArtifacts, PipeError, defaultRestartCommand, isHostSelector, parseHostSelector, splitTargetHosts } from '../lib/pipe.js'
 import { createStore } from '../lib/store.js'
+import { PROMOTION_ERRORS, promotionError, envRequiresPromotion, findSourceRelease, currentPointer, isPromoted, listPromotions, recordPromotion, promotionView } from '../lib/promotions.js'
 import { openDatabase } from '../lib/db.js'
 import { DatabaseSync } from 'node:sqlite'
 import { runPipeline, makeRunId } from '../lib/runner.js'
@@ -771,11 +772,11 @@ function callPath(pathname, query = '', { headers = {} } = {}) {
   return route.resource(new Request(`http://x${pathname}${query}`, { headers }))
 }
 
-check('apply：注册 28 个工具、38 条路由（34 exact + 4 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
-  assert.equal(ctx.toolsList.length, 28)
+check('apply：注册 29 个工具、39 条路由（35 exact + 4 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
+  assert.equal(ctx.toolsList.length, 29)
   assert.deepEqual(ctx.toolsList.map((tool) => tool.name).sort(), [
     'cicd_approve', 'cicd_artifacts', 'cicd_audit', 'cicd_auth', 'cicd_cancel', 'cicd_dora', 'cicd_environments', 'cicd_locks',
-    'cicd_logs', 'cicd_pipe_save', 'cicd_plan', 'cicd_project_create', 'cicd_project_meta', 'cicd_projects',
+    'cicd_logs', 'cicd_pipe_save', 'cicd_plan', 'cicd_project_create', 'cicd_project_meta', 'cicd_projects', 'cicd_promotions',
     'cicd_rbac', 'cicd_registry', 'cicd_releases', 'cicd_rollback', 'cicd_run', 'cicd_runners', 'cicd_secrets', 'cicd_status',
     'cicd_targets', 'cicd_tokens', 'cicd_toolchain', 'cicd_triggers', 'cicd_users', 'cicd_validate',
   ])
@@ -786,13 +787,13 @@ check('apply：注册 28 个工具、38 条路由（34 exact + 4 prefix）、1 �
     assert.equal(typeof tool.output.render, 'function')
     assert.equal(typeof tool.execute, 'function')
   }
-  assert.equal(ctx.routes.length, 38)
+  assert.equal(ctx.routes.length, 39)
   assert.deepEqual(ctx.routes.filter((route) => route.kind === 'exact').map((route) => route.path).sort(), [
     '/api/plugins/cicd/approvals', '/api/plugins/cicd/approve', '/api/plugins/cicd/artifacts', '/api/plugins/cicd/audit', '/api/plugins/cicd/auth',
     '/api/plugins/cicd/cancel', '/api/plugins/cicd/dora', '/api/plugins/cicd/environments', '/api/plugins/cicd/locks',
     '/api/plugins/cicd/log', '/api/plugins/cicd/notify-test', '/api/plugins/cicd/operations', '/api/plugins/cicd/pipe-save',
     '/api/plugins/cicd/plan', '/api/plugins/cicd/project-create', '/api/plugins/cicd/project-meta', '/api/plugins/cicd/projects',
-    '/api/plugins/cicd/rbac', '/api/plugins/cicd/releases', '/api/plugins/cicd/rollback', '/api/plugins/cicd/run',
+    '/api/plugins/cicd/promotions', '/api/plugins/cicd/rbac', '/api/plugins/cicd/releases', '/api/plugins/cicd/rollback', '/api/plugins/cicd/run',
     '/api/plugins/cicd/runner-log', '/api/plugins/cicd/runner-poll', '/api/plugins/cicd/runner-register', '/api/plugins/cicd/runner-result',
     '/api/plugins/cicd/runners', '/api/plugins/cicd/runs', '/api/plugins/cicd/secrets', '/api/plugins/cicd/targets',
     '/api/plugins/cicd/tokens', '/api/plugins/cicd/toolchain', '/api/plugins/cicd/triggers', '/api/plugins/cicd/users', '/api/plugins/cicd/validate',
@@ -806,7 +807,7 @@ check('apply：注册 28 个工具、38 条路由（34 exact + 4 prefix）、1 �
   assert.equal(typeof ctx.upgrades[0].handler, 'function')
 })
 
-check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补注册 34+4 条；remote() 惰性取 port', () => {
+check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补注册 35+4 条；remote() 惰性取 port', () => {
   const coldRoutes = []
   const coldUpgrades = []
   const coldWeb = {
@@ -828,8 +829,8 @@ check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补�
   assert.ok(typeof scopeFn === 'function', 'apply 应把路由注册挂到 ctx.inject 上')
   // 模拟 webServer 就绪：cordis 以一个能 get 到服务的 scope 触发回调（真实环境由服务就绪事件驱动）。
   scopeFn({ get: (key) => (key === 'webServer' ? coldWeb : undefined), effect() {} })
-  assert.equal(coldRoutes.length, 38, '就绪后应补注册 34 条 exact + 4 条 prefix 路由')
-  assert.equal(coldRoutes.filter((route) => route.kind === 'exact').length, 34)
+  assert.equal(coldRoutes.length, 39, '就绪后应补注册 35 条 exact + 4 条 prefix 路由')
+  assert.equal(coldRoutes.filter((route) => route.kind === 'exact').length, 35)
   assert.equal(coldUpgrades.length, 1, '就绪后应补注册 /log-ws upgrade 路由')
 
   // remote() 惰性解析：apply 时拿不到 port（remoteBase 为空），就绪后首次调用应取到 55470。
@@ -1034,7 +1035,7 @@ checkAsync('routes：operations 时间线、notify-test 未配置与写保护', 
 })
 
 check('routes：所有资源都走 resource，没有 handler/POST 形态', () => {
-  assert.equal(ctx.routes.length, 38)
+  assert.equal(ctx.routes.length, 39)
   for (const route of ctx.routes) {
     assert.equal(route.handler, undefined)
     assert.ok(route.kind === 'exact' || route.kind === 'prefix')
@@ -1116,7 +1117,7 @@ check('v0.5 选择器：语法校验、混写保序、非法前缀与重复项�
   )
 })
 
-check('DB：v1 库迁移到 user_version=11，补出 env、operations 审计列、projects 表、steps.runner_id 与 4 列主键、runs 配置快照、releases 回滚现场、制品三表', () => {
+check('DB：v1 库迁移到 user_version=12，补出 env、operations 审计列、projects 表、steps.runner_id 与 4 列主键、runs 配置快照、releases 回滚现场、制品三表', () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-cicd-migrate-'))
   const file = join(dir, 'cicd.db')
   const legacy = new DatabaseSync(file)
@@ -1128,7 +1129,7 @@ check('DB：v1 库迁移到 user_version=11，补出 env、operations 审计列�
   legacy.close()
 
   const db = openDatabase(file)
-  assert.equal(Number(db.prepare('PRAGMA user_version').get().user_version), 11)
+  assert.equal(Number(db.prepare('PRAGMA user_version').get().user_version), 12)
   // v3.0-P5：制品 CAS 的两张表必须随迁移补出来，否则上传能落盘、列表却是空的。
   for (const table of ['artifact_blobs', 'artifact_refs']) {
     assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(table), `迁移后应有 ${table} 表`)
@@ -1187,6 +1188,29 @@ const ENV_PIPE_SOURCE = [
   '          artifacts: ["bundle.tgz"]',
 ].join('\n')
 
+// v3.0-P5-5 用例：只有 staging 一个环境、主机的 env 与 envdemo 的 prod 重叠（env:prod + group:api）。
+const DIRECT_PIPE_SOURCE = [
+  'version: 1',
+  'name: direct-pipe',
+  'targets:',
+  '  staging:',
+  '    hosts: [api2]',
+  '    path: /srv/direct',
+  '    runtime: static',
+  'stages:',
+  '  - id: build',
+  '    steps:',
+  '      - name: build',
+  '        run: echo built',
+  '  - id: release',
+  '    needs: [build]',
+  '    steps:',
+  '      - name: ship',
+  '        deploy:',
+  '          target: staging',
+  '          artifacts: ["bundle-prod.tgz"]',
+].join('\n')
+
 const GRAY_PIPE_SOURCE = [
   'version: 1',
   'name: gray-pipe',
@@ -1236,7 +1260,12 @@ mkdirSync(bogusProject, { recursive: true })
 mkdirSync(grayProject, { recursive: true })
 writeFileSync(join(envProject, 'pipe.yml'), ENV_PIPE_SOURCE, 'utf8')
 writeFileSync(join(envProject, 'bundle.tgz'), 'bundle', 'utf8')
+writeFileSync(join(envProject, 'bundle-prod.tgz'), 'bundle', 'utf8')
 writeFileSync(join(bogusProject, 'pipe.yml'), BOGUS_PIPE_SOURCE, 'utf8')
+const directProject = join(envRoot, 'direct')
+mkdirSync(directProject, { recursive: true })
+writeFileSync(join(directProject, 'pipe.yml'), DIRECT_PIPE_SOURCE, 'utf8')
+writeFileSync(join(directProject, 'bundle-prod.tgz'), 'bundle', 'utf8')
 writeFileSync(join(grayProject, 'pipe.yml'), GRAY_PIPE_SOURCE, 'utf8')
 writeFileSync(join(grayProject, 'bundle.tgz'), 'bundle', 'utf8')
 
@@ -1280,6 +1309,7 @@ apply(envCtx, {
     { id: 'envdemo', name: 'EnvDemo', path: envProject, pipe: join(envProject, 'pipe.yml') },
     { id: 'bogus', name: 'Bogus', path: bogusProject, pipe: join(bogusProject, 'pipe.yml') },
     { id: 'gray', name: 'Gray', path: grayProject, pipe: join(grayProject, 'pipe.yml') },
+    { id: 'direct', name: 'Direct', path: directProject, pipe: join(directProject, 'pipe.yml') },
   ],
   workDir: join(envRoot, 'state'),
   remoteBase: 'http://127.0.0.1:7891',
@@ -1289,7 +1319,9 @@ function envCall(routePath, query = '', options = {}) {
   const route = envCtx.routes.find((item) => item.path === internals.ROUTE_PREFIX + routePath)
   assert.ok(route, `route ${routePath} registered`)
   return route.resource(new Request(`http://x${internals.ROUTE_PREFIX}${routePath}${query}`, {
+    method: options.method || 'GET',
     headers: { 'x-dsh-cicd': '1', ...(options.headers || {}) },
+    ...(options.body === undefined ? {} : { body: options.body }),
   }))
 }
 
@@ -1341,6 +1373,29 @@ checkAsync('v0.5 生产护栏：未带 confirm=prod 返回 409，带 confirm=pro
     assert.equal(dry.status, 200)
     assert.equal((await dry.json()).status, 'planned')
 
+    // v3.0-P5-5：受保护环境只接受已晋级的 digest。另一个项目（direct）里同名 staging
+    // target 的 host 与 envdemo 的 prod host 重叠（它自己的 pipe 里没有 prod 环境，所以不会被
+    // 当成受保护目标），用它跑一次拿到"字节相同、身份不同"的 digest，再把它晋级到 envdemo 的 prod：
+    // 这正是"跨项目、跨记账系统"的那条缝，也是 digest 恒等唯一说得清的通行证。
+    const directRun = await envCall('/run', '?project=direct&target=staging&confirm=1').then((response) => response.json())
+    // 发布行摘要里没有 digest（账本对外不暴露内部字段），从账本本身取。
+    // recordId 才是账本主键（形如 <runId>@<host>），releases()[].id 是 runId。
+    const directReleaseId = (directRun.releases || [])[0]?.recordId || ''
+    assert.ok(directReleaseId, 'direct run: ' + JSON.stringify(directRun).slice(0, 600))
+    const envStore = createStore({ dir: join(envRoot, 'state') })
+    const directRow = envStore.release(directReleaseId)
+    const directDigest = String(directRow?.artifact_digest || '')
+    envStore.close()
+    const directRecordId = String(directRow?.id || '')
+    assert.equal(directRun.ok, true, 'direct run: ' + JSON.stringify(directRun).slice(0, 1500))
+    assert.match(directDigest, /^sha256:[0-9a-f]{64}$/, 'direct run: ' + JSON.stringify(directRun).slice(0, 1500))
+    const promoted = await envCall('/promotions', '?confirm=1', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ confirm: '1', project: 'envdemo', toEnv: 'prod', releaseId: directRecordId, digest: directDigest }),
+    }).then((response) => response.json())
+    assert.equal(promoted.digest, directDigest, 'promote: ' + JSON.stringify(promoted).slice(0, 800))
+    assert.equal(promoted.toEnv, 'prod')
+
     const run = await envCall('/run', '?project=envdemo&target=web&confirm=prod').then((response) => response.json())
     assert.equal(run.ok, true)
     assert.deepEqual(run.prodHosts, ['linux26', 'api1'])
@@ -1353,6 +1408,86 @@ checkAsync('v0.5 生产护栏：未带 confirm=prod 返回 409，带 confirm=pro
     const stagingReleases = await envCall('/releases', '?target=web&env=staging').then((response) => response.json())
     assert.equal(stagingReleases.releases.length, 1)
     assert.equal(stagingReleases.releases[0].host, 'api2')
+  } finally { globalThis.fetch = originalFetch }
+})
+
+checkAsync('P5-5 晋级：digest 恒等、跨环境不复制字节、闸门按主机 env 逐台拦', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = envFetch
+  try {
+    // 独立 workDir：与前面用例共库会让「最新指针」被别人的晋级抢走，测的就不是本用例的事了。
+    const store = createStore({ dir: join(envRoot, 'promotions'), file: join(envRoot, 'promotions', 'state.sqlite') })
+    try {
+      const digest = 'sha256:' + 'a'.repeat(63) + '1'
+      const envs = { dev: { order: 1 }, staging: { order: 2 }, prod: { order: 3, protected: true } }
+
+      // ① 不指名来源 = 拒绝。默认「取 staging 最新」会让一次手滑的 POST 把陌生 digest 送进生产。
+      // （store 层不拦：from_env 允许为空，因为"直接从构建进入"是合法路径。拦在 runtime.promote。）
+      recordPromotion(store.db, { id: 'p-direct', projectId: 'envdemo', digest, toEnv: 'prod', fromEnv: '', createdAt: '2026-01-01T00:00:00.000Z' })
+      const direct = listPromotions(store.db, { projectId: 'envdemo', env: 'prod' }).find((row) => row.id === 'p-direct')
+      assert.ok(direct)
+      assert.equal(direct.from_env, '')
+      store.db.prepare('DELETE FROM promotions WHERE id = ?').run('p-direct')
+
+      // ② 最新一行就是环境指针，历史留着不删（问「当时上线的到底是哪个包」要能答）
+      const first = recordPromotion(store.db, { id: 'p-1', projectId: 'envdemo', digest, fromEnv: 'staging', toEnv: 'prod', releaseId: 'r-1', createdAt: '2026-01-01T00:00:01.000Z' })
+      assert.equal(first.digest, digest)
+      const other = 'sha256:' + 'b'.repeat(63) + '2'
+      recordPromotion(store.db, { id: 'p-2', projectId: 'envdemo', digest: other, fromEnv: 'staging', toEnv: 'prod', releaseId: 'r-2', createdAt: '2026-01-01T00:00:02.000Z' })
+      // 同一毫秒内的两次晋级：created_at 分不出先后，rowid DESC 兜底后最新一行必须还是后写的那个。
+      assert.equal(currentPointer(store.db, { projectId: 'envdemo', env: 'prod' }).digest, other)
+      assert.equal(listPromotions(store.db, { projectId: 'envdemo', env: 'prod' }).length, 2)
+
+      // ③ 判据是「晋级过」而不是「在这个环境跑过」：老 digest 仍算数，没晋级的永不算数
+      assert.ok(isPromoted(store.db, { projectId: 'envdemo', env: 'prod', digest }))
+      // 没晋级过返回 null（真值判定即可，不必伪造 false）
+      assert.equal(Boolean(isPromoted(store.db, { projectId: 'envdemo', env: 'prod', digest: 'sha256:' + 'c'.repeat(63) + '3' })), false)
+      assert.equal(Boolean(isPromoted(store.db, { projectId: 'envdemo', env: 'staging', digest })), false)
+
+      // ④ 视图：每个环境一行，指针与最近历史都在
+      const view = promotionView(store.db, { projectId: 'envdemo', environments: envs })
+      assert.deepEqual(view.map((item) => item.name), ['dev', 'staging', 'prod'])
+      const prod = view.find((item) => item.name === 'prod')
+      assert.equal(prod.digest, other)
+      assert.equal(prod.protected, true)
+      assert.equal(prod.history.length, 2)
+      assert.equal(view.find((item) => item.name === 'dev').digest, '')
+
+      // ⑤ 受保护环境的判定：显式 protected 或按约定叫 prod，两种都算
+      assert.equal(envRequiresPromotion(envs, 'prod'), true)
+      assert.equal(envRequiresPromotion({ dev: { order: 1 } }, 'prod'), true)
+      assert.equal(envRequiresPromotion({ canary: { order: 9, protected: true } }, 'canary'), true)
+      assert.equal(envRequiresPromotion(envs, 'staging'), false)
+
+      // ⑥ 源发布只认 active：superseded 是历史，failed 从来没跑起来过
+      assert.equal(findSourceRelease(store.db, { projectId: 'envdemo', fromEnv: 'prod' }), null)
+      assert.equal(findSourceRelease(store.db, { releaseId: 'nope' }), null)
+    } finally { store.close() }
+  } finally { globalThis.fetch = originalFetch }
+})
+
+checkAsync('P5-5 闸门：没有晋级记录的 digest 到不了受保护环境 —— 两条部署路径都拦、且在主机动过之前拦', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = envFetch
+  try {
+    // （「没晋级的 digest 进不了受保护环境」这条由 v0.5 生产护栏用例正着测：
+    //   它先确认带未晋级 digest 的 run 被拒，再晋级同一份字节、同一条命令通过。）
+    // 这里只钉住晋级接口自己的拒绝面 —— 那三条错误码是闸门的另一半。
+    // 晋级接口的拒绝面：不指名来源 = PROMOTION_SOURCE_REQUIRED（不猜「最新 staging」）
+    const noSource = await envCall('/promotions', '?confirm=1', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ confirm: '1', project: 'envdemo', toEnv: 'prod' }),
+    })
+    assert.equal(noSource.status, 400)
+    assert.equal((await noSource.json()).code, 'PROMOTION_SOURCE_REQUIRED')
+
+    // 指名了来源但 toEnv 不在晋升路径上 = PROMOTION_PATH_INVALID
+    const badPath = await envCall('/promotions', '?confirm=1', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ confirm: '1', project: 'envdemo', toEnv: 'nowhere', releaseId: 'x@y' }),
+    })
+    assert.equal(badPath.status, 400)
+    assert.equal((await badPath.json()).code, 'PROMOTION_PATH_INVALID')
   } finally { globalThis.fetch = originalFetch }
 })
 
@@ -4557,13 +4692,17 @@ check('P5-3-S5：版本排序与坐标解析的小件单独钉住（字典序会
   assert.match(xml, /<latest>2\.0\.0<\/latest>/)
   assert.equal(sha512Sri(createHash('sha512').update('x')), `sha512-${createHash('sha512').update('x').digest('base64')}`)
 })
-check('P5-S11：DB —— 制品表随 v10 迁出，artifact_blobs 只存索引不存字节', () => {
+check('P5-S11：DB —— 制品表随 v10 迁出、晋级表随 v12 迁出，artifact_blobs 只存索引不存字节', () => {
   const db = openDatabase(join(root, 'artifacts-db.sqlite'))
   try {
     const columns = db.prepare('PRAGMA table_info(artifact_blobs)').all().map((row) => row.name)
     assert.deepEqual(columns.sort(), ['bytes', 'created_at', 'digest', 'job_id', 'media_type', 'project_id', 'run_id', 'source_path'])
-    assert.equal(Number(db.prepare('PRAGMA user_version').get().user_version), 11)
+    assert.equal(Number(db.prepare('PRAGMA user_version').get().user_version), 12)
     assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE name = 'idx_artifact_refs_digest'").get())
+    assert.deepEqual(db.prepare('PRAGMA table_info(promotions)').all().map((row) => row.name).sort(), [
+      'approved_at', 'approved_by', 'created_at', 'digest', 'from_env', 'host', 'id', 'project_id', 'release_id', 'run_id', 'target', 'to_env',
+    ])
+    assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE name = 'idx_promotions_digest'").get())
   } finally { db.close() }
 })
 
