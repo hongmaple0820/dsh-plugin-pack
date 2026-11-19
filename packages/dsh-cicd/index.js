@@ -39,6 +39,11 @@ import { summarizeDora } from './lib/dora.js'
 import { createTaskBroker, createRemoteExecutor, joinTokenMatches } from './lib/executors.js'
 import { createSecretStore } from './lib/secrets.js'
 import { createArtifactStore, normalizeDigest, digestPath, parseRange, artifactError } from './lib/artifacts.js'
+import {
+  ECOSYSTEMS, PACKAGE_ERRORS, createPackageIndex, createPackageRepository, packageError,
+  mavenCoordinateError, mavenGroupPath, mavenFileName, splitNpmName, sha512Sri, sortVersions,
+  buildSimpleHtml, buildSimpleJson, prefersJson, pypiFilename, pypiHashOf, pypiNameCandidates, normalizePyPIname,
+} from './lib/packages.js'
 import { createApprovalGate } from './lib/approval.js'
 import { normalizeEnvironments, promotionPath, isProtected, requiresApproval } from './lib/environments.js'
 import { createRbac } from './lib/rbac.js'
@@ -218,6 +223,9 @@ function normalizeConfig(config = {}, ctx) {
     artifacts: {
       dir: typeof rawArtifacts.dir === 'string' && rawArtifacts.dir ? rawArtifacts.dir : '',
       maxBytes: clampInt(rawArtifacts.maxBytes, 2 * 1024 * 1024 * 1024, 0, Number.MAX_SAFE_INTEGER),
+      // 仓库对外地址（maven-metadata 里的 url、packument 的 dist.tarball、PEP 503 的 href 都用它）。
+      // 留空时按请求的 Host 现拼：同一份配置既能在本机 127.0.0.1 用，也能在 CI 里换名字用。
+      baseUrl: typeof rawArtifacts.baseUrl === 'string' ? rawArtifacts.baseUrl.trim().replace(/\/+$/, '') : '',
     },
     // v3.0-P1：v2 图的并发度。默认 4 —— 一个 stage 里 4 个 lint/test job 并行够用，
     // 又不会在 2 核构建机上把命令执行器压死（每个 job 可能还在跑自己的子进程）。
@@ -450,6 +458,21 @@ function createRuntime(ctx, config) {
       const rows = store.db.prepare("SELECT artifact_digest FROM releases WHERE artifact_digest <> ''").all()
       return rows.map((row) => row.artifact_digest).filter((digest) => digest && digest.startsWith('sha256:'))
     }],
+  })
+  // v3.0-P5-3：只读分发层。坐标（生态+名字+版本）指向 digest，字节仍由 artifactStore 持有；
+  // maven-metadata.xml / packument / PEP 503 索引全部由这张表**生成**，不落盘、不复制字节。
+  const packageIndex = createPackageIndex({ db: store.db, has: (digest) => artifactStore.has(digest) })
+  const packageRepo = createPackageRepository({
+    index: packageIndex,
+    store: artifactStore,
+    baseUrl: options.artifacts.baseUrl || '',
+    // 「最新版本」优先取部署过的：依赖解析拿到的应该是生产在跑的那一版。
+    listReleases: () => {
+      try {
+        const rows = store.db.prepare("SELECT DISTINCT version FROM releases WHERE version <> ''").all()
+        return rows.map((row) => String(row.version))
+      } catch { return [] }
+    },
   })
   // v3.0-P5-4：OCI registry。manifest 存 artifact_blobs（media_type）并把仓库名放进 source_path，
   // 字节仍由 artifactStore 持有——镜像层和构建产物是同一套 CAS，回滚按 digest 走同一条路。
@@ -2067,6 +2090,10 @@ function createRuntime(ctx, config) {
       const { action = 'list' } = args
       const project = args.project ? pickProject(options, args.project) : null
       if (action === 'stats') return { ok: true, stats: artifactStore.stats() }
+      // 下面两条要碰 packageIndex，而它在 createRuntime 里比 runtime 晚一步建好 —— 用 this 取。
+      if (action === 'publish') return this.artifactPublish({ ...args, project })
+      if (action === 'packages') return this.artifactPackages({ ecosystem: args.ecosystem || '', name: args.name || '' })
+      if (action === 'catalog') return { ok: true, ...this.artifactCatalog({ ecosystem: args.ecosystem || '' }) }
       if (action === 'verify') {
         const result = await artifactStore.verify(normalizeDigest(args.digest || ''))
         if (!result.ok) throw artifactError('ARTIFACT_CORRUPTED', `制品 ${result.digest} 校验失败：磁盘上的字节不再是 ${result.digest}`, { digest: result.digest })
@@ -2104,6 +2131,152 @@ function createRuntime(ctx, config) {
         ? store.db.prepare('SELECT digest, bytes, run_id, job_id, source_path, media_type, created_at FROM artifact_blobs WHERE project_id = ? ORDER BY created_at DESC LIMIT ?').all(project.id, Number(args.limit || 50))
         : store.db.prepare('SELECT digest, bytes, project_id, run_id, source_path, created_at FROM artifact_blobs ORDER BY created_at DESC LIMIT ?').all(Number(args.limit || 50))
       return { ok: true, project: project?.id || '', artifacts: rows, refs: artifactStore.listRefs(project?.id || ''), stats: artifactStore.stats() }
+    },
+    // ---- v3.0-P5-3：只读分发（Maven / npm / PyPI）与坐标登记 -------------------------------------
+    /** 仓库对外地址：配置优先，否则按本次请求的 Host 拼（只用于生成 URL，不参与鉴权）。 */
+    artifactBaseUrl(request) {
+      if (options.artifacts.baseUrl) return options.artifacts.baseUrl
+      try {
+        const target = new URL(request.url)
+        if (target.host && target.hostname !== 'x') return `${target.protocol}//${target.host}${ROUTE_PREFIX}`
+        const host = request.headers?.get?.('host')
+        if (host) return `http://${host}${ROUTE_PREFIX}`
+      } catch { /* 拼不出就退回相对路径 */ }
+      return ROUTE_PREFIX
+    },
+    /** 一次仓库 GET 落成「哪份字节 / 哪份生成的清单」；找不到返回 null（路由层转 404）。 */
+    artifactResolve({ ecosystem = '', segments = [], request = null } = {}) {
+      if (!ECOSYSTEMS.includes(ecosystem)) return null
+      const baseUrl = request ? this.artifactBaseUrl(request) : (options.artifacts.baseUrl || '')
+      const repository = createPackageRepository({
+        index: packageIndex,
+        store: artifactStore,
+        baseUrl,
+        listReleases: () => {
+          try { return store.db.prepare("SELECT DISTINCT version FROM releases WHERE version <> ''").all().map((row) => String(row.version)) } catch { return [] }
+        },
+      })
+      return repository.resolve(ecosystem, segments)
+    },
+    /** 仓库清单（运维视图）：有哪些包、每个版本指向哪个 digest。 */
+    artifactCatalog({ ecosystem = '' } = {}) {
+      return packageRepo.catalog(ecosystem)
+    },
+    /**
+     * 登记一个坐标。写入只有这一条路：字节先经 `artifacts` 进 CAS，再在这里挂上坐标。
+     * npm 的 SRI 在这里算一次（入库时读一遍字节），之后每次 packument 都从 meta 里取。
+     */
+    async artifactPublish(args = {}) {
+      const ecosystem = String(args.ecosystem || '')
+      if (!ECOSYSTEMS.includes(ecosystem)) throw packageError(PACKAGE_ERRORS.INVALID, `未知生态 “${ecosystem}”（只有 ${ECOSYSTEMS.join(' / ')}）`)
+      const project = args.project
+      // 两种入口：给 digest（字节已在 CAS）或给 path（本机文件，先收进 CAS）。
+      // 前者是流水线里「先 upload 再 publish」的写法，后者是手工发布时少走一步。
+      let digest = ''
+      if (String(args.digest || '').trim()) {
+        digest = normalizeDigest(String(args.digest))
+      } else if (String(args.path || '').trim()) {
+        const source = String(args.path)
+        if (isDirectoryPath(source)) throw artifactError('COMMAND_INVALID', `${source} 是目录，publish 只收单个文件`)
+        const stored = await artifactStore.putFile(source, {
+          expectDigest: '',
+          meta: { projectId: project?.id || '', runId: String(args.runId || ''), jobId: '', sourcePath: source, mediaType: args.mediaType || '' },
+        })
+        digest = stored.digest
+      } else {
+        throw artifactError('COMMAND_INVALID', 'publish 需要 digest（已在 CAS 里）或 path（本机文件）')
+      }
+      if (!artifactStore.has(digest)) throw artifactError('ARTIFACT_NOT_FOUND', `CAS 里没有 ${digest}，先 upload 再 publish`)
+      const bytes = artifactStore.stat(digest)?.bytes || 0
+      let scope = ''
+      let name = String(args.name || '')
+      const version = String(args.version || '')
+      let classifier = ''
+      let extension = String(args.extension || '').trim()
+      const meta = {}
+      if (ecosystem === 'maven') {
+        const groupId = String(args.groupId || '').trim()
+        const bad = mavenCoordinateError(groupId, name, version)
+        if (bad) throw packageError(PACKAGE_ERRORS.INVALID, bad)
+        scope = groupId
+        classifier = String(args.classifier || '').trim()
+        if (!extension) throw packageError(PACKAGE_ERRORS.INVALID, 'Maven 制品要指定 extension（jar / pom / war…）')
+      } else if (ecosystem === 'npm') {
+        // 归一就是校验：`Foo` 与 `@Scope/x` 在 npm 里是非法的，越早拒越好。
+        const split = splitNpmName(name)
+        if (!name || split.full !== name) throw packageError(PACKAGE_ERRORS.INVALID, `npm 包名 “${name}” 不合法（小写，可带 @scope/）`)
+        scope = split.scope
+        name = split.name
+        extension = 'tgz'
+        if (args.manifest !== undefined && args.manifest !== null) {
+          if (typeof args.manifest !== 'object' || Array.isArray(args.manifest)) throw packageError(PACKAGE_ERRORS.INVALID, 'npm manifest 必须是对象')
+          meta.manifest = args.manifest
+        }
+        if (Array.isArray(args.tags) && args.tags.length > 0) meta.tags = args.tags.map((tag) => String(tag)).filter(Boolean)
+      } else if (ecosystem === 'pypi') {
+        const normalized = normalizePyPIname(name)
+        if (!normalized) throw packageError(PACKAGE_ERRORS.INVALID, `PyPI 项目名 “${name}” 不合法`)
+        name = normalized
+        scope = ''
+        if (!extension) throw packageError(PACKAGE_ERRORS.INVALID, 'PyPI 分发文件要指定 extension（whl / tar.gz…）')
+        // `.tar.gz` 是两段，而 extension 列只允许字母数字 —— 统一记最后一段，文件名按它拼回来。
+        extension = extension.split('.').pop()
+        classifier = String(args.classifier || '').trim()
+        if (args.requiresPython) meta.requires_python = String(args.requiresPython)
+        // 归一后的名字丢了大小写与分隔符，而 wheel 文件名本身是分发契约的一部分——
+        // 给 filename 就以它为准（pip 只认文件名里的 name-version），否则按归一名字拼。
+        if (String(args.filename || '').trim()) {
+          const given = String(args.filename).trim()
+          const lower = given.toLowerCase()
+          // 分发文件名必须仍属于这个项目：前缀按 PEP 503 归一后要对得上。
+          if (!lower.startsWith(`${name}-`) && !lower.startsWith(`${name.replace(/-/g, '_')}-`)) {
+            throw packageError(PACKAGE_ERRORS.INVALID, `文件名 “${given}” 与项目名 ${name} 对不上`)
+          }
+          meta.filename = given
+        }
+      }
+      if (ecosystem === 'npm') {
+        const hash = createHash('sha512')
+        await new Promise((resolve, reject) => {
+          const stream = artifactStore.createReadable(digest)
+          stream.on('data', (chunk) => hash.update(chunk))
+          stream.on('error', reject)
+          stream.on('end', resolve)
+        })
+        meta.integrity = sha512Sri(hash)
+      }
+      const record = packageIndex.register({
+        ecosystem, scope, name, version, digest, bytes,
+        mediaType: args.mediaType || '',
+        projectId: project?.id || '',
+        runId: String(args.runId || ''),
+        classifier, extension, meta,
+      })
+      return { ok: true, ...record, reused: record.created === false }
+    },
+    /** 已登记的坐标清单：按生态分组，一包一行，版本升序。 */
+    artifactPackages({ ecosystem = '', name = '' } = {}) {
+      const wanted = ecosystem ? [ecosystem] : ECOSYSTEMS
+      const out = []
+      const needle = name ? normalizePyPIname(name) : ''
+      for (const current of wanted) {
+        for (const item of packageIndex.lookupEcosystem(current)) {
+          const full = item.scope ? `${item.scope}/${item.name}` : item.name
+          if (needle && !normalizePyPIname(full).includes(needle)) continue
+          const versions = packageIndex.versions({ ecosystem: current, scope: item.scope, name: item.name })
+          out.push({
+            ecosystem: current,
+            name: full,
+            versions: sortVersions(versions.map((entry) => entry.version)),
+            files: versions.map((entry) => ({ version: entry.version, digest: entry.digest, bytes: entry.bytes, classifier: entry.classifier, extension: entry.extension })),
+          })
+        }
+      }
+      return { count: out.length, packages: out }
+    },
+    /** 只读分发层要用的仓库对象：路由层从这里拿 resolve 结果，不直接碰 CAS。 */
+    artifactRepository() {
+      return packageRepo
     },
     // ---- v3.0-P5-4：OCI 分发（docker push / pull） -------------------------------------------
     // manifest 也是一个「制品」：它的字节进 CAS，digest 就是它的 sha256；tag 就是 refs/<repo>/<tag>。
@@ -3660,19 +3833,25 @@ function registerTools(ctx, runtime) {
   // v3.0-P5：制品 CAS。上传只收本地路径 —— 见 runtime.artifacts 上的说明。
   register({
     name: 'cicd_artifacts',
-    description: '制品 CAS：按 sha256 收字节（幂等去重）、按 digest 取回（支持 Range）、移指针（tag）、回收无引用 blob（默认 dry-run）。上传只接受构建机上的文件路径。',
+    description: '制品 CAS：按 sha256 收字节（幂等去重）、按 digest 取回（支持 Range）、移指针（tag）、回收无引用 blob（默认 dry-run）、登记 Maven/npm/PyPI 坐标供只读仓库分发。上传只接受构建机上的文件路径。',
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['list', 'upload', 'tag', 'verify', 'gc', 'stats'], description: '默认 list' },
+        action: { type: 'string', enum: ['list', 'upload', 'tag', 'verify', 'gc', 'stats', 'publish', 'packages', 'catalog'], description: '默认 list；publish=登记一个坐标（Maven/npm/PyPI），packages=已登记坐标清单，catalog=各生态仓库视图' },
         project: PROJECT_PARAM,
         path: { type: 'string', description: 'action=upload 时必填：构建机上的文件路径（不接受目录）' },
-        digest: { type: 'string', description: 'sha256:<64 hex>；upload 时作为校验值，tag/verify 时作为目标' },
+        digest: { type: 'string', description: 'sha256:<64 hex>；upload 时作为校验值，tag/verify/publish 时作为目标' },
+        ecosystem: { type: 'string', enum: ['maven', 'npm', 'pypi'], description: 'action=publish/packages/catalog 时的生态' },
+        groupId: { type: 'string', description: 'action=publish 且 ecosystem=maven：groupId，如 com.example' },
+        version: { type: 'string', description: 'action=publish：版本号（1.2.3 / 1.2.3-rc1 / 1.0.0+build5）' },
+        classifier: { type: 'string', description: 'action=publish：Maven classifier（sources/javadoc）或 PyPI 变体标记' },
+        extension: { type: 'string', description: 'action=publish：文件扩展名（jar / pom / tgz / whl / tar.gz）' },
+        filename: { type: 'string', description: 'action=publish 且 ecosystem=pypi：分发文件名原文（wheel 文件名是分发契约，缺省按归一名字拼）' },
         runId: { type: 'string', description: 'optional：把这次上传记到某次运行名下' },
         jobId: { type: 'string', description: 'optional：并行 job 的分片归属' },
         mediaType: { type: 'string' },
         owner: { type: 'string', description: 'action=tag：指针归属（默认项目 id）' },
-        name: { type: 'string', description: 'action=tag：指针名，如 latest / staging' },
+        name: { type: 'string', description: 'action=tag：指针名，如 latest / staging；action=publish：包名（npm 可带 @scope/）；packages：按名字过滤' },
         limit: { type: 'number' },
         dryRun: { type: 'boolean', description: 'action=gc：默认 true，只列出不删除' },
       },
@@ -3694,9 +3873,30 @@ function registerTools(ctx, runtime) {
           reclaimedBytes: { type: 'number' },
           artifacts: { type: 'array', items: { type: 'object' } },
           refs: { type: 'array', items: { type: 'object' } },
+          ecosystem: { type: 'string' },
+          versions: { type: 'array', items: { type: 'string' } },
+          created: { type: 'boolean' },
+          count: { type: 'number' },
+          packages: { type: 'array', items: { type: 'object' } },
+          repos: { type: 'object' },
         },
       },
       render(_args, value) {
+        // publish / packages / catalog 三种形态各自有话说，排在前面的 digest 分支会抢走它们。
+        if (value.ecosystem && value.created !== undefined) {
+          const label = value.scope ? `${value.scope}/${value.name}` : value.name
+          return textBlocks(`已登记 ${value.ecosystem}：${label}@${value.version} → ${value.digest}${value.created ? '' : '（坐标已存在且指向同一份字节，未重复写入）'}`)
+        }
+        if (Array.isArray(value.packages)) {
+          const lines = [`已登记坐标 ${value.count} 个`]
+          for (const item of value.packages) lines.push(`- [${item.ecosystem}] ${item.name}：${item.versions.join(', ') || '（无版本）'}`)
+          return textBlocks(lines.join('\n'))
+        }
+        if (value.repos) {
+          const lines = [`制品仓库（${value.baseUrl || ''}）`]
+          for (const [ecosystem, entries] of Object.entries(value.repos)) lines.push(`- ${ecosystem}：${(entries || []).length} 个`)
+          return textBlocks(lines.join('\n'))
+        }
         if (value.digest) return textBlocks(`${value.digest}（${value.bytes ?? 0} 字节${value.deduped ? '，已存在，未重复写入' : ''}）`)
         if (value.ref) return textBlocks(`${value.ref.owner}/${value.ref.name} → ${value.ref.digest}`)
         if (value.removed || value.kept) {
@@ -3720,6 +3920,8 @@ function registerTools(ctx, runtime) {
         runId: args.runId || '', jobId: args.jobId || '', mediaType: args.mediaType || '',
         owner: args.owner || '', name: args.name || '', limit: args.limit,
         dryRun: args.dryRun !== false,
+        ecosystem: args.ecosystem || '', groupId: args.groupId || '', version: args.version || '',
+        classifier: args.classifier || '', extension: args.extension || '', filename: args.filename || '',
       })
     },
   })
@@ -3882,6 +4084,10 @@ function errorStatus(error) {
   if (code === 'ARTIFACT_DIGEST_INVALID' || code === 'ARTIFACT_EMPTY' || code === 'ARTIFACT_TOO_LARGE') return 400
   if (code === 'ARTIFACT_DIGEST_MISMATCH' || code === 'ARTIFACT_CORRUPTED') return 409
   if (code === 'ARTIFACT_WRITE_FAILED') return 500
+  // v3.0-P5-3：坐标登记。重复登记是 409（坐标不可变，重试无用）。
+  if (code === 'PACKAGE_NOT_FOUND') return 404
+  if (code === 'PACKAGE_INVALID') return 400
+  if (code === 'PACKAGE_DUPLICATE' || code === 'PACKAGE_IMMUTABLE') return 409
   if (code.startsWith('PIPE_') || code === 'COMMAND_INVALID') return 400
   return 500
 }
@@ -4241,6 +4447,114 @@ async function triggersResource(request, runtime) {
   try { return json({ ok: true, ...runtime.triggers({ project: params.get('project') || '' }) }) } catch (error) { return errorJson(error) }
 }
 
+const REGISTRY_PREFIXES = Object.freeze({
+  maven: `${ROUTE_PREFIX}/repository/maven`,
+  npm: `${ROUTE_PREFIX}/repository/npm`,
+  pypi: `${ROUTE_PREFIX}/simple`,
+})
+
+/**
+ * 从路径上认出「这是哪个生态的哪一段」。返回 null 表示这不是仓库路径（路由层据此 404）。
+ *
+ * 三种生态各占一个前缀，且**互不重叠**：`/repository/maven` / `/repository/npm` / `/simple`。
+ * 前缀之外一律不认，避免 `/simple/maven/...` 这种混搭把两套路径规则串起来。
+ */
+export function parseRegistryPath(pathname) {
+  const path = String(pathname || '')
+  for (const [ecosystem, prefix] of Object.entries(REGISTRY_PREFIXES)) {
+    if (path === prefix) return { ecosystem, segments: [] }
+    if (!path.startsWith(`${prefix}/`)) continue
+    const raw = path.slice(prefix.length + 1)
+    // 尾斜杠是 PEP 503 要求的（`/simple/foo/`），但它是路径语法，不是段。
+    const trimmed = raw.replace(/\/+$/, '')
+    const segments = trimmed ? trimmed.split('/') : []
+    // 防御性检查：任何一段都不能是 `.` / `..`，否则 path 一拼就能越出 CAS。
+    if (segments.some((segment) => !segment || segment === '.' || segment === '..')) return { ecosystem, segments: [], invalid: true }
+    return { ecosystem, segments: segments.map((segment) => {
+      try { return decodeURIComponent(segment) } catch { return segment }
+    }) }
+  }
+  return null
+}
+
+function registryError(code, message, status = 404) {
+  return json({ ok: false, error: message, code }, status)
+}
+
+/**
+ * 仓库的只读入口。这里**只做 GET**：Docker 之外的所有客户端（mvn / npm / pip）发出来的
+ * 都只是 GET，任何非 GET 一律 405 —— 不写字节、不接受上传，写入走 `cicd_artifacts` 与 `publish`。
+ */
+async function registryResource(request, runtime, pathname) {
+  const method = String(request.method || 'GET').toUpperCase()
+  if (method !== 'GET' && method !== 'HEAD') return registryError('REGISTRY_READ_ONLY', '仓库是只读的：写入走 cicd_artifacts upload + publish', 405)
+  const parsed = parseRegistryPath(pathname)
+  if (!parsed) return registryError('REGISTRY_NOT_FOUND', `未知路径 ${pathname}`)
+  if (parsed.invalid) return registryError('REGISTRY_PATH_INVALID', '路径非法', 400)
+  const { ecosystem, segments } = parsed
+  if (segments.length === 0) {
+    // 根：给一份索引（人看的）；客户端从不请求它，但 404 会让排查变成猜谜。
+    const catalog = runtime.artifactCatalog({ ecosystem })
+    return json({ ok: true, ecosystem, repos: catalog.repos?.[ecosystem] || [] })
+  }
+  let resolved = null
+  try {
+    resolved = runtime.artifactResolve({ ecosystem, segments, request })
+  } catch (error) {
+    if (error?.code === 'ARTIFACT_NOT_FOUND') return registryError('REGISTRY_NOT_FOUND', '制品的字节已不在 CAS 里（可能被 GC 收走）')
+    throw error
+  }
+  if (!resolved) return registryError('REGISTRY_NOT_FOUND', `${ecosystem} 仓库里没有这份路径：${segments.join('/')}`)
+  const headers = { 'cache-control': 'no-cache' }
+  if (resolved.kind === 'generated') {
+    headers['content-type'] = resolved.mediaType
+    headers['content-length'] = String(Buffer.byteLength(resolved.body))
+    return new Response(method === 'HEAD' ? null : resolved.body, { status: 200, headers })
+  }
+  if (resolved.kind === 'simple') {
+    // PEP 691 与 PEP 503 是同一个索引的两种编码，按 Accept 协商；老的 pip 只会解析 HTML。
+    const accept = request.headers?.get?.('accept') || ''
+    if (prefersJson(accept)) {
+      const body = JSON.stringify(buildSimpleJson({ project: resolved.project, files: resolved.files }))
+      headers['content-type'] = 'application/vnd.pypi.simple.v1+json'
+      headers['content-length'] = String(Buffer.byteLength(body))
+      return new Response(method === 'HEAD' ? null : body, { status: 200, headers })
+    }
+    const body = buildSimpleHtml({ project: resolved.project, files: resolved.files })
+    headers['content-type'] = 'text/html; charset=utf-8'
+    headers['content-length'] = String(Buffer.byteLength(body))
+    return new Response(method === 'HEAD' ? null : body, { status: 200, headers })
+  }
+  // 字节：和 CAS 下载共用同一段 Range 逻辑（大 tarball 断点续传要靠它）。
+  try {
+    const range = request.headers?.get?.('range') || ''
+    const slice = runtime.artifactStream(resolved.digest, range)
+    headers['content-type'] = resolved.mediaType || 'application/octet-stream'
+    headers['content-length'] = String(slice.end - slice.start + 1)
+    headers['accept-ranges'] = 'bytes'
+    headers['content-digest'] = slice.digest
+    headers.etag = `"${slice.digest}"`
+    if (slice.status === 206) headers['content-range'] = `bytes ${slice.start}-${slice.end}/${slice.bytes}`
+    return new Response(method === 'HEAD' ? null : Readable.toWeb(slice.stream()), { status: slice.status, headers })
+  } catch (error) {
+    if (error?.code === 'ARTIFACT_NOT_FOUND') return registryError('REGISTRY_NOT_FOUND', '制品的字节已不在 CAS 里（可能被 GC 收走）')
+    throw error
+  }
+}
+
+/** prefix 路由的入口：/repository/maven、/repository/npm、/simple 共用它，按 pathname 自己分派。 */
+async function packageRegistryResource(request, runtime) {
+  try {
+    return await registryResource(request, runtime, queryPathOf(request))
+  } catch (error) {
+    return errorJson(error)
+  }
+}
+
+/** 路由拿到的是完整 URL；前缀匹配要看 pathname，不能带 query。 */
+function queryPathOf(request) {
+  try { return new URL(request.url, 'http://localhost').pathname } catch { return '' }
+}
 /** prefix 路由：`/hooks/<project>?...`，项目 id 从路径末段取（允许 URL 编码）。 */
 function hookProjectOf(request) {
   try {
@@ -5001,6 +5315,9 @@ function registerHttpRoutes(ctx, runtime) {
     // v3.0-P5-4：OCI Distribution v2。整段 /v2/ 是一条前缀路由——路径形状是规范定死的，
     // 拆成 exact 只会让 <repo>/manifests/<ref> 这类多段路径没处放。
     { kind: 'prefix', path: `${ROUTE_PREFIX}/v2`, resource: (request) => ociResource(request, runtime, new URL(request.url).pathname) },
+    // v3.0-P5-3：Maven / npm / PyPI 的只读仓库。三条前缀各管一个生态，写入不在这里。
+    { kind: 'prefix', path: `${ROUTE_PREFIX}/repository`, resource: (request) => packageRegistryResource(request, runtime) },
+    { kind: 'prefix', path: `${ROUTE_PREFIX}/simple`, resource: (request) => packageRegistryResource(request, runtime) },
   ]
   for (const route of routes) {
     try {

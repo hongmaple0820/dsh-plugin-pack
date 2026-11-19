@@ -11,6 +11,7 @@ import {
   name as packageName,
   inject,
   apply,
+  parseRegistryPath,
 } from '../index.js'
 import { parsePipe, planPipeline, interpolate, matchArtifacts, PipeError, defaultRestartCommand, isHostSelector, parseHostSelector, splitTargetHosts } from '../lib/pipe.js'
 import { createStore } from '../lib/store.js'
@@ -751,6 +752,8 @@ apply(ctx, {
   remoteBase: 'http://127.0.0.1:1',
   // 主测试进程不启动调度定时器（调度器本身在下面用注入的 run/tick 单独覆盖）。
   scheduler: { enabled: false },
+  // P5-3：仓库生成的 tarball/simple 链接要绝对地址，测试里钉死，免得断言跟着 Host 漂。
+  artifacts: { baseUrl: 'http://registry.test/api/plugins/cicd' },
 })
 
 function call(routePath, query = '', { headers = {}, origin = '' } = {}) {
@@ -768,7 +771,7 @@ function callPath(pathname, query = '', { headers = {} } = {}) {
   return route.resource(new Request(`http://x${pathname}${query}`, { headers }))
 }
 
-check('apply：注册 28 个工具、36 条路由（34 exact + 2 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
+check('apply：注册 28 个工具、38 条路由（34 exact + 4 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
   assert.equal(ctx.toolsList.length, 28)
   assert.deepEqual(ctx.toolsList.map((tool) => tool.name).sort(), [
     'cicd_approve', 'cicd_artifacts', 'cicd_audit', 'cicd_auth', 'cicd_cancel', 'cicd_dora', 'cicd_environments', 'cicd_locks',
@@ -783,7 +786,7 @@ check('apply：注册 28 个工具、36 条路由（34 exact + 2 prefix）、1 �
     assert.equal(typeof tool.output.render, 'function')
     assert.equal(typeof tool.execute, 'function')
   }
-  assert.equal(ctx.routes.length, 36)
+  assert.equal(ctx.routes.length, 38)
   assert.deepEqual(ctx.routes.filter((route) => route.kind === 'exact').map((route) => route.path).sort(), [
     '/api/plugins/cicd/approvals', '/api/plugins/cicd/approve', '/api/plugins/cicd/artifacts', '/api/plugins/cicd/audit', '/api/plugins/cicd/auth',
     '/api/plugins/cicd/cancel', '/api/plugins/cicd/dora', '/api/plugins/cicd/environments', '/api/plugins/cicd/locks',
@@ -794,14 +797,16 @@ check('apply：注册 28 个工具、36 条路由（34 exact + 2 prefix）、1 �
     '/api/plugins/cicd/runners', '/api/plugins/cicd/runs', '/api/plugins/cicd/secrets', '/api/plugins/cicd/targets',
     '/api/plugins/cicd/tokens', '/api/plugins/cicd/toolchain', '/api/plugins/cicd/triggers', '/api/plugins/cicd/users', '/api/plugins/cicd/validate',
   ])
-  assert.deepEqual(ctx.routes.filter((route) => route.kind === 'prefix').map((route) => route.path), ['/api/plugins/cicd/hooks', '/api/plugins/cicd/v2'])
+  assert.deepEqual(ctx.routes.filter((route) => route.kind === 'prefix').map((route) => route.path), [
+    '/api/plugins/cicd/hooks', '/api/plugins/cicd/v2', '/api/plugins/cicd/repository', '/api/plugins/cicd/simple',
+  ])
   assert.ok(ctx.routes.every((route) => typeof route.resource === 'function' && !route.handler))
   assert.equal(ctx.upgrades.length, 1)
   assert.equal(ctx.upgrades[0].path, '/api/plugins/cicd/log-ws')
   assert.equal(typeof ctx.upgrades[0].handler, 'function')
 })
 
-check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补注册 34+1 条；remote() 惰性取 port', () => {
+check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补注册 34+4 条；remote() 惰性取 port', () => {
   const coldRoutes = []
   const coldUpgrades = []
   const coldWeb = {
@@ -823,7 +828,7 @@ check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补�
   assert.ok(typeof scopeFn === 'function', 'apply 应把路由注册挂到 ctx.inject 上')
   // 模拟 webServer 就绪：cordis 以一个能 get 到服务的 scope 触发回调（真实环境由服务就绪事件驱动）。
   scopeFn({ get: (key) => (key === 'webServer' ? coldWeb : undefined), effect() {} })
-  assert.equal(coldRoutes.length, 36, '就绪后应补注册 34 条 exact + 2 条 prefix 路由')
+  assert.equal(coldRoutes.length, 38, '就绪后应补注册 34 条 exact + 4 条 prefix 路由')
   assert.equal(coldRoutes.filter((route) => route.kind === 'exact').length, 34)
   assert.equal(coldUpgrades.length, 1, '就绪后应补注册 /log-ws upgrade 路由')
 
@@ -1029,7 +1034,7 @@ checkAsync('routes：operations 时间线、notify-test 未配置与写保护', 
 })
 
 check('routes：所有资源都走 resource，没有 handler/POST 形态', () => {
-  assert.equal(ctx.routes.length, 36)
+  assert.equal(ctx.routes.length, 38)
   for (const route of ctx.routes) {
     assert.equal(route.handler, undefined)
     assert.ok(route.kind === 'exact' || route.kind === 'prefix')
@@ -1111,7 +1116,7 @@ check('v0.5 选择器：语法校验、混写保序、非法前缀与重复项�
   )
 })
 
-check('DB：v1 库迁移到 user_version=10，补出 env、operations 审计列、projects 表、steps.runner_id 与 4 列主键、runs 配置快照、releases 回滚现场、制品两表', () => {
+check('DB：v1 库迁移到 user_version=11，补出 env、operations 审计列、projects 表、steps.runner_id 与 4 列主键、runs 配置快照、releases 回滚现场、制品三表', () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-cicd-migrate-'))
   const file = join(dir, 'cicd.db')
   const legacy = new DatabaseSync(file)
@@ -1123,7 +1128,7 @@ check('DB：v1 库迁移到 user_version=10，补出 env、operations 审计列�
   legacy.close()
 
   const db = openDatabase(file)
-  assert.equal(Number(db.prepare('PRAGMA user_version').get().user_version), 10)
+  assert.equal(Number(db.prepare('PRAGMA user_version').get().user_version), 11)
   // v3.0-P5：制品 CAS 的两张表必须随迁移补出来，否则上传能落盘、列表却是空的。
   for (const table of ['artifact_blobs', 'artifact_refs']) {
     assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(table), `迁移后应有 ${table} 表`)
@@ -4368,15 +4373,196 @@ checkAsync('P5-OCR5：仓库名与路径非法一律 4xx —— 大写、穿越�
 
 check('P5-OCR6：/v2 只有一条前缀路由，且 routing 不落在 exact 表里', () => {
   const prefixes = ctx.routes.filter((route) => route.kind === 'prefix').map((route) => route.path)
-  assert.deepEqual(prefixes, [`${internals.ROUTE_PREFIX}/hooks`, `${internals.ROUTE_PREFIX}/v2`])
+  assert.deepEqual(prefixes, [
+    `${internals.ROUTE_PREFIX}/hooks`, `${internals.ROUTE_PREFIX}/v2`,
+    `${internals.ROUTE_PREFIX}/repository`, `${internals.ROUTE_PREFIX}/simple`,
+  ])
   assert.ok(!ctx.routes.some((route) => route.kind === 'exact' && route.path.startsWith(`${internals.ROUTE_PREFIX}/v2`)))
 })
 
+
+// ---------------------------------------------------------------------------------------------
+// P5-3 · Maven / npm / PyPI 只读仓库
+
+const { createPackageIndex, sha512Sri, buildMavenMetadata, sortVersions, normalizePyPIname } = await import('../lib/packages.js')
+
+async function repoTool(workDir, config = {}) {
+  const runtime = internals.createRuntime(fakeContext(), {
+    projects: [{ id: 'demo', path: projectDir }],
+    workDir,
+    scheduler: { enabled: false },
+    artifacts: { baseUrl: 'http://registry.test/api/plugins/cicd' },
+    ...config,
+  })
+  const fresh = fakeContext()
+  internals.registerHttpRoutes(fresh, runtime)
+  const routeOf = (pathname) => fresh.routes.find((item) => pathname === item.path || pathname.startsWith(`${item.path}/`))
+  return {
+    runtime,
+    call: (pathname, init = {}) => {
+      const route = routeOf(pathname)
+      assert.ok(route, `仓库路由没注册：${pathname}`)
+      return route.resource(new Request(`http://registry.test${pathname}`, init))
+    },
+    close: () => runtime.dispose(),
+  }
+}
+
+checkAsync('P5-3-S1：Maven —— publish 坐标后 maven-metadata.xml 由库生成，jar 走 CAS 且 digest 恒等', async () => {
+  const work = mkdtempSync(join(tmpdir(), 'dsh-cicd-maven-'))
+  const repo = await repoTool(work)
+  try {
+    const jar = casFile('demo-1.2.0.jar', 'jar-bytes-v1')
+    const published = await repo.runtime.artifacts({
+      action: 'publish', ecosystem: 'maven', groupId: 'com.example', name: 'demo', version: '1.2.0',
+      extension: 'jar', path: jar, project: 'demo',
+    })
+    assert.equal(published.created, true)
+    assert.equal(published.scope, 'com.example')
+    assert.equal(published.version, '1.2.0')
+    const base = '/api/plugins/cicd/repository/maven/com/example/demo'
+    const jarResponse = await repo.call(`${base}/1.2.0/demo-1.2.0.jar`)
+    assert.equal(jarResponse.status, 200)
+    assert.equal(jarResponse.headers.get('content-digest'), published.digest)
+    assert.equal(Buffer.from(await jarResponse.arrayBuffer()).toString(), 'jar-bytes-v1')
+    // 同坐标换字节 = 坐标不可变，必须拒；同字节重复登记是幂等。
+    await assert.rejects(
+      () => repo.runtime.artifacts({ action: 'publish', ecosystem: 'maven', groupId: 'com.example', name: 'demo', version: '1.2.0', extension: 'jar', path: casFile('demo-1.2.0-other.jar', 'other-bytes'), project: 'demo' }),
+      (error) => error.code === 'PACKAGE_DUPLICATE',
+    )
+    const again = await repo.runtime.artifacts({ action: 'publish', ecosystem: 'maven', groupId: 'com.example', name: 'demo', version: '1.2.0', extension: 'jar', path: jar, project: 'demo' })
+    assert.equal(again.created, false)
+    // 第二个版本：metadata 要把两个版本都列出来，且 latest/release 指向最大版本。
+    await repo.runtime.artifacts({ action: 'publish', ecosystem: 'maven', groupId: 'com.example', name: 'demo', version: '1.10.0', extension: 'jar', path: casFile('demo-1.10.0.jar', 'jar-bytes-v2'), project: 'demo' })
+    const metadata = await repo.call(`${base}/maven-metadata.xml`)
+    assert.equal(metadata.status, 200)
+    assert.match(metadata.headers.get('content-type'), /xml/)
+    const xml = await metadata.text()
+    assert.match(xml, /<latest>1\.10\.0<\/latest>/)
+    assert.ok(xml.indexOf('<version>1.2.0</version>') < xml.indexOf('<version>1.10.0</version>'), '版本要按语义序排列，不是字典序')
+    assert.match(xml, /<groupId>com\.example<\/groupId>/)
+  } finally {
+    repo.close()
+  }
+})
+
+checkAsync('P5-3-S2：npm —— packument 的 tarball 指向 CAS，integrity 是入库时算好的 SRI', async () => {
+  const work = mkdtempSync(join(tmpdir(), 'dsh-cicd-npm-'))
+  const repo = await repoTool(work)
+  try {
+    const tarball = casFile('pkg-1.0.0.tgz', 'npm-tarball-bytes')
+    const published = await repo.runtime.artifacts({
+      action: 'publish', ecosystem: 'npm', name: '@demo/pkg', version: '1.0.0', path: tarball, project: 'demo',
+      manifest: { name: '@demo/pkg', version: '1.0.0', main: 'index.js' },
+    })
+    assert.equal(published.scope, '@demo')
+    assert.equal(published.name, 'pkg')
+    const expectedSri = `sha512-${createHash('sha512').update('npm-tarball-bytes').digest('base64')}`
+    const packumentResponse = await repo.call('/api/plugins/cicd/repository/npm/@demo%2fpkg')
+    assert.equal(packumentResponse.status, 200)
+    const packument = await packumentResponse.json()
+    assert.equal(packument.name, '@demo/pkg')
+    const entry = packument.versions['1.0.0']
+    assert.equal(entry.dist.integrity, expectedSri)
+    assert.equal(entry.dist.shasum, published.digest.slice('sha256:'.length))
+    assert.equal(entry.dist.tarball, 'http://registry.test/api/plugins/cicd/repository/npm/@demo/pkg/-/pkg-1.0.0.tgz')
+    assert.equal(packument['dist-tags'].latest, '1.0.0')
+    assert.equal(packument.versions['1.0.0'].main, 'index.js', 'manifest 里的字段要原样透出')
+    // 客户端真正拉的是 tarball：路径带 @scope 和不带 scope 两种写法都得能取到同一份字节。
+    const tarballResponse = await repo.call('/api/plugins/cicd/repository/npm/@demo/pkg/-/pkg-1.0.0.tgz')
+    assert.equal(tarballResponse.status, 200)
+    assert.equal(Buffer.from(await tarballResponse.arrayBuffer()).toString(), 'npm-tarball-bytes')
+    // 包名归一失败要在入库时就拒，不能等到客户端 404。
+    await assert.rejects(
+      () => repo.runtime.artifacts({ action: 'publish', ecosystem: 'npm', name: 'Not-Upper', version: '1.0.0', path: casFile('bad.tgz', 'x'), project: 'demo' }),
+      (error) => error.code === 'PACKAGE_INVALID',
+    )
+  } finally {
+    repo.close()
+  }
+})
+
+checkAsync('P5-3-S3：PyPI —— PEP 503 HTML 与 PEP 691 JSON 按 Accept 协商，文件名与 hash 都对得上', async () => {
+  const work = mkdtempSync(join(tmpdir(), 'dsh-cicd-pypi-'))
+  const repo = await repoTool(work)
+  try {
+    const wheel = casFile('Demo_Pkg-1.0.0-py3-none-any.whl', 'wheel-bytes')
+    const published = await repo.runtime.artifacts({
+      action: 'publish', ecosystem: 'pypi', name: 'Demo.Pkg', version: '1.0.0', extension: 'whl', classifier: 'py3-none-any', path: wheel, project: 'demo', filename: 'Demo_Pkg-1.0.0-py3-none-any.whl',
+    })
+    // 名字归一：Demo.Pkg → demo-pkg（PEP 503）。
+    assert.equal(published.name, normalizePyPIname('Demo.Pkg'))
+    const html = await repo.call('/api/plugins/cicd/simple/demo-pkg/')
+    assert.equal(html.status, 200)
+    assert.match(html.headers.get('content-type'), /text\/html/)
+    const body = await html.text()
+    assert.match(body, /href="[^"]*Demo_Pkg-1\.0\.0-py3-none-any\.whl#sha256=[0-9a-f]{64}"/)
+    const jsonResponse = await repo.call('/api/plugins/cicd/simple/demo-pkg/', { headers: { accept: 'application/vnd.pypi.simple.v1+json' } })
+    assert.equal(jsonResponse.status, 200)
+    assert.equal(jsonResponse.headers.get('content-type'), 'application/vnd.pypi.simple.v1+json')
+    const index = await jsonResponse.json()
+    assert.equal(index.meta['api-version'], '1.0')
+    assert.equal(index.files.length, 1)
+    assert.equal(index.files[0].filename, 'Demo_Pkg-1.0.0-py3-none-any.whl')
+    assert.equal(index.files[0].hashes.sha256, published.digest.slice('sha256:'.length))
+    const file = await repo.call('/api/plugins/cicd/simple/demo-pkg/Demo_Pkg-1.0.0-py3-none-any.whl')
+    assert.equal(file.status, 200)
+    assert.equal(Buffer.from(await file.arrayBuffer()).toString(), 'wheel-bytes')
+    // 不存在的项目 / 不存在的文件都是 404，不是 500。
+    assert.equal((await repo.call('/api/plugins/cicd/simple/nope/')).status, 404)
+    assert.equal((await repo.call('/api/plugins/cicd/simple/demo-pkg/missing.whl')).status, 404)
+  } finally {
+    repo.close()
+  }
+})
+
+checkAsync('P5-3-S4：仓库只读 —— 写方法与越界路径一律拒绝，publish 的 digest 必须已在 CAS', async () => {
+  const work = mkdtempSync(join(tmpdir(), 'dsh-cicd-ro-'))
+  const repo = await repoTool(work)
+  try {
+    const put = await repo.call('/api/plugins/cicd/repository/maven/com/example/demo/1.0.0/demo-1.0.0.jar', { method: 'PUT', body: 'x' })
+    assert.equal(put.status, 405)
+    assert.equal((await put.json()).code, 'REGISTRY_READ_ONLY')
+    // 越界路径段：任何一段是 `..` 都不能进解析器。
+    const escape = parseRegistryPath('/api/plugins/cicd/repository/maven/../../etc/passwd')
+    assert.equal(escape.invalid, true)
+    assert.deepEqual(parseRegistryPath('/api/plugins/cicd/simple/'), { ecosystem: 'pypi', segments: [] })
+    assert.equal(parseRegistryPath('/api/plugins/cicd/elsewhere'), null)
+    await assert.rejects(
+      () => repo.runtime.artifacts({ action: 'publish', ecosystem: 'maven', groupId: 'com.example', name: 'ghost', version: '1.0.0', extension: 'jar', digest: `sha256:${'0'.repeat(64)}`, project: 'demo' }),
+      (error) => error.code === 'ARTIFACT_NOT_FOUND',
+    )
+    await assert.rejects(
+      () => repo.runtime.artifacts({ action: 'publish', ecosystem: 'cargo', name: 'x', version: '1.0.0', path: casFile('x.bin', 'x'), project: 'demo' }),
+      (error) => error.code === 'PACKAGE_INVALID',
+    )
+  } finally {
+    repo.close()
+  }
+})
+
+check('P5-3-S5：版本排序与坐标解析的小件单独钉住（字典序会把 1.10.0 排到 1.9.0 前面）', () => {
+  assert.deepEqual(sortVersions(['1.9.0', '1.10.0', '1.2.0']), ['1.2.0', '1.9.0', '1.10.0'])
+  // FAQ：仓库里同时有 2.0.0 与它的预发布版时，预发布版不能顶到最前面去当「最新」。
+  assert.equal(sortVersions(['2.0.0', '2.0.0-rc1', '2.0.0-beta']).pop(), '2.0.0')
+  assert.equal(normalizePyPIname('Foo_Bar.baz'), 'foo-bar-baz')
+  // 裸 :memory: 库没有建表——迁移过的库才是 createPackageIndex 的合法输入。
+  const pkgDb = openDatabase(join(root, 'packages-index.sqlite'))
+  try { assert.equal(typeof createPackageIndex({ db: pkgDb, has: () => true }).register, 'function') } finally { pkgDb.close() }
+  // 只有一个版本时不写 <versioning>（没得选），两个以上才列。
+  // version 是「版本级」坐标，级别不同不写 versioning。
+  assert.doesNotMatch(buildMavenMetadata({ groupId: 'g', artifactId: 'a', version: '1.0.0', entries: ['1.0.0'] }), /<versioning>/)
+  const xml = buildMavenMetadata({ groupId: 'g', artifactId: 'a', entries: ['1.0.0', '2.0.0'] })
+  assert.match(xml, /<versioning>/)
+  assert.match(xml, /<latest>2\.0\.0<\/latest>/)
+  assert.equal(sha512Sri(createHash('sha512').update('x')), `sha512-${createHash('sha512').update('x').digest('base64')}`)
+})
 check('P5-S11：DB —— 制品表随 v10 迁出，artifact_blobs 只存索引不存字节', () => {
   const db = openDatabase(join(root, 'artifacts-db.sqlite'))
   try {
     const columns = db.prepare('PRAGMA table_info(artifact_blobs)').all().map((row) => row.name)
     assert.deepEqual(columns.sort(), ['bytes', 'created_at', 'digest', 'job_id', 'media_type', 'project_id', 'run_id', 'source_path'])
+    assert.equal(Number(db.prepare('PRAGMA user_version').get().user_version), 11)
     assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE name = 'idx_artifact_refs_digest'").get())
   } finally { db.close() }
 })

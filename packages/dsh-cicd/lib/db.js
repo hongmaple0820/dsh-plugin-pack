@@ -26,8 +26,11 @@ export const DB_FILE_NAME = 'cicd.db'
  * 9 — v3.0-P3：releases 增加 artifact_digest / mode / strategy / instances / operator。
  *     回滚必须只用不可变摘要（tag 会移动，digest 不会）；一个 release 落在一台主机的多个
  *     实例上，端口与 pid 是回滚现场的一部分，不能只记一个 host。
+ * 11 — v3.0-P5-3：artifact_refs 重建为 WITHOUT ROWID（owner,name 就是主键），
+ *     并新增 artifact_packages —— Maven/npm/PyPI 的坐标（生态 + 名字 + 版本）指向 digest。
+ *     没有这张表，`/repository/maven/...` 只能靠扫目录猜版本顺序，maven-metadata.xml 也就无从生成。
  */
-export const SCHEMA_VERSION = 10
+export const SCHEMA_VERSION = 11
 
 const DDL = [
   `CREATE TABLE IF NOT EXISTS runs (
@@ -235,6 +238,8 @@ const DDL = [
   // ---- v3.0-P5 --------------------------------------------------------------------------------
   // 制品 CAS 的元数据索引。**字节不在这个表里**：事实来源是磁盘上按 digest 命名的文件，
   // 这里只记录「谁在哪个项目/运行里上传了什么」，删掉整张表不会丢一份字节。
+  // 指针表重建一次（v11）：它靠 (owner,name) 存活，不该另有一个自增 rowid 在 GC 后一路变长。
+  `DROP TABLE IF EXISTS artifact_refs`,
   `CREATE TABLE IF NOT EXISTS artifact_blobs (
     digest TEXT PRIMARY KEY,
     bytes INTEGER NOT NULL DEFAULT 0,
@@ -256,8 +261,29 @@ const DDL = [
     project_id TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (owner, name)
-  )`,
+  ) WITHOUT ROWID`,
   `CREATE INDEX IF NOT EXISTS idx_artifact_refs_digest ON artifact_refs (digest)`,
+  // v3.0-P5-3：Maven / npm / PyPI 的坐标。一个版本一个 digest，**永远不覆盖**：
+  // 同名同版本再传一次是对「不可变」的违背，宁可在入库时拒掉，也不能让上游的两个构建共用同一个坐标。
+  // meta / integrity 存各生态自己的元数据（SRI、classifier 的扩展名等），按 JSON 原样回给客户端。
+  `CREATE TABLE IF NOT EXISTS artifact_packages (
+    ecosystem TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    bytes INTEGER NOT NULL DEFAULT 0,
+    media_type TEXT NOT NULL DEFAULT '',
+    project_id TEXT NOT NULL DEFAULT '',
+    run_id TEXT NOT NULL DEFAULT '',
+    classifier TEXT NOT NULL DEFAULT '',
+    extension TEXT NOT NULL DEFAULT '',
+    meta TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT ''
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_artifact_packages_key ON artifact_packages (ecosystem, scope, name, version, classifier, extension)`,
+  `CREATE INDEX IF NOT EXISTS idx_artifact_packages_name ON artifact_packages (ecosystem, scope, name, created_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_artifact_packages_digest ON artifact_packages (digest)`,
 ]
 
 const OPERATION_COLUMNS = [
@@ -319,6 +345,38 @@ function rebuildStepsWithJobId(db) {
   return true
 }
 
+/**
+ * v10 的 artifact_refs 带隐式 rowid；v11 起改成 WITHOUT ROWID（主键即数据）。
+ * 指针会被反复覆盖，rowid 只增不减，长期跑会留下永远用不到的 id 空洞——不是正确性问题，
+ * 但一张「只有两列主键」的表没有理由付这个代价。数据要原样搬过去。
+ */
+function ensureRefsWithoutRowid(db) {
+  const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'artifact_refs'").get()
+  const sql = String(row?.sql || '')
+  if (!sql || /WITHOUT\s+ROWID/i.test(sql)) return false
+  db.exec('BEGIN')
+  try {
+    db.exec(`CREATE TABLE artifact_refs_v11 (
+      owner TEXT NOT NULL,
+      name TEXT NOT NULL,
+      digest TEXT NOT NULL,
+      previous TEXT NOT NULL DEFAULT '',
+      project_id TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL DEFAULT '',
+      PRIMARY KEY (owner, name)
+    ) WITHOUT ROWID`)
+    db.exec(`INSERT INTO artifact_refs_v11 (owner, name, digest, previous, project_id, updated_at)
+      SELECT owner, name, digest, previous, project_id, updated_at FROM artifact_refs`)
+    db.exec('DROP TABLE artifact_refs')
+    db.exec('ALTER TABLE artifact_refs_v11 RENAME TO artifact_refs')
+    db.exec('COMMIT')
+  } catch (error) {
+    try { db.exec('ROLLBACK') } catch { /* 回滚失败就让错误继续抛 */ }
+    throw error
+  }
+  return true
+}
+
 function migrate(db) {
   const row = db.prepare('PRAGMA user_version').get()
   const version = Number(row?.user_version ?? 0)
@@ -355,6 +413,9 @@ function migrate(db) {
       db.exec(`ALTER TABLE releases ADD COLUMN ${name} TEXT NOT NULL DEFAULT ''`)
     }
   }
+  // v10 → v11：指针表改成 WITHOUT ROWID。v10 的迁移脚本先建过一次普通表（带 rowid），
+  // 这里按「有没有 rowid」判新旧——PRAGMA index_list 看不出这个，只能问 sqlite_master 的原始 DDL。
+  ensureRefsWithoutRowid(db)
   db.exec(`CREATE INDEX IF NOT EXISTS idx_operations_at ON operations (at DESC)`)
   db.exec(`UPDATE operations SET action = kind WHERE action = '' AND kind <> ''`)
   if (version < SCHEMA_VERSION) db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
