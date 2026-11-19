@@ -726,7 +726,11 @@ export function parsePipe(source, { path = 'pipe.yml' } = {}) {
   // 解析只做形状检查，语义判定统一在 lib/environments.js 的 parseEnvironmentGuards ——
   // 两处各写一份校验，最后一定会出现"pipe 说合法、运行时说不合法"的分裂。
   const environments = normalizePipeEnvironments(root.environments)
-  return { version, name, vars: vars || {}, targets: normalizedTargets, stages: normalizedStages, triggers, toolchain, environments, path }
+  // v3.0-P6-1：defaultTarget 要让编辑器预览知道「不选目标时会落到哪一个」，否则预览挑的默认值
+  // 和真正运行时的选择规则可能不一样（预览显示 prod、实跑 staging 是最坏的一种不一致）。
+  const defaultTarget = typeof root.default_target === 'string' ? root.default_target.trim() : ''
+  if (defaultTarget && !targetNames.has(defaultTarget)) throw new PipeError(`default_target 指向不存在的 target “${defaultTarget}”`)
+  return { version, name, vars: vars || {}, targets: normalizedTargets, defaultTarget, stages: normalizedStages, triggers, toolchain, environments, path }
 }
 
 /**
@@ -793,10 +797,12 @@ function normalizeToolchain(raw) {
 
 const VAR_PATTERN = /\$\{\{\s*([A-Za-z_]\w*)\s*\}\}/g
 
-export function interpolate(text, vars = {}) {
+export function interpolate(text, vars = {}, { onUse = null } = {}) {
   if (typeof text !== 'string') return text
   return text.replace(VAR_PATTERN, (_match, name) => {
     if (!Object.prototype.hasOwnProperty.call(vars, name)) throw new PipeError(`未定义变量 ${name}`, { code: 'PIPE_VAR' })
+    // v3.0-P6-1：编辑器预览要知道「这条命令用了哪些变量」，好把密钥类变量显示成占位符而不是明文。
+    if (typeof onUse === 'function') onUse(name)
     return String(vars[name] ?? '')
   })
 }
@@ -846,6 +852,15 @@ function parseStageWhen(when) {
   throw new PipeError(`when 只支持 branch == 'x'、tag == 'x'、env == 'x'、changed == 'x' 或 changed: path/**（收到 “${text}”）`, { code: 'PIPE_WHEN' })
 }
 
+/** v3.0-P6-1：预览要解释「这个 stage 为什么没出现在计划里」，所以把判定暴露出来。 */
+export function explainWhen(condition, context) {
+  return evaluateWhen(condition, context)
+}
+
+export function stageConditionOf(stage) {
+  try { return parseStageWhen(stage && stage.when) } catch { return null }
+}
+
 function evaluateWhen(condition, context) {
   if (!condition) return true
   if (condition.kind === 'changed') return matchArtifacts([condition.pattern], context.changed).length > 0
@@ -878,7 +893,7 @@ function topological(stages) {
  * `lib/model.js` 的 job（已经过 matrix 展开，还没插值），如果 runner 自己再写一遍
  * kind/deploy 判定，两处迟早对不上（比如 `uses` 在一个地方算 run、在另一个地方算动作）。
  */
-export function buildStep(step, { index = 0, jobId = '', vars = {}, target = '', stageManual = false, matrix = null } = {}) {
+export function buildStep(step, { index = 0, jobId = '', vars = {}, target = '', stageManual = false, matrix = null, onInterpolate = null } = {}) {
   const isDeploy = step.deploy !== undefined && step.deploy !== null
   const isUses = !isDeploy && typeof step.uses === 'string' && step.uses.trim() !== ''
   const kind = isDeploy ? 'deploy' : (isUses ? 'uses' : 'run')
@@ -909,10 +924,10 @@ export function buildStep(step, { index = 0, jobId = '', vars = {}, target = '',
   }
   if (kind === 'deploy') return { ...base, command: `deploy:${deployTarget || ''}` }
   if (kind === 'uses') return { ...base, command: `uses:${step.uses.trim()}`, uses: step.uses.trim(), with: step.with || null }
-  return { ...base, command: interpolate(step.run, vars) }
+  return { ...base, command: interpolate(step.run, vars, { onUse: onInterpolate }) }
 }
 
-export function planPipeline(pipe, { project, target, env = {} } = {}) {
+export function planPipeline(pipe, { project, target, env = {}, onInterpolate = null } = {}) {
   if (!pipe || !Array.isArray(pipe.stages)) throw new PipeError('planPipeline 需要 parsePipe 的结果')
   const projectId = typeof project === 'string' ? project : project?.id || ''
   const envContext = {
@@ -943,6 +958,7 @@ export function planPipeline(pipe, { project, target, env = {} } = {}) {
       target,
       stageManual: Boolean(stage.manual),
       matrix,
+      onInterpolate,
     })
 
     const steps = []

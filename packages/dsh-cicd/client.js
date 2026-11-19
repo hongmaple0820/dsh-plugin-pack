@@ -296,6 +296,33 @@ window.__ModuleLoader__.load({
 .cicd-editor-head{flex:none;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
 .cicd-editor-meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:var(--dsw-alias-label-tertiary);font-size:11.5px;line-height:16px}
 .cicd-editor-body{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;gap:8px}
+.cicd-editor-cols{flex:1 1 auto;min-height:0;display:flex;gap:10px}
+.cicd-editor-col{display:flex;flex-direction:column;min-height:0;min-width:0;gap:6px;box-sizing:border-box}
+.cicd-editor-col.is-form{flex:0 0 232px}
+.cicd-editor-col.is-source,.cicd-editor-col.is-preview{flex:1 1 0}
+.cicd-editor-col-head{flex:none;display:flex;align-items:center;justify-content:space-between;gap:6px;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:15px}
+.cicd-editor-form{flex:1 1 auto;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:8px;padding:10px;border:.5px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-md, 8px);background:var(--dsw-alias-bg-layer-2)}
+.cicd-editor-field{display:flex;flex-direction:column;gap:4px;font-size:11.5px;line-height:16px;color:var(--dsw-alias-label-secondary)}
+.cicd-editor-input,.cicd-editor-select{box-sizing:border-box;width:100%;padding:5px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-size:12px;line-height:17px;outline:none}
+.cicd-editor-input:focus,.cicd-editor-select:focus{border-color:var(--dsw-alias-border-l4)}
+.cicd-editor-readonly{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:15px;overflow-wrap:anywhere}
+.cicd-editor-preview{flex:1 1 auto;min-height:0;overflow:auto;padding:10px 12px;border:.5px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-md, 8px);background:var(--dsw-alias-bg-layer-2);box-sizing:border-box;display:flex;flex-direction:column;gap:8px}
+.cicd-preview-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:11.5px;line-height:16px;color:var(--dsw-alias-label-secondary)}
+.cicd-preview-chip{padding:1px 6px;border-radius:999px;border:.5px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary);font-size:10.5px;line-height:15px}
+.cicd-preview-stage{display:flex;flex-direction:column;gap:4px}
+.cicd-preview-stage-title{display:flex;align-items:center;gap:6px;color:var(--dsw-alias-label-primary);font-size:12px;line-height:17px;font-weight:500}
+.cicd-preview-step{display:flex;flex-direction:column;gap:2px;padding:4px 0 4px 8px;border-left:2px solid var(--dsw-alias-border-l1)}
+.cicd-preview-step.is-manual{border-left-color:var(--dsw-alias-state-warning-primary)}
+.cicd-preview-step.is-deploy{border-left-color:var(--dsw-alias-brand-primary)}
+.cicd-preview-cmd{margin:0;padding:0;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;line-height:16px;color:var(--dsw-alias-label-primary);white-space:pre-wrap;overflow-wrap:anywhere}
+.cicd-preview-note{color:var(--dsw-alias-label-tertiary);font-size:10.5px;line-height:15px}
+.cicd-preview-skipped{display:flex;flex-direction:column;gap:2px;padding:6px 8px;border:.5px dashed var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm, 6px);color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}
+.cicd-preview-vars{display:flex;flex-direction:column;gap:2px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:16px}
+.cicd-preview-var{display:flex;gap:6px;align-items:baseline;overflow-wrap:anywhere}
+.cicd-preview-var-name{color:var(--dsw-alias-label-secondary);flex:0 0 auto}
+.cicd-preview-var-value{color:var(--dsw-alias-label-primary);flex:1 1 auto;min-width:0;overflow-wrap:anywhere}
+.cicd-preview-var.is-secret .cicd-preview-var-value{color:var(--dsw-alias-label-tertiary)}
+.cicd-preview-var.is-undeclared .cicd-preview-var-name{color:var(--dsw-alias-state-warning-primary)}
 .cicd-editor-textarea{flex:1 1 auto;min-height:0;box-sizing:border-box;width:100%;padding:10px 12px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md, 8px);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;line-height:19px;resize:none;outline:none}
 .cicd-editor-textarea:focus{border-color:var(--dsw-alias-border-l4)}
 .cicd-editor-actions{flex:none;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -1648,9 +1675,122 @@ window.__ModuleLoader__.load({
     }
 
     /** v2-M0：pipe.yml 编辑器视图。 */
-    function EditorView({ editor, editorValidate, editorSave, projectId, busy, hasTarget, onReload, onChange, onValidate, onSave, onDryRun }) {
+    /**
+     * v3.0-P6-1：三栏编辑器的左栏。表单只覆盖最常改的几项，改完写回同一份 YAML 文本 ——
+     * 中栏始终是唯一真相，不存在「表单状态与源码不同步」这种两份真相的经典缺陷。
+     */
+    function EditorForm({ preview, projectId, target, onTarget, onInsertStage, disabled }) {
+      const spec = (preview && preview.targetSpec) || null
+      const hosts = spec && Array.isArray(spec.hosts) ? spec.hosts : []
+      const targets = preview && Array.isArray(preview.targets) ? preview.targets : []
+      return h('div', { className: 'cicd-editor-form' },
+        h('div', { className: 'cicd-editor-field' }, '项目',
+          h('span', { className: 'cicd-editor-readonly' }, projectId || '未选择')),
+        h('label', { className: 'cicd-editor-field' }, '预览目标',
+          h('select', {
+            className: 'cicd-editor-select',
+            value: target || '',
+            onChange: (event) => onTarget(event.currentTarget.value),
+            disabled,
+          },
+            targets.length
+              ? targets.map((name) => h('option', { key: name, value: name },
+                name + (preview && preview.defaultTarget === name ? '（默认）' : '')))
+              : h('option', { value: '' }, '无目标'))),
+        h('div', { className: 'cicd-editor-field' }, '目标详情',
+          h('span', { className: 'cicd-editor-readonly' },
+            spec
+              ? (spec.mode || 'native') + ' · ' + (hosts.length ? hosts.join('、') : '本机')
+              : '—')),
+        h('div', { className: 'cicd-editor-field' }, '密钥',
+          h('span', { className: 'cicd-editor-readonly' },
+            preview
+              ? (preview.secretCount ? preview.secretCount + ' 个（预览里显示为 ***）' : '此项目未配置密钥')
+              : '—')),
+        h('button', {
+          className: 'cicd-button',
+          type: 'button',
+          disabled,
+          onClick: onInsertStage,
+          title: '在 pipe.yml 末尾追加一个空 stage',
+        }, '追加 stage'))
+    }
+
+    /** v3.0-P6-1：右栏 —— 展开后的命令、变量取值、被条件跳过的阶段。 */
+    function PreviewPane({ state, onRetry }) {
+      if (!state) return h(EmptyState, { text: '改动 pipe.yml 后这里会显示展开后的命令', tone: 'empty' })
+      if (state.status === 'loading') return h(LoadingState, { text: '正在展开…', rows: 4 })
+      if (state.status === 'error') {
+        const error = state.error || {}
+        return h('div', { className: 'cicd-editor-preview' },
+          h(ErrorState, { title: '展开失败', error, onRetry }),
+          error.code ? h('p', { className: 'cicd-preview-note' }, error.code + (error.line ? ' · 第 ' + error.line + ' 行' : '')) : null)
+      }
+      const data = state.data || {}
+      const stages = Array.isArray(data.stages) ? data.stages : []
+      const skipped = Array.isArray(data.skipped) ? data.skipped : []
+      const vars = Array.isArray(data.vars) ? data.vars : []
+      const used = Array.isArray(data.usedVars) ? data.usedVars : []
+      const usedSet = new Set(used.map((item) => item.name))
+      return h('div', { className: 'cicd-editor-preview' },
+        h('div', { className: 'cicd-preview-head' },
+          h('span', null, data.name || '未命名'),
+          h('span', { className: 'cicd-preview-chip' }, '目标 ' + (data.target || '无')),
+          h('span', { className: 'cicd-preview-chip' }, stages.length + ' 个阶段'),
+          skipped.length ? h('span', { className: 'cicd-preview-chip' }, skipped.length + ' 个被条件跳过') : null),
+        skipped.length
+          ? h('div', { className: 'cicd-preview-skipped' },
+            h('span', null, '按当前分支/标签不会执行：'),
+            skipped.map((item) => h('span', { key: item.id },'· ' + item.id + '（when: ' + item.when + '）')))
+          : null,
+        stages.length
+          ? stages.map((stage) => h('div', { key: stage.id, className: 'cicd-preview-stage' },
+            h('div', { className: 'cicd-preview-stage-title' },
+              h('span', null, stage.id),
+              stage.manual ? h('span', { className: 'cicd-preview-chip' }, '手动') : null,
+              stage.needs && stage.needs.length ? h('span', { className: 'cicd-preview-note' }, 'needs ' + stage.needs.join(', ')) : null),
+            stage.steps.map((step) => h('div', {
+              key: String(step.index),
+              className: 'cicd-preview-step' + (step.manual ? ' is-manual' : '') + (step.kind === 'deploy' ? ' is-deploy' : ''),
+            },
+              // 命令行就是「将执行什么」本身：原样给出，不缩略、不省略。
+              h('p', { className: 'cicd-preview-cmd' }, step.kind === 'deploy'
+                ? '→ 发布到 ' + (step.target || '默认目标')
+                : (step.command || '')),
+              h('span', { className: 'cicd-preview-note' },
+                [
+                  step.name || '',
+                  step.when ? 'when: ' + step.when : '',
+                  step.timeoutSec ? '超时 ' + step.timeoutSec + 's' : '',
+                  step.retries ? '重试 ' + step.retries : '',
+                  step.allowFailure ? '允许失败' : '',
+                ].filter(Boolean).join(' · '))))))
+          : h(EmptyState, { text: '这个目标下没有可执行的阶段', tone: 'empty' }),
+        vars.length
+          ? h('div', { className: 'cicd-preview-vars' },
+            h('div', { className: 'cicd-preview-note' }, '变量（' + vars.length + '）'),
+            vars.map((item) => h('div', {
+              key: item.name,
+              className: 'cicd-preview-var' + (item.secret ? ' is-secret' : '') + (item.undeclared ? ' is-undeclared' : ''),
+            },
+              h('span', { className: 'cicd-preview-var-name' }, item.name),
+              h('span', { className: 'cicd-preview-var-value' }, item.value === '' ? '(空)' : item.value),
+              item.undeclared ? h('span', { className: 'cicd-preview-note' }, '未声明') : null,
+              usedSet.has(item.name) ? null : h('span', { className: 'cicd-preview-note' }, '未使用'))))
+          : null)
+    }
+
+    function EditorView({ editor, editorValidate, editorSave, preview, projectId, target, busy, hasTarget, onReload, onChange, onValidate, onSave, onDryRun, onTarget, onPreview }) {
       const loading = editor.status === 'loading'
       const source = editor.source || ''
+      const previewState = preview || null
+      // 追加 stage 只是把文本补全到最后一行：模板里的 stages 必须是 pipe 的顶层键，
+      // 所以直接追加在最末，用户再改 id 与命令 —— 比弹一个表单问六个字段快得多。
+      const insertStage = useCallback(() => {
+        const base = source.replace(/\s*$/, '')
+        const name = 'stage-' + (base.match(/^\s{2}([A-Za-z0-9_-]+):\s*$/gm) || []).length
+        onChange(base + '\n  ' + name + ':\n    steps:\n      - name: ' + name + '\n        run: echo hello')
+      }, [source, onChange])
       return h('div', { className: 'cicd-editor' },
         h('div', { className: 'cicd-editor-head' },
           h('span', { className: 'cicd-col-title' }, '编辑器' + (projectId ? ' · ' + projectId : '')),
@@ -1661,14 +1801,27 @@ window.__ModuleLoader__.load({
         loading ? h(LoadingState, { text: '正在读取 pipe.yml…', rows: 2 }) : null,
         editor.status !== 'error' && !loading
           ? h('div', { className: 'cicd-editor-body' },
-            h('textarea', {
-              className: 'cicd-editor-textarea',
-              value: source,
-              onChange: (event) => onChange(event.currentTarget.value),
-              spellCheck: false,
-              'aria-label': 'pipe.yml 源码',
-              placeholder: '在这里编辑 pipe.yml…',
-            }),
+            h('div', { className: 'cicd-editor-cols' },
+              h('div', { className: 'cicd-editor-col is-form' },
+                h('div', { className: 'cicd-editor-col-head' }, h('span', null, '表单')),
+                h(EditorForm, { preview: previewState && previewState.status === 'ok' ? previewState.data : null, projectId, target, onTarget, onInsertStage: insertStage, disabled: busy })),
+              h('div', { className: 'cicd-editor-col is-source' },
+                h('div', { className: 'cicd-editor-col-head' },
+                  h('span', null, 'YAML'),
+                  h('span', null, source.split('\n').length + ' 行')),
+                h('textarea', {
+                  className: 'cicd-editor-textarea',
+                  value: source,
+                  onChange: (event) => onChange(event.currentTarget.value),
+                  spellCheck: false,
+                  'aria-label': 'pipe.yml 源码',
+                  placeholder: '在这里编辑 pipe.yml…',
+                })),
+              h('div', { className: 'cicd-editor-col is-preview' },
+                h('div', { className: 'cicd-editor-col-head' },
+                  h('span', null, '将执行什么'),
+                  h('button', { className: 'cicd-button', type: 'button', onClick: onPreview || onValidate, disabled: busy }, '重新展开')),
+                h(PreviewPane, { state: previewState, onRetry: onPreview || onValidate }))),
             h('div', { className: 'cicd-editor-actions' },
               h('button', { className: 'cicd-button', type: 'button', onClick: onValidate, disabled: busy || loading }, '校验'),
               h('button', { className: 'cicd-button cicd-button-primary', type: 'button', onClick: onSave, disabled: busy || loading || !editor.dirty }, '保存'),
@@ -1945,6 +2098,8 @@ window.__ModuleLoader__.load({
       const [projectMetas, setProjectMetas] = useState({})
       /** v2-M0：编辑器状态（source / dirty / status / error）。 */
       const [editor, setEditor] = useState({ status: 'idle', source: '', loaded: false, dirty: false, error: null })
+      // v3.0-P6-1：右栏预览。与 editorValidate 分开：一个答「语法对不对」，一个答「会执行什么」。
+      const [editorPreview, setEditorPreview] = useState(null)
       const [editorValidate, setEditorValidate] = useState(null)
       const [editorSave, setEditorSave] = useState(null)
       /** v2-M0：新建向导的提交结果。 */
@@ -2559,9 +2714,11 @@ window.__ModuleLoader__.load({
           setEditor({ status: 'idle', source: '', loaded: false, dirty: false, error: null })
           setEditorValidate(null)
           setEditorSave(null)
+          setEditorPreview(null)
           return
         }
         setEditor({ status: 'loading', source: '', loaded: false, dirty: false, error: null })
+        setEditorPreview(null)
         // 编辑器刻意清空源码：读回来的内容会覆盖用户正在改的那份，宁可先显示骨架也不要吞掉编辑。
         setEditorValidate(null)
         setEditorSave(null)
@@ -2586,6 +2743,35 @@ window.__ModuleLoader__.load({
         }
       }, [editor.source, freshSignal])
 
+      /**
+       * v3.0-P6-1：展开当前文本（/preview?source=）。和校验分开，因为用户要的答案不一样：
+       * 校验答「这份 YAML 合不合法」，预览答「跑起来到底会执行什么命令、哪些 stage 会被跳过」。
+       */
+      const runEditorPreview = useCallback(async () => {
+        const text = editor.source || ''
+        if (!text.trim()) { setEditorPreview(null); return }
+        setEditorPreview((current) => ({ ...(current && current.data ? current : {}), status: 'loading', error: null }))
+        try {
+          const payload = await callApi('preview', {
+            source: text,
+            project: projectId || '',
+            target: targetName || '',
+          }, freshSignal('preview'))
+          setEditorPreview({ status: 'ok', data: payload })
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          setEditorPreview({ status: 'error', error })
+        }
+      }, [editor.source, projectId, targetName, freshSignal])
+
+      // 输入停下 500ms 再展开：每敲一个字发一次请求既浪费也永远追不上输入。
+      useEffect(() => {
+        if (view !== 'editor' || editor.status !== 'ready') return undefined
+        const text = editor.source || ''
+        if (!text.trim()) return undefined
+        const timer = setTimeout(() => { void runEditorPreview() }, 500)
+        return () => clearTimeout(timer)
+      }, [view, editor.status, editor.source, runEditorPreview])
       /** v2-M0：保存 pipe.yml（/pipe-save confirm=1），成功后刷新目标与计划。 */
       const runEditorSave = useCallback(async () => {
         setEditorSave({ status: 'running', message: '' })
@@ -2845,14 +3031,18 @@ window.__ModuleLoader__.load({
           editor,
           editorValidate,
           editorSave,
+          preview: editorPreview,
           projectId,
+          target: targetName || '',
           busy,
           hasTarget: Boolean(targetName),
           onReload: () => void loadEditor(projectId),
-          onChange: (source) => { setEditor((prev) => ({ ...prev, source, dirty: true })); setEditorValidate(null); setEditorSave(null) },
+          onChange: (source) => { setEditor((prev) => ({ ...prev, source, dirty: true })); setEditorValidate(null); setEditorSave(null); setEditorPreview(null) },
           onValidate: () => void runEditorValidate(),
           onSave: () => void runEditorSave(),
           onDryRun: () => void startRun(true),
+          onTarget: onSelectTarget,
+          onPreview: () => void runEditorPreview(),
         })
         : view === 'create'
         ? h(CreateView, {

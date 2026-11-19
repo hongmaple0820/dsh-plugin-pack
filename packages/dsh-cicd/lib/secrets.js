@@ -21,6 +21,7 @@
  *     get(project, scope, name)          → value（未设/解不开返回 ''）
  *     list(project, scope = '')          → [{ ref, scope, name, createdAt }]
  *     refsForInterpolate(project, vars)  → { ...vars, SECRET_NAME: value, ... }
+ *     namesFor(project)                  → [名字...]，编辑器预览用（不返回明文）
  *     valuesFor(project)                 → [明文...]，供日志脱敏
  *     stats()                            → { entries, encrypted, plaintext, backend }
  *     rotate()                           → 用新密钥重加密全部记录
@@ -204,6 +205,20 @@ export function createSecretStore({ dir, file = '', keyFile = '', key = '', env 
     return merged
   }
 
+  /**
+   * 该项目 secret 的**名字**表（v3.0-P6-1）。
+   * 编辑器预览要用它把密钥类变量写成占位符：预览把明文命令渲染到屏幕上，
+   * 而用户下一步往往是截图或粘贴给别人看 —— 预览里出现明文就等于泄露。
+   */
+  function namesFor(project) {
+    const out = []
+    for (const key of Object.keys(all)) {
+      const entry = all[key]
+      if (entry.project === project) out.push(entry.name)
+    }
+    return out.sort()
+  }
+
   /** 该项目所有 secret 的**明文值**，按长度降序，供日志脱敏。 */
   function valuesFor(project) {
     const out = []
@@ -263,5 +278,5 @@ export function createSecretStore({ dir, file = '', keyFile = '', key = '', env 
     /* 文件已持久化，无需额外清理 */
   }
 
-  return { set, get, list, remove, refsForInterpolate, valuesFor, stats, rotate, dispose, backend, file: path }
+  return { set, get, list, remove, refsForInterpolate, valuesFor, namesFor, stats, rotate, dispose, backend, file: path }
 }

@@ -773,7 +773,7 @@ function callPath(pathname, query = '', { headers = {} } = {}) {
   return route.resource(new Request(`http://x${pathname}${query}`, { headers }))
 }
 
-check('apply：注册 32 个工具、42 条路由（38 exact + 4 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
+check('apply：注册 32 个工具、43 条路由（39 exact + 4 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
   assert.equal(ctx.toolsList.length, 32)
   assert.deepEqual(ctx.toolsList.map((tool) => tool.name).sort(), [
     'cicd_approve', 'cicd_artifacts', 'cicd_audit', 'cicd_auth', 'cicd_cancel', 'cicd_dora', 'cicd_environments', 'cicd_locks',
@@ -789,13 +789,13 @@ check('apply：注册 32 个工具、42 条路由（38 exact + 4 prefix）、1 �
     assert.equal(typeof tool.output.render, 'function')
     assert.equal(typeof tool.execute, 'function')
   }
-  assert.equal(ctx.routes.length, 42)
+  assert.equal(ctx.routes.length, 43)
   assert.deepEqual(ctx.routes.filter((route) => route.kind === 'exact').map((route) => route.path).sort(), [
     '/api/plugins/cicd/approvals', '/api/plugins/cicd/approve', '/api/plugins/cicd/artifacts', '/api/plugins/cicd/audit', '/api/plugins/cicd/auth',
     '/api/plugins/cicd/cancel', '/api/plugins/cicd/dora', '/api/plugins/cicd/environments', '/api/plugins/cicd/locks',
     '/api/plugins/cicd/log', '/api/plugins/cicd/metrics', '/api/plugins/cicd/notify-ledger', '/api/plugins/cicd/notify-test',
     '/api/plugins/cicd/operations', '/api/plugins/cicd/pipe-save',
-    '/api/plugins/cicd/plan', '/api/plugins/cicd/project-create', '/api/plugins/cicd/project-meta', '/api/plugins/cicd/projects',
+    '/api/plugins/cicd/plan', '/api/plugins/cicd/preview', '/api/plugins/cicd/project-create', '/api/plugins/cicd/project-meta', '/api/plugins/cicd/projects',
     '/api/plugins/cicd/promotions', '/api/plugins/cicd/rbac', '/api/plugins/cicd/releases', '/api/plugins/cicd/rollback', '/api/plugins/cicd/run',
     '/api/plugins/cicd/runner-log', '/api/plugins/cicd/runner-poll', '/api/plugins/cicd/runner-register', '/api/plugins/cicd/runner-result',
     '/api/plugins/cicd/runners', '/api/plugins/cicd/runs', '/api/plugins/cicd/secrets', '/api/plugins/cicd/storage',
@@ -811,7 +811,7 @@ check('apply：注册 32 个工具、42 条路由（38 exact + 4 prefix）、1 �
   assert.equal(typeof ctx.upgrades[0].handler, 'function')
 })
 
-check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补注册 38+4 条；remote() 惰性取 port', () => {
+check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补注册 39+4 条；remote() 惰性取 port', () => {
   const coldRoutes = []
   const coldUpgrades = []
   const coldWeb = {
@@ -833,8 +833,8 @@ check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补�
   assert.ok(typeof scopeFn === 'function', 'apply 应把路由注册挂到 ctx.inject 上')
   // 模拟 webServer 就绪：cordis 以一个能 get 到服务的 scope 触发回调（真实环境由服务就绪事件驱动）。
   scopeFn({ get: (key) => (key === 'webServer' ? coldWeb : undefined), effect() {} })
-  assert.equal(coldRoutes.length, 42, '就绪后应补注册 38 条 exact + 4 条 prefix 路由')
-  assert.equal(coldRoutes.filter((route) => route.kind === 'exact').length, 38)
+  assert.equal(coldRoutes.length, 43, '就绪后应补注册 39 条 exact + 4 条 prefix 路由')
+  assert.equal(coldRoutes.filter((route) => route.kind === 'exact').length, 39)
   assert.equal(coldUpgrades.length, 1, '就绪后应补注册 /log-ws upgrade 路由')
 
   // remote() 惰性解析：apply 时拿不到 port（remoteBase 为空），就绪后首次调用应取到 55470。
@@ -892,6 +892,69 @@ checkAsync('routes：validate 校验原始文本与落盘文件，错误带行�
   assert.equal((await call('/validate', '?extra=1')).status, 400)
 })
 
+checkAsync('v3.0-P6-1 preview：把未保存的文本插值成命令，密钥写成 ***，跳过的阶段说得出口', async () => {
+  const src = [
+    'version: 1',
+    'name: previewed',
+    'default_target: staging',
+    'vars:',
+    '  GREETING: hello',
+    'targets:',
+    '  prod:',
+    '    hosts: [h1]',
+    '    path: /srv/prod',
+    '  staging:',
+    '    hosts: [h2]',
+    '    path: /srv/staging',
+    'stages:',
+    '  - id: build',
+    '    steps:',
+    '      - name: greet',
+    '        run: echo ${{GREETING}} on ${{BRANCH}}',
+    '  - id: prod-only',
+    "    when: branch == 'main'",
+    '    needs: [build]',
+    '    steps:',
+    '      - name: ship',
+    '        run: echo ship',
+  ].join('\n')
+
+  const body = await call('/preview', `?source=${encodeURIComponent(src)}`).then((response) => response.json())
+  assert.equal(body.ok, true)
+  assert.equal(body.name, 'previewed')
+  // default_target 生效：不点目标就用 pipe 自己声明的那个，而不是列表里的第一个。
+  assert.equal(body.target, 'staging')
+  assert.deepEqual(body.targets, ['prod', 'staging'])
+  assert.deepEqual(body.targetSpec.hosts, ['h2'])
+  // 没传分支时 when: branch == 'main' 不成立 —— prod-only 被跳过是正确行为，
+  assert.deepEqual(body.stages.map((stage) => stage.id), ['build'])
+  assert.deepEqual(body.skipped.map((item) => item.id), ['prod-only'])
+  const greet = body.stages[0].steps[0].command
+  assert.equal(greet, 'echo hello on ', 'vars 与 BRANCH 都要经过同一条插值链路（没传分支就是空）')
+  assert.deepEqual(body.usedVars.map((item) => item.name).sort(), ['BRANCH', 'GREETING'])
+
+  // 分支不是 main 时同样跳过：prod-only 的「消失」必须能解释，否则用户以为写了个死 stage。
+  const onDev = await call('/preview', `?source=${encodeURIComponent(src)}&branch=dev`).then((response) => response.json())
+  assert.deepEqual(onDev.stages.map((stage) => stage.id), ['build'])
+  assert.deepEqual(onDev.skipped.map((item) => item.id), ['prod-only'])
+  assert.equal(onDev.skipped[0].when, "branch == 'main'")
+  assert.deepEqual(onDev.skipped[0].needs, ['build'])
+  const onMain = await call('/preview', `?source=${encodeURIComponent(src)}&branch=main`).then((response) => response.json())
+  assert.deepEqual(onMain.stages.map((stage) => stage.id), ['build', 'prod-only'])
+  assert.deepEqual(onMain.skipped, [])
+
+  // 显式点名目标优先于 default_target。
+  const forced = await call('/preview', `?source=${encodeURIComponent(src)}&target=prod`).then((response) => response.json())
+  assert.equal(forced.target, 'prod')
+  assert.deepEqual(forced.targetSpec.hosts, ['h1'])
+
+  // 语法错误走 ok:false + 行号，而不是 4xx —— 编辑器要拿行号去定位。
+  const bad = await call('/preview', `?source=${encodeURIComponent('version: 1\n\tbad: tab\n')}`).then((response) => response.json())
+  assert.equal(bad.ok, false)
+  assert.ok(bad.line > 0)
+  assert.equal((await call('/preview', '', { origin: 'http://evil.test' })).status, 403)
+  assert.equal((await call('/preview', '?extra=1')).status, 400)
+})
 checkAsync('routes：pipe-save 校验通过才写盘，非法源不落盘，写保护与未知参数', async () => {
   assert.equal((await call('/pipe-save', '?project=demo&source=x')).status, 403)
   assert.equal((await call('/pipe-save', '?project=demo&source=x', { headers: { 'x-dsh-cicd': '1' } })).status, 400)
@@ -1039,7 +1102,7 @@ checkAsync('routes：operations 时间线、notify-test 未配置与写保护', 
 })
 
 check('routes：所有资源都走 resource，没有 handler/POST 形态', () => {
-  assert.equal(ctx.routes.length, 42)
+  assert.equal(ctx.routes.length, 43)
   for (const route of ctx.routes) {
     assert.equal(route.handler, undefined)
     assert.ok(route.kind === 'exact' || route.kind === 'prefix')

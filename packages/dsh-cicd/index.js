@@ -21,7 +21,7 @@ import { Readable } from 'node:stream'
 import fs, { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, isAbsolute, join, relative } from 'node:path'
-import { parsePipe, planPipeline, interpolate, matchArtifacts, isHostSelector, parseHostSelector } from './lib/pipe.js'
+import { parsePipe, planPipeline, interpolate, matchArtifacts, isHostSelector, parseHostSelector, explainWhen, stageConditionOf } from './lib/pipe.js'
 import { createStore, DEFAULT_WORK_DIR } from './lib/store.js'
 import { DB_FILE_NAME } from './lib/db.js'
 import { runPipeline, makeRunId } from './lib/runner.js'
@@ -2250,6 +2250,117 @@ function createRuntime(ctx, config) {
             triggers: triggers ? triggerSummary(triggers) : null,
           }
         }),
+      }
+    },
+    /**
+     * v3.0-P6-1：编辑器右侧的「将执行什么」预览。
+     * 和 plan 的区别是它算的是编辑器里那份**还没保存**的文本，不读项目落盘的 pipe.yml ——
+     * 用户改一行就能看见展开后的命令、变量取值和被跳过的条件，而不是保存之后才发现命令不对。
+     * 密钥类的变量在这里一律写成占位符：预览是给人看甚至给人截图的，明文不该出现在屏幕上。
+     */
+    previewPipe({ source = '', project: projectId = '', target: targetName = '', branch = '', tag = '' } = {}) {
+      let pipe = null
+      try {
+        pipe = parsePipe(source || '', { path: 'pipe.yml（未保存）' })
+      } catch (error) {
+        return { ok: false, error: error.message || String(error), code: error.code || 'PIPE_INVALID', line: error.line || 0 }
+      }
+      // 项目 id 只用于插值里的 ${PROJECT}；没选项目时留空，宁可显示空也不要猜一个。
+      let projectPath = ''
+      if (projectId) {
+        try { projectPath = pickProject(options, projectId).path } catch { projectPath = '' }
+      }
+      // 走与执行同一条插值链路（interpolate → PIPE_VAR），所以预览里能跑通的命令，跑起来也能通过。
+      const secretNames = new Set()
+      const declared = new Set()
+      const vars = {
+        CI: '1',
+        PROJECT: projectId,
+        TARGET: targetName,
+        BRANCH: branch,
+        COMMIT: '',
+        RELEASE_ID: '',
+        ...(pipe.vars || {}),
+      }
+      for (const name of Object.keys(vars)) declared.add(name)
+      try {
+        const names = typeof secrets.namesFor === 'function' ? secrets.namesFor(projectId) : []
+        for (const name of names) { secretNames.add(name); vars[name] = '***' }
+      } catch { /* secrets 读不出来不该让预览整体失败：这一栏是辅助，不是闸门 */ }
+      // 目标解析与 resolveTarget 一致：显式给了就用，否则 default_target，再否则第一个。
+      const targetNames = Object.keys(pipe.targets)
+      const resolvedTarget = targetName && targetNames.includes(targetName)
+        ? targetName
+        : (pipe.defaultTarget && targetNames.includes(pipe.defaultTarget) ? pipe.defaultTarget : (targetNames[0] || ''))
+      let plan = null
+      try {
+        plan = planPipeline(pipe, {
+          project: { id: projectId, branch, commit: '', tag, env: {} },
+          target: resolvedTarget,
+          env: { branch, commit: '', tag },
+        })
+      } catch (error) {
+        return { ok: false, error: error.message || String(error), code: error.code || 'PIPE_INVALID', line: error.line || 0 }
+      }
+      // 「这条命令用了哪些变量」要再按真实变量算一遍：上面给的占位符只够让插值不抛错，
+      // 不足以说明哪些变量真的被用到了、哪些是密钥。
+      const usedVars = new Map()
+      try {
+        planPipeline(pipe, {
+          project: { id: projectId, branch, commit: '', tag, env: {} },
+          target: resolvedTarget,
+          env: { branch, commit: '', tag },
+          onInterpolate: (name) => usedVars.set(name, (usedVars.get(name) || 0) + 1),
+        })
+      } catch { /* 使用统计是加分项，算不出来不影响预览本身 */ }
+      const skipped = collectSkippedStages(pipe, { branch, tag })
+      const spec = pipe.targets[resolvedTarget] || null
+      const envRows = Object.keys(plan.vars)
+        .sort()
+        .map((name) => ({
+          name,
+          value: secretNames.has(name) ? '***' : String(plan.vars[name] ?? ''),
+          secret: secretNames.has(name),
+          // v3.0-P0 的教训：secret 只能经 vars 插值，写在 stage.env 顶层是不生效的。
+          // 预览把「声明了但这台机器上没值」直接说出来，省掉一次跑起来才发现变量为空。
+          undeclared: !declared.has(name),
+        }))
+      return {
+        ok: true,
+        path: pipe.path,
+        name: pipe.name,
+        version: pipe.version,
+        projectPath,
+        target: resolvedTarget,
+        targets: targetNames,
+        defaultTarget: pipe.defaultTarget || '',
+        targetSpec: spec ? {
+          hosts: Array.isArray(spec.hosts) ? spec.hosts : [],
+          mode: spec.mode || 'native',
+          service: spec.service || '',
+        } : null,
+        vars: envRows,
+        secretCount: secretNames.size,
+        usedVars: [...usedVars.entries()].map(([name, count]) => ({ name, count, secret: secretNames.has(name) })),
+        skipped,
+        stages: plan.stages.map((stage) => ({
+          id: stage.id,
+          needs: stage.needs,
+          manual: Boolean(stage.manual),
+          steps: stage.steps.map((step) => ({
+            index: step.index,
+            jobId: step.jobId || '',
+            name: step.name,
+            kind: step.kind,
+            command: step.command,
+            when: step.when || '',
+            manual: Boolean(step.manual),
+            timeoutSec: step.timeoutSec,
+            retries: step.retries,
+            allowFailure: Boolean(step.allowFailure),
+            target: step.deploy?.target || '',
+          })),
+        })),
       }
     },
     async plan({ project: projectId, target: targetName } = {}) {
@@ -5107,6 +5218,24 @@ async function projectCreateResource(request, runtime) {
   } catch (error) { return errorJson(error) }
 }
 
+/**
+ * v3.0-P6-1：planPipeline 只返回「会跑的」stage，被 when 挡掉的直接消失。
+ * 预览里那些「消失了」的 stage 恰恰是最需要解释的：用户以为自己写了一个 prod 分支，
+ * 结果它压根没进计划。这里把它们连同条件原文与判定结果一起返回，交给编辑器显示成灰行。
+ */
+function collectSkippedStages(pipe, { branch = '', tag = '' } = {}) {
+  const context = { branch, tag, env: '', changed: [] }
+  const out = []
+  for (const stage of pipe.stages || []) {
+    if (!stage.when) continue
+    const condition = stageConditionOf(stage)
+    let passed = false
+    try { passed = condition === null ? true : explainWhen(condition, context) } catch { passed = false }
+    if (!passed) out.push({ id: stage.id, when: String(stage.when), needs: stage.needs || [] })
+  }
+  return out
+}
+
 async function validateResource(request, runtime) {
   if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
   const params = queryOf(request)
@@ -5114,6 +5243,27 @@ async function validateResource(request, runtime) {
   if (bad) return json({ ok: false, error: bad }, 400)
   // 校验只是解析文本、不落盘也不执行：同源即可，不要求身份（编辑器边打边校验）。
   const data = runtime.validatePipe({ source: params.get('source') || '', project: params.get('project') || '' })
+  return json(data)
+}
+
+/**
+ * v3.0-P6-1：/preview —— 用编辑器里未保存的文本算一遍计划。
+ * 只读、不落盘、不执行：同源即可（和 /validate 一样），因为它能做的事本来就只是
+ * 「把你手里这份文本插值一遍给你看」。密钥按名字抹成 ***。
+ */
+async function previewResource(request, runtime) {
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
+  const params = queryOf(request)
+  const bad = unsupportedParams(params, new Set(['source', 'project', 'target', 'branch', 'tag']))
+  if (bad) return json({ ok: false, error: bad }, 400)
+  const data = runtime.previewPipe({
+    source: params.get('source') || '',
+    project: params.get('project') || '',
+    target: params.get('target') || '',
+    branch: params.get('branch') || '',
+    tag: params.get('tag') || '',
+  })
+  if (data && data.ok === false) return json({ ok: false, error: data.error, code: data.code, line: data.line }, 400)
   return json(data)
 }
 
@@ -6260,6 +6410,7 @@ function registerHttpRoutes(ctx, runtime) {
     { kind: 'exact', path: `${ROUTE_PREFIX}/project-meta`, resource: (request) => projectMetaResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/project-create`, resource: (request) => projectCreateResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/validate`, resource: (request) => validateResource(request, runtime) },
+    { kind: 'exact', path: `${ROUTE_PREFIX}/preview`, resource: (request) => previewResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/pipe-save`, resource: (request) => pipeSaveResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/plan`, resource: (request) => planResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/run`, resource: (request) => runResource(request, runtime) },
