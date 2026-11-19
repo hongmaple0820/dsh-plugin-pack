@@ -23,9 +23,17 @@ const APP_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._@:/-]*$/
 // registry[:port]/namespace/name — 小写、无 tag、无 digest。docker 自己定的形状，抄一份而不是自创。
 const DOCKER_IMAGE_PATTERN = /^[a-z0-9]+(?:(?:[._-]|:)[a-z0-9]+)*(?:\/[a-z0-9]+(?:(?:[._-])[a-z0-9]+)*)*$/
 const HOST_FAILURE_VALUES = new Set(['stop', 'continue'])
-// v3.0-P3：目前只有 native 有诚实的实现。container / k8s 在解析层就认得，
-// 但要等各自的 Actuator 落地才允许真的部署 —— 见 normalizeTarget 里的模式校验。
+// v3.0-P3：三种模式各有自己的 Actuator（lib/actuator/{native,container,k8s}.js），
+// 共用 release / rollback / manifest 语义，只把「怎么激活」这一段分出去。
 export const DEPLOY_MODES = new Set(['native', 'container', 'k8s'])
+// K8s 对象名与容器名同一条规则（RFC 1123 label）。猜名字的成本是 rollout status 挂五分钟。
+const WORKLOAD_NAME_PATTERN = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/
+const K8S_KINDS = new Set(['Deployment', 'Rollout'])
+
+// image 去掉 tag 部分：registry:5000/a/b:1.2.3 → registry:5000/a/b
+export function k8sRepositoryOf(image) {
+  return String(image || '').trim().replace(/:[^/:]+$/, '')
+}
 
 function quote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`
@@ -468,6 +476,8 @@ function normalizeTarget(targetName, target) {
     }
   }
 
+  let k8s = null
+
   // v3.0-P3：容器 target。image 与 container.port 是两件「只能由用户说、猜不得」的事：
   // 猜仓库名会把镜像发到别人的命名空间，猜容器内端口会让探针永远打在一个关闭的门上。
   let container = null
@@ -500,6 +510,70 @@ function normalizeTarget(targetName, target) {
     }
   }
 
+
+  // v3.0-P3-P7：K8s target。这里能配的都必须是集群里已有的名字 ——
+  // 猜一个 Deployment 名会在 rollout status 上挂五分钟然后告诉你「没找到」，
+  // 而那时候 patch 可能已经发出去了一半。
+  if (mode === 'k8s') {
+    if (target.service || target.restart) {
+      throw new PipeError(`target ${targetName} 的 mode 是 k8s，起停由控制器负责，不能配置 service / restart`)
+    }
+    if (target.instances !== undefined && target.instances !== null && target.instances !== '') {
+      // replicas 是 spec 里的字段，不是我们能挑的端口；两个概念不能混在一处。
+      throw new PipeError(`target ${targetName} 的 mode 是 k8s，副本数写在 k8s.replicas，不能用 instances`)
+    }
+    if (target.container !== undefined) {
+      throw new PipeError(`target ${targetName} 的 mode 是 k8s，容器相关配置写在 k8s 块里`)
+    }
+    if (target.k8s !== undefined && (typeof target.k8s !== 'object' || Array.isArray(target.k8s))) {
+      throw new PipeError(`target ${targetName} 的 k8s 必须是 map`)
+    }
+    const rawK8s = target.k8s || {}
+    const rawImage = String(target.image || '').trim()
+    if (!rawImage) {
+      throw new PipeError(`target ${targetName} 的 mode 是 k8s，必须给 image（如 registry.example.com/demo/web）`)
+    }
+    if (!DOCKER_IMAGE_PATTERN.test(k8sRepositoryOf(rawImage))) {
+      throw new PipeError(`target ${targetName} 的 image “${rawImage}” 不合法（registry[:port]/path 的小写形状）`)
+    }
+    const workloadName = String(rawK8s.workload || targetName).trim()
+    if (!WORKLOAD_NAME_PATTERN.test(workloadName)) {
+      throw new PipeError(`target ${targetName} 的 k8s.workload “${workloadName}” 不是合法的 K8s 对象名（小写字母数字与 -）`)
+    }
+    const namespace = String(rawK8s.namespace || 'default').trim()
+    if (!WORKLOAD_NAME_PATTERN.test(namespace)) {
+      throw new PipeError(`target ${targetName} 的 k8s.namespace “${namespace}” 不合法`)
+    }
+    const kindValue = String(rawK8s.kind || 'Deployment').trim()
+    if (!K8S_KINDS.has(kindValue)) {
+      throw new PipeError(`target ${targetName} 的 k8s.kind “${kindValue}” 不支持（可用 ${[...K8S_KINDS].join('、')}）`)
+    }
+    const containerName = String(rawK8s.container || workloadName).trim()
+    if (!WORKLOAD_NAME_PATTERN.test(containerName)) {
+      throw new PipeError(`target ${targetName} 的 k8s.container “${containerName}” 不是合法的容器名`)
+    }
+    const replicas = rawK8s.replicas === undefined ? 1 : rawK8s.replicas
+    if (!Number.isInteger(replicas) || replicas < 1 || replicas > 512) {
+      throw new PipeError(`target ${targetName} 的 k8s.replicas 必须是 1-512 的整数`)
+    }
+    const progressDeadlineSec = rawK8s.progressDeadlineSec ?? 300
+    if (!Number.isInteger(progressDeadlineSec) || progressDeadlineSec < 1 || progressDeadlineSec > 3600) {
+      throw new PipeError(`target ${targetName} 的 k8s.progressDeadlineSec 必须是 1-3600 的整数（秒）`)
+    }
+    const rolloutTimeoutSec = rawK8s.rolloutTimeoutSec ?? progressDeadlineSec + 60
+    if (!Number.isInteger(rolloutTimeoutSec) || rolloutTimeoutSec < 1 || rolloutTimeoutSec > 7200) {
+      throw new PipeError(`target ${targetName} 的 k8s.rolloutTimeoutSec 必须是 1-7200 的整数（秒）`)
+    }
+    k8s = {
+      kind: kindValue,
+      namespace,
+      workload: workloadName,
+      container: containerName,
+      replicas,
+      progressDeadlineSec,
+      rolloutTimeoutSec,
+    }
+  }
   // 环境（environment）升格：target 自动映射，带保护/审批标志
   const protected_ = targetName.toLowerCase() === 'prod' || target.protected === true
   const approvalRequired = targetName.toLowerCase() === 'prod' || target.approvalRequired === true
@@ -526,6 +600,7 @@ function normalizeTarget(targetName, target) {
     app,
     mode,
     container,
+    k8s,
     instances,
     health,
     onHostFailure,

@@ -14,6 +14,7 @@
  */
 
 import { createContainerActuator } from './actuator/container.js'
+import { createK8sActuator } from './actuator/k8s.js'
 
 // Actuator 要的是 (host, command) 形状的 exec，而 remote 客户端把 host 放在第一个参数上。
 // 这一层绑定只做形状对齐，不做任何策略。
@@ -422,6 +423,57 @@ export async function rollbackOne({ remote, target, host, releaseId, commit, onL
   }
 
   const stamp = new Date().toISOString()
+  if (target.mode === 'k8s') {
+    // K8s 的回滚不切镜像、不删 pod：`rollout undo` 是唯一会把控制器内部记账一起退回去的操作。
+    // 与部署补偿共用同一个 Actuator 的 revert，两条回滚路径才不会各自漂移。
+    const factory = actuatorFactory || createK8sActuator
+    const actuator = factory({ host: hostBound(remote, host), target, hostName: host, onLog })
+    // 回滚现场只能从那份 release 自己的 manifest 读：集群当前跑的是新版，本地软链也指着新版。
+    const handle = {
+      host, mode: 'k8s', releaseId: wanted, dir,
+      image: target.image || '', imageDigest: '', imageReference: '',
+      namespace: target.k8s?.namespace || 'default',
+      workload: target.k8s?.workload || target.app || '',
+      kind: target.k8s?.kind || 'Deployment',
+      containerName: target.k8s?.container || target.k8s?.workload || target.app || '',
+      instances: [], pods: [], slots: { releaseAll: async () => {} },
+      previous: wanted, previousImage: '', revision: 'rollback', pids: [], activatedAt: stamp,
+    }
+    let artifactDigest = ''
+    try {
+      const recorded = await remote.exec(host, `cat ${shellQuote(`${dir}/.dsh-manifest.json`)} 2>/dev/null || true`)
+      const artifact = JSON.parse(String(recorded?.stdout || '').trim() || '{}').artifact || {}
+      handle.previousImage = String(artifact.reference || (artifact.image && artifact.digest ? `${artifact.image}@${artifact.digest}` : ''))
+      artifactDigest = String(artifact.digest || '')
+    } catch { /* 没有 manifest 时，undo 由控制器决定退到哪一版，我们只负责如实报告结果 */ }
+    const reverted = await actuator.revert(handle)
+    logLine(onLog, `[${host}] rollout undo（回滚到 ${wanted} 之前的版本）`)
+    const verdict = await actuator.health({ ...handle, pods: reverted?.pods || [] })
+    if (verdict && verdict.ok === false) {
+      const error = new Error(`[${host}] 回滚后健康检查失败（${verdict.detail || verdict.layer || target.health?.http || ''}）`)
+      error.code = 'HEALTH_FAILED'
+      error.health = 'failed'
+      error.restarted = 'k8s'
+      throw error
+    }
+    return {
+      host,
+      ok: true,
+      batch: 1,
+      releaseId: wanted,
+      releaseDir: dir,
+      restarted: 'k8s',
+      health: verdict?.ok === false ? 'failed' : 'ok',
+      previous: '',
+      cleaned: false,
+      activated_at: stamp,
+      artifactDigest,
+      instances: [],
+      pods: reverted?.pods || [],
+      error: '',
+      code: '',
+    }
+  }
   if (target.mode === 'container') {
     // 容器的回滚不是「换个软链、重启一下」：上一版跑的是另一个镜像，
     // 旧容器必须停掉、旧 digest 必须重新 pull 起来。走容器 Actuator 的 revert，

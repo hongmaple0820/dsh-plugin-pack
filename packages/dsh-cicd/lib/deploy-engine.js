@@ -27,8 +27,16 @@
 
 import { createNativeActuator, ACTUATOR_ERRORS } from './actuator/native.js'
 import { createContainerActuator } from './actuator/container.js'
+import { createK8sActuator } from './actuator/k8s.js'
 import { normalizeStrategy } from './strategy.js'
 import { delay, logLine, shellQuote } from './deploy.js'
+
+// 模式 → Actuator 的唯一映射。表在这里而不是散在 if 里：加第四种模式时要改的地方只有一处。
+const ACTUATOR_FACTORIES = {
+  native: createNativeActuator,
+  container: createContainerActuator,
+  k8s: createK8sActuator,
+}
 
 export const DEPLOY_ERRORS = {
   STAGE: 'DEPLOY_STAGE_FAILED',
@@ -160,12 +168,12 @@ export async function deployTransaction(params = {}) {
   const failMode = target.onHostFailure === 'continue' ? 'continue' : 'stop'
 
   const { strategy, batches } = planBatches(target, hosts, strategyOverride)
-  // mode 拒绝静默降级：写 mode: container 却走软链部署，是那种「面板显示成功、生产其实
-  // 没有换镜像」的失败。只有 native 有诚实的实现，其余必须等各自 Actuator 落地。
+  // mode 拒绝静默降级：写 mode: k8s 却走软链部署，是那种「面板显示成功、生产其实
+  // 没有换镜像」的失败。三种模式现在都有 Actuator，判据收紧成「模式必须在已知集合里」。
   // actuatorFactory 是测试注入点，注入时不看 mode（测试用自己的假执行器）。
-  const nativeOrContainer = !target.mode || target.mode === 'native' || target.mode === 'container'
-  if (!actuatorFactory && !nativeOrContainer) {
-    const error = new Error(`mode ${target.mode} 的 Actuator 还没实现（当前有 native 与 container）；拒绝退回软链部署——那会让面板显示成功而生产没有真的换版本`)
+  const knownMode = !target.mode || ACTUATOR_FACTORIES[target.mode] !== undefined
+  if (!actuatorFactory && !knownMode) {
+    const error = new Error(`mode ${target.mode} 的 Actuator 不存在（可用 ${Object.keys(ACTUATOR_FACTORIES).join('、')}）；拒绝退回软链部署——那会让面板显示成功而生产没有真的换版本`)
     error.code = 'ACTUATOR_NOT_IMPLEMENTED'
     throw error
   }
@@ -180,8 +188,8 @@ export async function deployTransaction(params = {}) {
       uploadFile: (localPath, remotePath) => remote.uploadFile(hostName, localPath, remotePath),
     }
     // v3.0-P3：mode 决定用哪个 Actuator，其余一切（批次、补偿、health 分层、manifest）都在这里，
-    // 与模式无关。容器 Actuator 只需要 pull 得到 digest、起得来容器、读得回端口。
-    const factory = actuatorFactory || (target.mode === 'container' ? createContainerActuator : createNativeActuator)
+    // 与模式无关。容器 Actuator 拉 digest、起容器、读回端口；K8s Actuator patch 镜像再等 rollout。
+    const factory = actuatorFactory || ACTUATOR_FACTORIES[target.mode || 'native'] || createNativeActuator
     const actuator = factory({ ...(actuatorOptions || {}), host: bound, target, hostName, onLog })
     actuators.set(hostName, actuator)
     return actuator

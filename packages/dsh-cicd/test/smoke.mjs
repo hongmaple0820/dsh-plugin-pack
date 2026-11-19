@@ -33,6 +33,7 @@ import { deployRelease as strategyDeploy, normalizeStrategy } from '../lib/strat
 import { deployTransaction, planBatches, readManifest, usesTransaction } from '../lib/deploy-engine.js'
 import { createNativeActuator, renderTemplate } from '../lib/actuator/native.js'
 import { createContainerActuator, resolveImageReference, parsePublishedPort, parseInspect, normalizeImageDigest, CONTAINER_ERRORS } from '../lib/actuator/container.js'
+import { createK8sActuator, k8sImageReference, parseDeployment, parsePods, normalizeK8sDigest, K8S_ERRORS, K8S_COMMANDS } from '../lib/actuator/k8s.js'
 import { createSlotStore } from '../lib/slots.js'
 import {
   createToolchain, envFor, assertVersions, inferFromFiles, writeDualLocks, binDirOf,
@@ -3944,8 +3945,8 @@ checkAsync('P3-S5：release 存储保留不可变 artifact digest 与实例快�
   } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
 })
 
-checkAsync('P3-S6：k8s 尚无 Actuator 时拒绝静默退回 native', async () => {
-  await assert.rejects(() => deployTransaction({ remote: {}, target: { mode: 'k8s', path: '/srv', hosts: ['h1'] }, releaseId: 'p3-r6' }), (error) => error.code === 'ACTUATOR_NOT_IMPLEMENTED')
+checkAsync('P3-S6：不认识的 mode 拒绝静默退回 native', async () => {
+  await assert.rejects(() => deployTransaction({ remote: {}, target: { mode: 'nomad', path: '/srv', hosts: ['h1'] }, releaseId: 'p3-r6' }), (error) => error.code === 'ACTUATOR_NOT_IMPLEMENTED')
 })
 
 checkAsync('P3-S6b：容器 mode 与 native 同一条事务路径 —— 先全部 pull 再切，一台失败谁都不换', async () => {
@@ -4049,6 +4050,193 @@ checkAsync('P3-S8：容器按 digest 部署 —— pull @sha256、-p 0 读回端
   assert.equal(calls.filter((command) => command.startsWith('docker stop')).length, 2)
 })
 
+// 假 kubectl：只实现 K8S_COMMANDS 里列出的形状，其它命令一律「命令未知」退出码 127 ——
+// 新写一条命令而忘了登记，用例会立刻红，而不是在生产上才发现多了一种 kubectl 调用。
+function fakeKubectl(options = {}) {
+  const calls = []
+  const state = {
+    generation: options.generation || 1,
+    observed: options.observed || 1,
+    replicas: options.replicas || 2,
+    ready: options.ready === undefined ? 2 : options.ready,
+    image: options.image || 'registry.example.com/demo/web@sha256:' + 'b'.repeat(64),
+    pods: options.pods || [],
+    setImageExit: options.setImageExit || 0,
+    rolloutExit: options.rolloutExit || 0,
+    undoExit: options.undoExit || 0,
+    missing: options.missing === true,
+    clusterDown: options.clusterDown === true,
+    noGenerationBump: options.noGenerationBump === true,
+  }
+  const host = {
+    async exec(command) {
+      calls.push(command)
+      if (command.startsWith('kubectl -n')) {
+        if (!/get (deployment|rollout) /.test(command) && !/set image|rollout /.test(command) && !/get pod/.test(command)) {
+          return { stdout: '', stderr: 'kubectl: 未知命令形状 ' + command, exitCode: 127 }
+        }
+      } else if (!/^(mkdir -p|printf |echo |readlink|ln -sfn|ls -1dt|cat )/.test(command)) {
+        return { stdout: '', stderr: 'unknown command ' + command, exitCode: 127 }
+      }
+      if (command.startsWith('readlink')) return { stdout: options.current || '', exitCode: 0 }
+      if (/get (deployment|rollout) /.test(command)) {
+        if (state.clusterDown) return { stdout: '', stderr: 'The connection to the server 10.0.0.1:6443 was refused', exitCode: 1 }
+        if (state.missing) return { stdout: '', stderr: 'Error from server (NotFound): deployments.apps "web" not found', exitCode: 1 }
+        return {
+          stdout: JSON.stringify({
+            metadata: { name: 'web', generation: state.generation },
+            spec: { template: { spec: { containers: [{ name: 'web', image: state.image }] } } },
+            status: { observedGeneration: state.observed, replicas: state.replicas, readyReplicas: state.ready, updatedReplicas: state.ready },
+          }),
+          exitCode: 0,
+        }
+      }
+      if (/get pod /.test(command)) return { stdout: JSON.stringify({ items: state.pods.map((pod) => ({ metadata: { name: pod }, status: { phase: 'Running' }, spec: { containers: [{ image: state.image }] } })) }), exitCode: 0 }
+      if (/set image /.test(command)) {
+        if (state.setImageExit !== 0) return { stdout: '', stderr: 'Error from server: admission webhook denied', exitCode: state.setImageExit }
+        const match = /set image [^ ]+ '([^=]+)=(.+)'$/.exec(command)
+        const next = match ? match[2] : state.image
+        // 镜像没变时控制器不会加 generation —— 这正是「看起来成功的空发布」。
+        if (!state.noGenerationBump) { state.image = next; state.generation += 1; state.observed = state.generation }
+        return { stdout: 'deployment.apps/web image updated', exitCode: 0 }
+      }
+      if (/rollout status /.test(command)) {
+        return state.rolloutExit === 0
+          ? { stdout: 'deployment "web" successfully rolled out', exitCode: 0 }
+          : { stdout: 'Waiting for deployment "web" rollout to finish: 1 out of 2 new replicas have been updated...', stderr: 'error: timed out waiting for the condition', exitCode: state.rolloutExit }
+      }
+      if (/rollout undo /.test(command)) {
+        if (state.undoExit !== 0) return { stdout: '', stderr: 'error: no rollout history found', exitCode: state.undoExit }
+        state.image = 'registry.example.com/demo/web@sha256:' + 'b'.repeat(64)
+        return { stdout: 'deployment.apps/web rolled back', exitCode: 0 }
+      }
+      return { stdout: '', exitCode: 0 }
+    },
+    async uploadFile() {},
+  }
+  return { host, calls, state }
+}
+
+const K8S_TARGET = {
+  path: '/srv/k8s', app: 'web', keep: 3,
+  image: 'registry.example.com/demo/web',
+  k8s: { kind: 'Deployment', namespace: 'prod', workload: 'web', container: 'web', replicas: 2, progressDeadlineSec: 300, rolloutTimeoutSec: 360 },
+  health: { http: '', tries: 1, interval: 0, expect: 0, window: 0 },
+}
+
+checkAsync('P3-S11：k8s 按 digest patch —— 一次 set image、等 rollout、current 与 manifest 都记下 generation', async () => {
+  const digest = 'sha256:' + 'a'.repeat(64)
+  const { host, calls, state } = fakeKubectl({ current: 'releases/p3-r7', pods: ['web-abc-1', 'web-abc-2'] })
+  const actuator = createK8sActuator({ host, target: K8S_TARGET, hostName: 'h1', onLog: () => {}, now: () => Date.parse('2026-01-01T00:00:00Z') })
+  const handle = await actuator.stage({ releaseId: 'p3-r11', artifactDigest: digest })
+  assert.equal(handle.imageReference, 'registry.example.com/demo/web@' + digest)
+  assert.equal(state.generation, 1, 'stage 不碰集群：一次 patch 都还没发')
+  assert.equal(calls.filter((command) => /set image /.test(command)).length, 0)
+  await actuator.activate(handle)
+  const patches = calls.filter((command) => /set image /.test(command))
+  assert.equal(patches.length, 1, '一次发布只 patch 一次')
+  assert.ok(patches[0].includes('@' + digest), '引用必须是 image@sha256，不能是 tag')
+  assert.ok(patches[0].includes("'web=registry.example.com/demo/web@sha256:" + 'a'.repeat(64) + "'"), 'patch 的容器名与引用')
+  assert.ok(calls.some((command) => /rollout status /.test(command)), 'patch 之后必须等 rollout')
+  assert.equal(handle.previous, 'p3-r7')
+  assert.deepEqual(handle.pods.map((pod) => pod.name), ['web-abc-1', 'web-abc-2'])
+  assert.equal(handle.revision, '2')
+  assert.ok(calls.some((command) => command.includes('ln -sfn') && command.includes('releases/p3-r11')))
+  const verdict = await actuator.health(handle)
+  assert.equal(verdict.ok, true)
+  // manifest 是回滚唯一读得到的现场：digest、集群坐标、generation 都得在里面。
+  const dir = mkdtempSync(join(tmpdir(), 'cicd-p3-k8s-'))
+  try {
+    const writer = createK8sActuator({
+      host: { exec: async (command) => {
+        if (command.startsWith('printf %s')) writeFileSync(join(dir, 'manifest.json'), command.replace(/^printf %s '((?:[^']|'\\'')*)'.*$/s, '$1').replace(/'\\''/g, "'"))
+        return { stdout: '', exitCode: 0 }
+      } },
+      target: K8S_TARGET, hostName: 'h1', onLog: () => {},
+    })
+    handle.dir = dir
+    await writer.writeManifest(handle, { runId: 'run-1', commit: 'deadbeef', health: 'ok' })
+    const written = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8'))
+    assert.equal(written.mode, 'k8s')
+    assert.equal(written.artifact.digest, digest)
+    assert.equal(written.cluster.namespace, 'prod')
+    assert.equal(written.cluster.workload, 'web')
+    assert.equal(written.revision, '2')
+    assert.equal(written.pods.length, 2)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+checkAsync('P3-S12：k8s 的三种失败各自有话说 —— 空发布、rollout 超时、集群不可达', async () => {
+  const digest = 'sha256:' + 'a'.repeat(64)
+  // 1) generation 没涨 = 这份 digest 已经在跑，发布没有产生新版本。静默成功最危险。
+  {
+    const { host } = fakeKubectl({ noGenerationBump: true, image: 'registry.example.com/demo/web@' + digest })
+    const actuator = createK8sActuator({ host, target: K8S_TARGET, hostName: 'h1', onLog: () => {} })
+    const handle = await actuator.stage({ releaseId: 'p3-r12a', artifactDigest: digest })
+    await assert.rejects(() => actuator.activate(handle), (error) => error.code === K8S_ERRORS.NO_CHANGE)
+  }
+  // 2) rollout 超时 = 新副本没起来。此时既不能当成功，也不能切 current 假装切了。
+  {
+    const { host, calls } = fakeKubectl({ rolloutExit: 1 })
+    const actuator = createK8sActuator({ host, target: K8S_TARGET, hostName: 'h1', onLog: () => {} })
+    const handle = await actuator.stage({ releaseId: 'p3-r12b', artifactDigest: digest })
+    await assert.rejects(() => actuator.activate(handle), (error) => error.code === K8S_ERRORS.ROLLOUT)
+    assert.equal(calls.filter((command) => command.includes('ln -sfn')).length, 0, 'rollout 没走完就不许切 current')
+  }
+  // 3) 集群连不上与对象不存在是两件事：前者改 kubeconfig，后者改 pipe。
+  {
+    const down = fakeKubectl({ clusterDown: true })
+    const actuator = createK8sActuator({ host: down.host, target: K8S_TARGET, hostName: 'h1', onLog: () => {} })
+    await assert.rejects(() => actuator.stage({ releaseId: 'p3-r12c', artifactDigest: digest }), (error) => error.code === K8S_ERRORS.CLUSTER)
+    const missing = fakeKubectl({ missing: true })
+    const actuator2 = createK8sActuator({ host: missing.host, target: K8S_TARGET, hostName: 'h1', onLog: () => {} })
+    await assert.rejects(() => actuator2.stage({ releaseId: 'p3-r12d', artifactDigest: digest }), (error) => error.code === K8S_ERRORS.WORKLOAD)
+  }
+  // 4) 没有任何 digest 时不许部署 —— 按 tag 部署会让回滚跟着 tag 漂移。
+  assert.throws(() => k8sImageReference({ image: 'demo/web', digest: '' }), (error) => error.code === K8S_ERRORS.IMAGE)
+  assert.equal(normalizeK8sDigest('A'.repeat(64)), 'sha256:' + 'a'.repeat(64))
+  assert.throws(() => normalizeK8sDigest('latest'), (error) => error.code === K8S_ERRORS.IMAGE)
+  assert.throws(() => normalizeK8sDigest('sha256:abc'), (error) => error.code === K8S_ERRORS.IMAGE)
+})
+
+checkAsync('P3-S13：k8s 回滚走 rollout undo —— 不自己 set image 回去，历史里不该多一个 revision', async () => {
+  const { host, calls } = fakeKubectl({ current: 'releases/p3-r13' })
+  const actuator = createK8sActuator({ host, target: K8S_TARGET, hostName: 'h1', onLog: () => {} })
+  const handle = await actuator.stage({ releaseId: 'p3-r13', artifactDigest: 'sha256:' + 'a'.repeat(64) })
+  await actuator.activate(handle)
+  const patchesBefore = calls.filter((command) => /set image /.test(command)).length
+  const reverted = await actuator.revert(handle)
+  assert.equal(reverted.reverted, true)
+  assert.equal(calls.filter((command) => /rollout undo /.test(command)).length, 1)
+  assert.equal(calls.filter((command) => /set image /.test(command)).length, patchesBefore, '回滚不许再 patch 一次镜像')
+  assert.ok(calls.some((command) => command.includes('ln -sfn') && command.includes('releases/p3-r13')))
+  // activate 没走完时无可回滚：不 patch 也不 undo，集群保持原样。
+  const untouched = fakeKubectl({})
+  const early = { ...handle, revision: '', activatedAt: '' }
+  const actuator2 = createK8sActuator({ host: untouched.host, target: K8S_TARGET, hostName: 'h1', onLog: () => {} })
+  await actuator2.revert(early)
+  assert.equal(untouched.calls.filter((command) => /rollout undo /.test(command)).length, 0)
+  // undo 本身失败要明说，而不是把「没回滚」当「回滚了」。
+  const broken = fakeKubectl({ undoExit: 1 })
+  const actuator3 = createK8sActuator({ host: broken.host, target: K8S_TARGET, hostName: 'h1', onLog: () => {} })
+  await assert.rejects(() => actuator3.revert({ ...handle, revision: '2' }), (error) => error.code === K8S_ERRORS.ROLLBACK)
+})
+
+checkAsync('P3-S14：k8s 解析与命令词表 —— parseDeployment/parsePods 的边界、词表是封闭的', async () => {
+  assert.equal(parseDeployment(''), null)
+  assert.equal(parseDeployment('not json'), null)
+  const parsed = parseDeployment(JSON.stringify({ metadata: { name: 'web', generation: 4 }, status: { observedGeneration: 4, replicas: 3, readyReplicas: 2, conditions: [{ type: 'Available', status: 'True' }] }, spec: { template: { spec: { containers: [{ image: 'repo@sha256:x' }] } } } }))
+  assert.equal(parsed.generation, 4)
+  assert.equal(parsed.ready, 2)
+  assert.equal(parsed.available, 1)
+  assert.equal(parsed.image, 'repo@sha256:x')
+  assert.deepEqual(parsePods('garbage'), [])
+  assert.equal(parsePods(JSON.stringify({ items: [{ metadata: { name: 'p1' }, status: { phase: 'Pending' } }] }))[0].phase, 'Pending')
+  // 词表是封闭的：任何新命令都必须先登记，否则假集群会以 127 拒绝它。
+  assert.ok(K8S_COMMANDS.some((entry) => entry.includes('set image')))
+  assert.ok(K8S_COMMANDS.some((entry) => entry.includes('rollout undo')))
+  assert.equal(K8S_COMMANDS.some((entry) => entry.includes('kubectl apply')), false, 'apply 需要一份会漂移的完整 manifest')
+})
 checkAsync('P3-S9：tag 一律拒绝 —— 按 tag 回滚会跟着 tag 漂移', async () => {
   for (const digest of ['', 'latest', 'sha256:abc', 'b'.repeat(64)]) {
     const ok = normalizeImageDigest(digest)
