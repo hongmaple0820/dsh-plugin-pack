@@ -1,0 +1,77 @@
+# Docker 示例：buildx 构建镜像 → 推送到内部 registry（按 digest）→ 部署
+version: 2
+name: web-frontend
+description: 前端静态站，容器化部署
+
+on:
+  push: { branches: [main] }
+  tag: ["v*"]
+  manual: true
+
+variables:
+  IMAGE: cicd.internal/web-frontend
+  NODE_VERSION: "20"
+
+environments:
+  staging: { autoDeployBranches: [main] }
+  prod: { protected: true, requireApproval: true, branchRule: main }
+
+stages:
+  - id: build
+    jobs:
+      - id: image
+        kind: build
+        toolchain: { node: "20" }
+        steps:
+          - uses: checkout
+          - uses: toolchain
+          - name: 安装与构建
+            run: npm ci && npm run build
+            timeout: 15m
+          - name: 构建镜像并推送
+            run: |
+              echo "$REGISTRY_PASSWORD" | docker login cicd.internal -u "$REGISTRY_USER" --password-stdin
+              docker buildx build \
+                --platform linux/amd64 \
+                --build-arg NODE_VERSION=$NODE_VERSION \
+                -t "$IMAGE:$CI_COMMIT_SHA" \
+                --push .
+              docker buildx imagetools inspect "$IMAGE:$CI_COMMIT_SHA" \
+                --format '{{json .Manifest.Digest}}'
+        secrets: [REGISTRY_USER, REGISTRY_PASSWORD]
+        artifacts:                      # 仅用于记录 digest 文本，真正部署走 registry
+          paths: ["dist/**"]
+
+  - id: deploy
+    needs: [build]
+    jobs:
+      - id: staging
+        kind: deploy
+        environment: staging
+        target: staging
+        mode: container
+        # 部署引用镜像 digest（不是 tag），由 collect 步骤回传的 digest 决定
+        artifact: "image-digest.txt"
+        strategy: rolling
+        needs: [image]
+        verify:
+          smoke: ["https://staging.example.com/"]
+          window: 60s
+
+      - id: prod
+        kind: deploy
+        environment: prod
+        target: prod
+        mode: container
+        artifact: "image-digest.txt"
+        strategy: blue-green
+        needs: [image]
+        when: { tag: "v*" }
+        approval:
+          reviewers: ["group:release-managers"]
+          timeout: 4h
+          on_timeout: fail
+        verify:
+          smoke: ["https://www.example.com/healthz"]
+          window: 120s
+          maxErrorRate: 0.01

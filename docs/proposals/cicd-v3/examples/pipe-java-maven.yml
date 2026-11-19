@@ -1,0 +1,75 @@
+﻿# Java · Maven 示例：JDK17 构建，产出 jar，晋级到 staging
+# 验证：cicd_validate → cicd_plan → cicd_run
+version: 2
+name: shop-api
+description: 订单服务（Spring Boot）
+
+on:
+  push: { branches: [main, "release/*"], paths: ["src/**", "pom.xml"] }
+  pull_request: { branches: [main] }
+  tag: ["v*"]
+  manual: true
+
+variables:
+  APP: shop-api
+  MAVEN_ARGS: "-B -ntp -Dmaven.repo.local=$RUN_DIR/m2"
+
+environments:
+  staging: { autoDeployBranches: [main] }
+  prod:
+    protected: true
+    requireApproval: true
+    branchRule: main
+
+stages:
+  - id: build
+    jobs:
+      - id: package
+        kind: build
+        toolchain:
+          java: temurin-17
+          maven: "3.9.6"
+        cache:
+          - key: "m2-${{ hashFiles('**/pom.xml') }}"
+            restore_keys: ["m2-"]
+            paths: [".m2"]
+        steps:
+          - uses: checkout
+          - uses: toolchain
+          - name: 运行测试并打包
+            run: mvn $MAVEN_ARGS verify
+            timeout: 20m
+        artifacts:
+          paths: ["target/*.jar"]
+          name: "${{ APP }}"
+          retention: default
+
+  - id: deploy
+    needs: [build]
+    jobs:
+      - id: staging
+        kind: deploy
+        environment: staging
+        target: staging
+        artifact: "target/*.jar"
+        strategy: rolling
+        needs: [package]
+        verify:
+          smoke: ["https://staging.example.com/healthz"]
+          window: 60s
+          maxErrorRate: 0.05
+
+      - id: prod
+        kind: deploy
+        environment: prod
+        target: prod
+        artifact: "target/*.jar"
+        strategy: canary
+        needs: [package]
+        when: { tag: "v*" }
+        approval:
+          reviewers: ["group:release-managers"]
+          timeout: 4h
+          on_timeout: fail
+        migrate:
+          expand: ["scripts/migrate-expand.sh"]

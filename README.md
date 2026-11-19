@@ -5,7 +5,7 @@ DSH 插件包：一组可直接装进当前 profile 的 **bundle**（Host 插件
 | 方向 | 包 | 交付 |
 |---|---|---|
 | 远程控制 | `packages/dsh-remote`（`@local/dsh-remote`） | 13 个 `remote_*` 工具（SSH / SFTP / 本地端口转发 / 持久 PTY / 多机并发），左侧栏「远程主机」全局面板（主机增删改 / 命令 / 面板内交互终端 / 隧道 / 文件浏览）+ 会话内同名 View |
-| 流水线 | `packages/dsh-cicd`（`@local/dsh-cicd`） | 20 个 `cicd_*` 工具（项目 / 向导 / 编辑器 / 计划 / 执行 / 取消 / DORA / 触发 / 远端 runner / 审批 / secrets / 环境 / RBAC），读仓库 `pipe.yml` 本地或远端构建，经 dsh-remote 发布与自动回滚，运行记录落本地 SQLite（`node:sqlite`）；28 条精确路由 + 1 条 prefix（webhook）+ 1 条 WebSocket upgrade（实时日志） |
+| 流水线 | `packages/dsh-cicd`（`@local/dsh-cicd`） | 26 个 `cicd_*` 工具（项目 / 向导 / 编辑器 / 计划 / 执行 / 取消 / DORA / 触发 / 远端 runner / 审批 / secrets / 环境 / 身份 / 审计 / 锁 / 工具链），读仓库 `pipe.yml` 本地或远端构建，经 dsh-remote 发布与自动回滚，运行记录落本地 SQLite（`node:sqlite`）；33 条精确路由 + 1 条 prefix（webhook）+ 1 条 WebSocket upgrade（实时日志） |
 | 社区资讯 | `packages/dsh-aihot`（`@local/dsh-aihot`） | 8 个 `aihot_*` 工具（精选/搜索/热点/日报/周报/月报/额度重置/来龙去脉），左侧栏「AI 资讯」全局面板（精选 / 热点 / 日报+周报+月报期刊 / 福利）+ 会话内同名 View；卡片可展开「来龙去脉」时间线抽屉并复制链接，也可「读正文」就地看全文 |
 
 设计契约：`docs/SPEC.md`。验收闸门：`test/mount.mjs`（无 Host 环境挂载自检）。
@@ -269,7 +269,7 @@ delete（无 recursive 409）→ delete recursive`；`chmod mode=99` → 400「m
 - **v2.7 汇总路由**：`GET /api/plugins/remote/groups`（免执行头，保留同源检查）→ `{envs:[{name,hosts}], groups:[…], tags:[…]}`，供流水线的 `env:`/`group:`/`tag:` 选择器展开；未配元信息的主机不进任何桶。
 - 门禁：remote smoke **70 checks**、`mount` → remote **36 路由**；本仓库 `hosts.json` 已把 linux26/win22 标 `env: test`（group `web`/`build`）、remote113 标 `env: staging`（group `web`），`env:test` 这类选择器因此可直接用。
 
-## dsh-cicd（本地 CI/CD，v0.4 → v2.0-M5）
+## dsh-cicd（本地 CI/CD，v0.4 → v3.0-P2）
 
 `pipe.yml` → 本机构建（或远端 runner 构建，v2.0-M2）→ 经 dsh-remote 上传到目标机 → `releases/<runId>` + `current` 软链 + `revisions.log` → 重启 + 健康检查（失败自动回滚）→ SQLite（`cicd.db`）运行记录 + 每次发布产物的 sha256。
 
@@ -278,25 +278,30 @@ delete（无 recursive 409）→ delete recursive`；`chmod mode=99` → 400「m
 | `cicd_projects` / `cicd_targets` | 列出项目与部署目标（target 的 hosts / path / runtime / app / onHostFailure / keep / restartCommand / health / current / active） |
 | `cicd_project_meta` / `cicd_project_create` | 项目卡 git 元信息（branch / commit / tag / dirty）；项目向导（本地 / git clone + 5 种脚手架模板） |
 | `cicd_validate` / `cicd_pipe_save` | `pipe.yml` 校验（带行号 + 错误码）；保存（先校验后写盘） |
-| `cicd_plan` | 打印 stage 计划（不执行） |
-| `cicd_run` | 真跑一条流水线（`confirm=1`；`dryRun=1` 只出计划；`stage=<id>` 可只跑单 stage；`runner=<id>` 指定远端构建主机） |
-| `cicd_status` / `cicd_logs` | 运行状态与日志（尾部截断） |
+| `cicd_plan` | 打印 stage 计划（不执行）；v2 的 pipe 计划里带 job 图，v1 不带（老面板不会突然多出一块空视图） |
+| `cicd_run` | 真跑一条流水线（`confirm=1`；`dryRun=1` 只出计划；`stage=<id>` 可只跑单 stage；`runner=<id>` 指定远端构建主机；`approvalId` 消费审批）。返回值里 v2 多一个 `jobs`（并发度、执行顺序、每个 job 的状态/耗时/依赖），v1 为 `null` |
+| `cicd_status` / `cicd_logs` | 运行状态与日志（尾部截断）；`cicd_logs` 的 `jobId` 读单个 job 的分片日志——v2 的并行 job 在主日志里是交错的，`jobs` 字段列出本次运行的全部分片（v3.0-P1） |
 | `cicd_cancel` | 取消运行（杀进程树，run 记录标 `canceled`） |
 | `cicd_releases` / `cicd_rollback` | 发布记录与回滚（`releaseId` 省略=上一条；可选 `host` 单机） |
 | `cicd_dora` | DORA 四指标（部署频率 / 变更前置时间 / 变更失败率 / MTTR，默认最近 30 天） |
 | `cicd_triggers` | 触发配置摘要 + webhook URL + 调度器快照（cron / git push polling / manual） |
 | `cicd_runners` | 列出已注册远端 runner（labels / 容量 / 在线状态 / 在跑任务数） |
-| `cicd_approve` / `cicd_secrets` / `cicd_environments` / `cicd_rbac` | 审批门（prod 默认停在「待审批」）/ secrets 存储（DB 只存 ref，载荷 0600）/ 环境晋升路径 / RBAC（server 模式三角色 + 短 TTL token） |
+| `cicd_approve` / `cicd_secrets` / `cicd_environments` / `cicd_rbac` | 审批门（prod 默认停在「待审批」，绑产物摘要 + TTL + 禁自批，v3.0-P0）/ secrets 存储（DB 只存 ref，载荷 0600，日志自动脱敏）/ 环境晋升路径 / RBAC（v2.0-M5 旧接口，v3.0-P0 起不参与判定） |
+| **`cicd_auth`** / **`cicd_users`** / **`cicd_tokens`** | 登录态（`me` / `login` / `logout`）/ 成员与角色（create / set-password / set-role / remove-role）/ API token（create / revoke / list）—— v3.0-P0 身份三件套 |
+| **`cicd_audit`** / **`cicd_locks`** | 审计（`list` / `verify` 逐条重算哈希链，能定位第一处断裂）/ 部署锁（`list` / `release` 强制释放）—— v3.0-P0 可查性 |
+| **`cicd_toolchain`** | 工具链（`list` / `resolve` / `install` / `lock` / `gc` / `remove`）—— v3.0-P2：按锁文件解析、下载、按算法校验、解包进自己的 store，然后只注入白名单 env；`pipe.yml` 里只能写 `vendor+版本`，写 URL 会被拒 |
 
-- 路由（28 条精确 + 1 条 prefix `/hooks/<project>` + 1 条 WebSocket upgrade `/log-ws`）：`/api/plugins/cicd/{projects,project-meta,project-create,validate,pipe-save,plan,run,runs,log,releases,rollback,targets,operations,notify-test,cancel,dora,triggers,runner-register,runner-poll,runner-result,runner-log,runners,approve,approvals,secrets,environments,rbac}`；写操作额外要 `x-dsh-cicd: 1` 头 + `confirm=1`；`runner-*` 五条与 prefix `/hooks/` 不校验同源（跨机 / token 鉴权）。
-- 面板：侧栏「流水线」→ 项目切换 / 目标矩阵 / 阶段计划 / Run 详情（含实时日志跟随）/ Releases（按主机回滚）/ 审计时间线（v0.6）/ 创建向导 / 编辑器（v2.0-M0）/ 构建主机下拉（v2.0-M2）。
+- 路由（33 条精确 + 1 条 prefix `/hooks/<project>` + 1 条 WebSocket upgrade `/log-ws`）：`/api/plugins/cicd/{projects,project-meta,project-create,validate,pipe-save,plan,run,runs,log,releases,rollback,targets,operations,notify-test,cancel,dora,triggers,runner-register,runner-poll,runner-result,runner-log,runners,approve,approvals,secrets,environments,rbac,auth,users,tokens,audit,locks,toolchain}`；写操作要 `x-dsh-cicd: 1` 头 + `confirm=1`，**并在 v3.0-P0 起真正校验身份与权限**（`can()` 默认拒绝，越权 403 `POLICY_DENY` 且写审计）；`runner-*` 五条与 prefix `/hooks/` 不校验同源（跨机 / token 鉴权）。
+- 面板：侧栏「流水线」→ **左侧导航**（流水线：运行/发布/审批；配置：pipe.yml/新建项目；管理：构建主机/Secrets/RBAC/审计）+ **面包屑**（项目 › 视图 › 运行，带复制链接）/ 项目切换 / 目标矩阵 / 阶段计划 / Run 详情（含实时日志跟随）/ Releases（按主机回滚）/ 创建向导 / 编辑器（v2.0-M0）/ 构建主机下拉（v2.0-M2）。**v3.0-P0 起有 hash 路由**：`#/projects/:p/runs/:id?line=1204` 可分享、刷新不丢视图、`?line=` 直接高亮到那行日志。**v3.0-P1 起时间线多一层 job 行**（并行 job / matrix 实例各一行，带状态徽章与耗时，悬停看依赖），日志区多一个「只看某个 job」下拉（只在 job 多于一个时出现）。
 - 真机实测（linux26）：首次发布、内容变更发布、双向回滚、404 保护全部验过，细节与 5 个坑见 [packages/dsh-cicd/README.md](packages/dsh-cicd/README.md)。
 - 存储（v0.3）：运行/步骤/产物/发布/操作全进 `~/.dsh-cicd/cicd.db`（Node 22 内置 `node:sqlite`，WAL，无需原生编译），日志仍是 `logs/<runId>.log` 文本文件；旧版 `runs.jsonl` 首次打开自动导入并改名 `.migrated`。
 - 入口：左侧栏独立一行「流水线」；远程主机面板头部也有 `流水线` 按钮直接跳过去（`@local/dsh-cicd` 未加载时会内联提示重启）。
 - **多主机发布（v0.4）**：一个 target 可写 `hosts: [a, b, c]`，逐台独立发布（各自 `previous`/`current`/`revisions.log`/重启/健康检查）；`onHostFailure: stop|continue`（默认 stop）决定某台失败后是否继续；`/rollback` 不带 `host` 即全主机回滚；`/releases?host=` 可单机过滤。
 - **运行时预设（v0.4）**：target 可写 `runtime: static|node|python|go|php|docker` + `app`，自动生成重启命令（`pm2 restart <app>` / `systemctl restart <app>` / `php-fpm reload` / `docker compose -f <app> up -d` 等，一律带 `|| true` 兜底）；写 `restart:` 则完全覆盖预设。
 - **环境选择器 + 生产护栏（v0.5）**：`hosts` 里可写 `env:test` / `group:web` / `tag:canary`，与别名混写并自动去重；部署前用 `GET /api/plugins/remote/groups` 展开，展开为空 → `PIPE_INVALID`「选择器 env:nope 没有匹配的主机」。展开后只要有 `env: prod` 的主机：`/run`、`/rollback` 必须带 `confirm=prod`，否则 **409 `PROD_CONFIRM_REQUIRED`** 并在错误体里列出受影响主机；`/plan` 会标 `willDeployToProd: true` + `prodHosts`。
-- **部署锁（v0.5）**：同一 target 并发发布 → 409 `DEPLOY_IN_PROGRESS`（`finally` 释放；`dryRun` 不占锁、也不触发生产护栏）。
+- **部署锁（v0.5 → v3.0-P0 落库）**：同一 target 并发发布 → 409 `DEPLOY_IN_PROGRESS`（`dryRun` 不占锁、也不触发生产护栏）。v3.0-P0 起锁在 `deploy_locks` 表里，带 TTL（默认 1800s）与心跳续期，**重启服务后依然互斥**；`release` 必须匹配 runId/owner，`forceRelease` 仅 admin 且写审计。
+- **DSL v2 执行内核（v3.0-P1）**：`pipe.yml` 支持 `version: 2` 的 `stages[].jobs[]` + `needs` + `matrix`。job 图归一化（v1 每个 stage 自动变成一个 `<stage>-main` job，**老文件一行不用改**）、按拓扑并发执行（默认并发 4，`jobs.concurrency` 可配 1–32）、matrix 展开上限 64 实例 / 3 维、`when`/`if`/`${{ }}` 走手写解析器（不用 `eval`，`process.exit(0)` 报 `PIPE_EXPR`）、三档求值（`secrets` 只在真正执行命令的 T2 可见）、失败**与跳过**都向下传播、每个 job 一份分片日志、每次运行落 `pipe.yml` 原文快照 + sha256（重跑用快照，不重读工作区）。
+- **工具链与动作（v3.0-P2）**：`pipe.yml` 顶层 `toolchain: { java: temurin-17, maven: "3.9.6" }` 只声明**厂商 + 版本**（写 URL 或路径直接拒绝——那份文件谁提 PR 谁能改）。安装器按 `pipe.lock` 解析 → 下载 → **按算法校验**（sha512/sha256/sha1，Maven 只发 sha512）→ 解包进 `<workDir>/toolchains/store/<lang>/<version>/<platform>`，然后只向子进程注入**白名单 env**（`PATH` 前置、`JAVA_HOME`/`PYTHONHOME`/`GOROOT` 显式覆盖或删除、`GOTOOLCHAIN=local`）；宿主一个字节不改，宿主自己的 `JAVA_HOME`/`NODE_OPTIONS` 也漏不进构建。`frozen` + `offline` 支持内网/离线（`file:///opt/mirror/...` 照样可用），Maven 的 `toolchains.xml` 与 Gradle 的 `installations.paths` 保证 daemon 用同一棵 JDK，装完还会跑 `java -version` 断言。`uses:` 执行七个内置动作（checkout / toolchain / cache / collect / deploy / verify / notify），**不引用任何外部 action**，未知动作 / 未知 `with` 参数 / 缺能力全部硬失败而不是静默跳过；缓存先恢复、job 结束时收尾保存，`paths` 拒绝绝对路径。
 - 存储（v0.5）：`cicd.db` 的 releases 表新增 `env` 列（`SCHEMA_VERSION=2`，旧库 `ALTER TABLE` 自动补列），`/releases?env=` 可按环境过滤。
 - **灰度分批（v0.6）**：target 可写 `canary: { first: 1, waitSec: 30 }`——先发 `first` 台，**首批任一台失败立即停止**（不受 `onHostFailure` 影响），首批全绿后等 `waitSec` 再发剩余；每台结果带 `batch: 1|2`，run 结果带 `canary.batches`，等待期写一条 `canary-hold` 审计。
 - **通知 webhook（v0.6）**：插件配置 `notify.webhooks: [{ url, secret?, events? }]`，事件 `run.success|run.failed|run.canceled|rollback.success|rollback.failed`；并发 POST，配了 `secret` 就带 `x-dsh-signature: sha256=<hex>`（HMAC-SHA256）；**通知失败只记审计，绝不影响发布**；`GET /notify-test?confirm=1` 可试发（未配置返回 `configured: 0`）。

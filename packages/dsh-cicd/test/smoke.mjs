@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, readdirSync, chmodSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 
 import {
   internals,
@@ -26,7 +28,14 @@ import { createApprovalGate } from '../lib/approval.js'
 import { createSecretStore } from '../lib/secrets.js'
 import { normalizeEnvironments, promotionPath } from '../lib/environments.js'
 import { deployRelease as strategyDeploy, normalizeStrategy } from '../lib/strategy.js'
-import { deployOne, rollbackOne } from '../lib/deploy.js'
+import { deployTransaction, planBatches, readManifest, usesTransaction } from '../lib/deploy-engine.js'
+import { createNativeActuator, renderTemplate } from '../lib/actuator/native.js'
+import { createSlotStore } from '../lib/slots.js'
+import {
+  createToolchain, envFor, assertVersions, inferFromFiles, writeDualLocks, binDirOf,
+  parseSpec, pickVersion, parseChecksum, matchesVersion, sha256File, currentPlatform,
+  emptyLock, readLock, writeLock, upsertLockEntry, runSync, TOOLCHAIN_ERRORS,
+} from '../lib/toolchain.js'
 
 const checks = []
 function check(title, fn) {
@@ -39,10 +48,10 @@ function throwsCode(fn, code) {
   assert.throws(fn, (error) => error && error.code === code, `expected code ${code}`)
 }
 
-check('manifest 是 @local/dsh-cicd 0.6.1 且导出 Host 形状', () => {
+check('manifest 是 @local/dsh-cicd 3.0.0-p2 且导出 Host 形状', () => {
   const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
   assert.equal(manifest.name, '@local/dsh-cicd')
-  assert.equal(manifest.version, '0.6.1')
+  assert.equal(manifest.version, '3.0.0-p2')
   assert.equal(manifest.type, 'module')
   assert.equal(packageName, '@local/dsh-cicd')
   assert.deepEqual(inject, ['tools'])
@@ -758,12 +767,13 @@ function callPath(pathname, query = '', { headers = {} } = {}) {
   return route.resource(new Request(`http://x${pathname}${query}`, { headers }))
 }
 
-check('apply：注册 20 个工具、28 条 exact + 1 条 prefix 路由、1 条 WS upgrade 与 runtime disposer', () => {
-  assert.equal(ctx.toolsList.length, 20)
+check('apply：注册 27 个工具、35 条路由（34 exact + 1 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
+  assert.equal(ctx.toolsList.length, 27)
   assert.deepEqual(ctx.toolsList.map((tool) => tool.name).sort(), [
-    'cicd_approve', 'cicd_cancel', 'cicd_dora', 'cicd_environments', 'cicd_logs', 'cicd_pipe_save', 'cicd_plan',
-    'cicd_project_create', 'cicd_project_meta', 'cicd_projects', 'cicd_rbac', 'cicd_releases', 'cicd_rollback',
-    'cicd_run', 'cicd_runners', 'cicd_secrets', 'cicd_status', 'cicd_targets', 'cicd_triggers', 'cicd_validate',
+    'cicd_approve', 'cicd_artifacts', 'cicd_audit', 'cicd_auth', 'cicd_cancel', 'cicd_dora', 'cicd_environments', 'cicd_locks',
+    'cicd_logs', 'cicd_pipe_save', 'cicd_plan', 'cicd_project_create', 'cicd_project_meta', 'cicd_projects',
+    'cicd_rbac', 'cicd_releases', 'cicd_rollback', 'cicd_run', 'cicd_runners', 'cicd_secrets', 'cicd_status',
+    'cicd_targets', 'cicd_tokens', 'cicd_toolchain', 'cicd_triggers', 'cicd_users', 'cicd_validate',
   ])
   for (const tool of ctx.toolsList) {
     assert.equal(typeof tool.description, 'string')
@@ -772,15 +782,16 @@ check('apply：注册 20 个工具、28 条 exact + 1 条 prefix 路由、1 条 
     assert.equal(typeof tool.output.render, 'function')
     assert.equal(typeof tool.execute, 'function')
   }
-  assert.equal(ctx.routes.length, 28)
+  assert.equal(ctx.routes.length, 35)
   assert.deepEqual(ctx.routes.filter((route) => route.kind === 'exact').map((route) => route.path).sort(), [
-    '/api/plugins/cicd/approvals', '/api/plugins/cicd/approve', '/api/plugins/cicd/cancel', '/api/plugins/cicd/dora',
-    '/api/plugins/cicd/environments', '/api/plugins/cicd/log', '/api/plugins/cicd/notify-test', '/api/plugins/cicd/operations',
-    '/api/plugins/cicd/pipe-save', '/api/plugins/cicd/plan', '/api/plugins/cicd/project-create', '/api/plugins/cicd/project-meta',
-    '/api/plugins/cicd/projects', '/api/plugins/cicd/rbac', '/api/plugins/cicd/releases', '/api/plugins/cicd/rollback',
-    '/api/plugins/cicd/run', '/api/plugins/cicd/runner-log', '/api/plugins/cicd/runner-poll', '/api/plugins/cicd/runner-register',
-    '/api/plugins/cicd/runner-result', '/api/plugins/cicd/runners', '/api/plugins/cicd/runs', '/api/plugins/cicd/secrets',
-    '/api/plugins/cicd/targets', '/api/plugins/cicd/triggers', '/api/plugins/cicd/validate',
+    '/api/plugins/cicd/approvals', '/api/plugins/cicd/approve', '/api/plugins/cicd/artifacts', '/api/plugins/cicd/audit', '/api/plugins/cicd/auth',
+    '/api/plugins/cicd/cancel', '/api/plugins/cicd/dora', '/api/plugins/cicd/environments', '/api/plugins/cicd/locks',
+    '/api/plugins/cicd/log', '/api/plugins/cicd/notify-test', '/api/plugins/cicd/operations', '/api/plugins/cicd/pipe-save',
+    '/api/plugins/cicd/plan', '/api/plugins/cicd/project-create', '/api/plugins/cicd/project-meta', '/api/plugins/cicd/projects',
+    '/api/plugins/cicd/rbac', '/api/plugins/cicd/releases', '/api/plugins/cicd/rollback', '/api/plugins/cicd/run',
+    '/api/plugins/cicd/runner-log', '/api/plugins/cicd/runner-poll', '/api/plugins/cicd/runner-register', '/api/plugins/cicd/runner-result',
+    '/api/plugins/cicd/runners', '/api/plugins/cicd/runs', '/api/plugins/cicd/secrets', '/api/plugins/cicd/targets',
+    '/api/plugins/cicd/tokens', '/api/plugins/cicd/toolchain', '/api/plugins/cicd/triggers', '/api/plugins/cicd/users', '/api/plugins/cicd/validate',
   ])
   assert.deepEqual(ctx.routes.filter((route) => route.kind === 'prefix').map((route) => route.path), ['/api/plugins/cicd/hooks'])
   assert.ok(ctx.routes.every((route) => typeof route.resource === 'function' && !route.handler))
@@ -789,7 +800,7 @@ check('apply：注册 20 个工具、28 条 exact + 1 条 prefix 路由、1 条 
   assert.equal(typeof ctx.upgrades[0].handler, 'function')
 })
 
-check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补注册 17+1 条；remote() 惰性取 port', () => {
+check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补注册 34+1 条；remote() 惰性取 port', () => {
   const coldRoutes = []
   const coldUpgrades = []
   const coldWeb = {
@@ -811,8 +822,8 @@ check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补�
   assert.ok(typeof scopeFn === 'function', 'apply 应把路由注册挂到 ctx.inject 上')
   // 模拟 webServer 就绪：cordis 以一个能 get 到服务的 scope 触发回调（真实环境由服务就绪事件驱动）。
   scopeFn({ get: (key) => (key === 'webServer' ? coldWeb : undefined), effect() {} })
-  assert.equal(coldRoutes.length, 28, '就绪后应补注册 27 条 exact + 1 条 hooks prefix 路由')
-  assert.equal(coldRoutes.filter((route) => route.kind === 'exact').length, 27)
+  assert.equal(coldRoutes.length, 35, '就绪后应补注册 34 条 exact + 1 条 hooks prefix 路由')
+  assert.equal(coldRoutes.filter((route) => route.kind === 'exact').length, 34)
   assert.equal(coldUpgrades.length, 1, '就绪后应补注册 /log-ws upgrade 路由')
 
   // remote() 惰性解析：apply 时拿不到 port（remoteBase 为空），就绪后首次调用应取到 55470。
@@ -1017,7 +1028,7 @@ checkAsync('routes：operations 时间线、notify-test 未配置与写保护', 
 })
 
 check('routes：所有资源都走 resource，没有 handler/POST 形态', () => {
-  assert.equal(ctx.routes.length, 28)
+  assert.equal(ctx.routes.length, 35)
   for (const route of ctx.routes) {
     assert.equal(route.handler, undefined)
     assert.ok(route.kind === 'exact' || route.kind === 'prefix')
@@ -1044,6 +1055,17 @@ check('routes：所有资源都走 resource，没有 handler/POST 形态', () =>
   assert.equal(typeof internals.resources.secretsResource, 'function')
   assert.equal(typeof internals.resources.environmentsResource, 'function')
   assert.equal(typeof internals.resources.rbacResource, 'function')
+  // v3.0-P0：身份、审计、锁
+  assert.equal(typeof internals.resources.authResource, 'function')
+  assert.equal(typeof internals.resources.usersResource, 'function')
+  assert.equal(typeof internals.resources.tokensResource, 'function')
+  assert.equal(typeof internals.resources.auditResource, 'function')
+  assert.equal(typeof internals.resources.locksResource, 'function')
+  // v3.0-P2：工具链
+  assert.equal(typeof internals.resources.toolchainResource, 'function')
+  assert.equal(typeof internals.toolchain.createToolchain, 'function')
+  assert.equal(typeof internals.toolchain.envFor, 'function')
+  assert.deepEqual(internals.toolchain.LANGS, ['java', 'maven', 'gradle', 'node', 'python', 'php', 'go'])
   assert.equal(typeof internals.logWsHandler, 'function')
   assert.equal(typeof internals.createTaskBroker, 'function')
   assert.equal(typeof internals.createRemoteExecutor, 'function')
@@ -1088,7 +1110,7 @@ check('v0.5 选择器：语法校验、混写保序、非法前缀与重复项�
   )
 })
 
-check('DB：v1 库迁移到 user_version=5，补出 env、operations 审计列、projects 表与 steps.runner_id', () => {
+check('DB：v1 库迁移到 user_version=10，补出 env、operations 审计列、projects 表、steps.runner_id 与 4 列主键、runs 配置快照、releases 回滚现场、制品两表', () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-cicd-migrate-'))
   const file = join(dir, 'cicd.db')
   const legacy = new DatabaseSync(file)
@@ -1100,7 +1122,11 @@ check('DB：v1 库迁移到 user_version=5，补出 env、operations 审计列�
   legacy.close()
 
   const db = openDatabase(file)
-  assert.equal(Number(db.prepare('PRAGMA user_version').get().user_version), 5)
+  assert.equal(Number(db.prepare('PRAGMA user_version').get().user_version), 10)
+  // v3.0-P5：制品 CAS 的两张表必须随迁移补出来，否则上传能落盘、列表却是空的。
+  for (const table of ['artifact_blobs', 'artifact_refs']) {
+    assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(table), `迁移后应有 ${table} 表`)
+  }
   assert.ok(db.prepare('PRAGMA table_info(releases)').all().some((row) => row.name === 'env'))
   for (const column of ['action', 'project', 'target', 'host', 'release_id', 'status']) {
     assert.ok(db.prepare('PRAGMA table_info(operations)').all().some((row) => row.name === column), `operations.${column}`)
@@ -1109,6 +1135,19 @@ check('DB：v1 库迁移到 user_version=5，补出 env、operations 审计列�
   assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_operations_at'").get())
   assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'projects'").get())
   assert.ok(db.prepare('PRAGMA table_info(steps)').all().some((row) => row.name === 'runner_id'), 'steps.runner_id')
+  // v3.0-P0：新表必须随旧库一起补出来，否则老部署升级后锁/审计/认证全失效。
+  for (const table of ['deploy_locks', 'audit_events', 'users', 'memberships', 'api_tokens', 'sessions', 'runners', 'approvals']) {
+    assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table), `table ${table}`)
+  }
+  assert.equal(db.prepare('PRAGMA table_info(audit_events)').all().filter((row) => row.name === 'prev_hash').length, 1)
+  // v3.0-P1：steps 主键扩到 4 列（加 job_id），老行的 job_id 必须是空串而不是丢行。
+  const stepPk = db.prepare('PRAGMA table_info(steps)').all().filter((row) => row.pk > 0).sort((a, b) => a.pk - b.pk).map((row) => row.name)
+  assert.deepEqual(stepPk, ['run_id', 'stage_id', 'job_id', 'idx'])
+  // v3.0-P3：releases 必须补出回滚现场五列，且老行留空串（不是编一个默认值）。
+  const releaseColumns = db.prepare('PRAGMA table_info(releases)').all().map((row) => row.name)
+  for (const column of ['artifact_digest', 'mode', 'strategy', 'instances', 'operator']) {
+    assert.ok(releaseColumns.includes(column), `releases.${column}`)
+  }
   db.close()
   rmSync(dir, { recursive: true, force: true })
 })
@@ -2155,21 +2194,56 @@ check('V2-M4 environments：dev/staging/prod 环境 + 晋升路径', () => {
   assert.deepEqual(promotionPath(envs, 'prod'), [])
 })
 
-check('V2-M4 approvalGate：request/isPending/resolve/list 全链路', () => {
-  const gate = createApprovalGate()
-  const approval = gate.request({ runId: 'r1', project: 'demo', target: 'prod', requestedBy: 'ui', detail: 'deploy' })
+check('V2-M4 approvalGate：request/isPending/resolve/list 全链路（落库版）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-cicd-approval-'))
+  const db = openDatabase(join(dir, 'cicd.db'))
+  const gate = createApprovalGate({ db })
+  const approval = gate.request({ runId: 'r1', project: 'demo', target: 'prod', requestedBy: 'alice', detail: 'deploy' })
   assert.equal(approval.status, 'pending')
   assert.equal(gate.isPending('r1'), true)
   assert.equal(gate.get('r1').id.startsWith('appr-'), true)
   const list = gate.list({ project: 'demo', status: 'pending' })
   assert.equal(list.length, 1)
   assert.equal(list[0].runId, 'r1')
-  const resolved = gate.resolve({ runId: 'r1', approved: true, resolvedBy: 'admin' })
-  assert.equal(resolved.status, 'approved')
+  // v3.0-P0：禁自批——服务端校验，不靠 UI 隐藏按钮。
+  const selfApprove = gate.resolve({ runId: 'r1', approved: true, resolvedBy: 'alice' })
+  assert.equal(selfApprove.ok, false)
+  assert.equal(selfApprove.code, 'SELF_APPROVAL_FORBIDDEN')
+  const resolved = gate.resolve({ runId: 'r1', approved: true, resolvedBy: 'bob' })
+  assert.equal(resolved.ok, true)
+  assert.equal(resolved.approval.status, 'approved')
   assert.equal(gate.isPending('r1'), false)
-  assert.equal(gate.get('r1').resolvedBy, 'admin')
+  assert.equal(gate.get('r1').decidedBy, 'bob')
+  // 一次性消费：批准后能给一次部署放行，第二次必须重新申请。
+  const first = gate.consume({ id: resolved.approval.id, digest: 'sha256:aaa' })
+  assert.equal(first.ok, true)
+  assert.equal(first.approval.artifactDigest, 'sha256:aaa')
+  const second = gate.consume({ id: resolved.approval.id, digest: 'sha256:bbb' })
+  assert.equal(second.ok, false)
+  assert.equal(second.code, 'APPROVAL_CONSUMED')
+  // 重启不丢：同一个库重开，历史审批仍在。
   gate.dispose()
-  assert.equal(gate.list().length, 0)
+  const reopened = createApprovalGate({ db })
+  assert.equal(reopened.get(resolved.approval.id).status, 'consumed')
+  assert.equal(reopened.stats().consumed, 1)
+  db.close()
+  rmSync(dir, { recursive: true, force: true })
+})
+
+check('V2-M4 approvalGate：TTL 到期落 approval_timeout', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-cicd-approval-ttl-'))
+  const db = openDatabase(join(dir, 'cicd.db'))
+  let clock = Date.now()
+  const gate = createApprovalGate({ db, ttlSec: 60, now: () => clock })
+  const approval = gate.request({ runId: 'r2', project: 'demo', target: 'prod', requestedBy: 'alice' })
+  assert.equal(gate.isPending('r2'), true)
+  clock += 61 * 1000
+  assert.equal(gate.isPending('r2'), false)
+  const row = gate.get(approval.id)
+  assert.equal(row.status, 'expired')
+  assert.equal(row.reason, 'approval_timeout')
+  db.close()
+  rmSync(dir, { recursive: true, force: true })
 })
 
 check('V2-M4 secrets：set/get/list/remove + refsForInterpolate', () => {
@@ -2193,13 +2267,13 @@ check('V2-M4 secrets：set/get/list/remove + refsForInterpolate', () => {
   rmSync(dir, { recursive: true, force: true })
 })
 
-checkAsync('V2-M4 /approve 路由：缺 runId 400、未知 404', async () => {
+checkAsync('V2-M4 /approve 路由：缺 approvalId/runId 400、未知 404', async () => {
   const r1 = await call('/approve', '?confirm=1', { headers: { 'x-dsh-cicd': '1' } })
   assert.equal(r1.status, 400)
   const r2 = await call('/approve', '?runId=unknown-run&decision=approve&confirm=1', { headers: { 'x-dsh-cicd': '1' } })
   assert.equal(r2.status, 404)
   const body = await r2.json()
-  assert.equal(body.code, 'RUN_NOT_FOUND')
+  assert.equal(body.code, 'APPROVAL_NOT_FOUND')
 })
 
 checkAsync('V2-M4 /approvals /secrets /environments 路由', async () => {
@@ -2323,7 +2397,1650 @@ checkAsync('V2-M5 /rbac 路由：签发/校验/吊销/审计', async () => {
   assert.ok(aBody.audit.length >= 2)
 })
 
-// 末尾清理
+// ============================================================================
+// 08-security-rbac.md §10 八条验收（v3.0-P0）
+// 每条都走真实 HTTP 路由 + 真实 DB，不打桩：验收标准写的是「线上能不能挡住」，
+// 用单元测试替身证明不了这件事。
+// ============================================================================
+
+const ACC_PIPE = [
+  'version: 1',
+  'name: acc-pipe',
+  'targets:',
+  '  dev:',
+  '    hosts: [api2]',
+  '    path: /srv/acc-dev',
+  '  prod:',
+  '    hosts: [linux26, win22]',
+  '    path: /srv/acc-prod',
+  'stages:',
+  '  - id: build',
+  '    steps:',
+  '      - name: build',
+  '        run: echo ACC_BUILD_OK',
+  '  - id: release',
+  '    needs: [build]',
+  '    steps:',
+  '      - name: ship',
+  '        deploy:',
+  '          target: prod',
+  '          artifacts: ["bundle.tgz"]',
+].join('\n')
+
+// 内容与 ACC_PIPE 相同、只有项目 id 不同 → digest 不同。验收④用它证明「一条审批只绑一个 digest」。
+const ACC_PIPE_TWIN = ACC_PIPE.replace('name: acc-pipe', 'name: acc-pipe-twin')
+
+const ACC_SECRET_PIPE = [
+  'version: 1',
+  'name: acc-secret-pipe',
+  'targets:',
+  '  dev:',
+  '    hosts: [api2]',
+  '    path: /srv/acc-secret',
+  'stages:',
+  '  - id: build',
+  '    steps:',
+  '      - name: leak',
+  '        run: echo ${{ACC_SECRET}}',
+].join('\n')
+
+const ACC_SECRET_VALUE = 'acc-s3cret-value'
+const ACC_PASSWORD = '{{SECRET_9ntmfi6m}}'
+const accRoot = mkdtempSync(join(tmpdir(), 'cicd-acc-'))
+const accAppDir = join(accRoot, 'app')
+const accTwinDir = join(accRoot, 'app-twin')
+const accSecretDir = join(accRoot, 'app-secret')
+for (const dir of [accAppDir, accTwinDir, accSecretDir]) mkdirSync(dir, { recursive: true })
+writeFileSync(join(accAppDir, 'pipe.yml'), ACC_PIPE, 'utf8')
+writeFileSync(join(accTwinDir, 'pipe.yml'), ACC_PIPE_TWIN, 'utf8')
+writeFileSync(join(accSecretDir, 'pipe.yml'), ACC_SECRET_PIPE, 'utf8')
+writeFileSync(join(accAppDir, 'bundle.tgz'), 'acc-bundle', 'utf8')
+writeFileSync(join(accTwinDir, 'bundle.tgz'), 'acc-bundle', 'utf8')
+
+const accCtx = fakeContext()
+apply(accCtx, {
+  projects: [
+    { id: 'acc', name: 'Acc', path: accAppDir, pipe: join(accAppDir, 'pipe.yml') },
+    { id: 'acc2', name: 'Acc2', path: accTwinDir, pipe: join(accTwinDir, 'pipe.yml') },
+    { id: 'accsec', name: 'AccSecret', path: accSecretDir, pipe: join(accSecretDir, 'pipe.yml') },
+  ],
+  workDir: join(accRoot, 'state'),
+  remoteBase: 'http://127.0.0.1:7891',
+  scheduler: { enabled: false },
+  runners: { joinToken: 'acc-join-token' },
+  approval: { ttlSec: 3600 },
+})
+// 验收上下文的路由也要随主 ctx 一起销毁，否则末尾那条 `routes.length === 0` 会漏。
+ctx.effects.push(...accCtx.effects.splice(0))
+
+function accCall(routePath, query = '', { headers = {} } = {}) {
+  // 允许把查询串直接写在 routePath 里（读起来更像一个真实 URL），
+  // 但查路由必须用干净的 path，否则 `/audit?name=x` 会被当成一条不存在的路由。
+  const cut = routePath.indexOf('?')
+  const pathname = cut < 0 ? routePath : routePath.slice(0, cut)
+  const search = cut < 0 ? query : routePath.slice(cut) + query
+  const route = accCtx.routes.find((item) => item.path === internals.ROUTE_PREFIX + pathname)
+  assert.ok(route, `acc route ${pathname} registered`)
+  return route.resource(new Request(`http://x${internals.ROUTE_PREFIX}${pathname}${search}`, {
+    headers: { 'x-dsh-cicd': '1', ...headers },
+  }))
+}
+
+const accDbFile = join(accRoot, 'state', 'cicd.db')
+// 八条验收共享的凭据：验收①里建好，后面全部用 token 走真实认证链。
+const accIds = { view: '', admin: '', approver: '', viewToken: '', adminToken: '', approverToken: '' }
+
+checkAsync('验收①：Viewer 调 /run → 403 POLICY_DENY，且审计里留下 deny 记录', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = envFetch
+  try {
+    // 引导期（库里还没有任何用户）才有权限建第一个人 —— 这是刻意设计的首启路径。
+    const created = await accCall('/users', `?action=create&email=admin%40acc.test&password=${encodeURIComponent(ACC_PASSWORD)}&role=owner&confirm=1`)
+    assert.equal(created.status, 200, '引导期建管理员')
+    accIds.admin = (await created.json()).user.id
+
+    // 第一个人建完，bootstrap 立刻退场 —— 这一步之后连签 token 都得先登录。
+    const login = await accCall('/auth', `?action=login&email=admin%40acc.test&password=${encodeURIComponent(ACC_PASSWORD)}`)
+    assert.equal(login.status, 200, '登录要能用')
+    const loginBody = await login.json()
+    assert.match(loginBody.cookie, /^dsh_cicd_session=/)
+    const auth = { cookie: loginBody.cookie.split(';')[0] }
+
+    const adminToken = await accCall('/tokens', `?action=create&userId=${encodeURIComponent(accIds.admin)}&name=acc-admin&confirm=1`, { headers: auth })
+    assert.equal(adminToken.status, 200, '登录后能签 token')
+    accIds.adminToken = (await adminToken.json()).token.token
+    assert.match(accIds.adminToken, /^cicd_/)
+    const mkUser = async (email, role) => {
+      const res = await accCall('/users', `?action=create&email=${encodeURIComponent(email)}&password=${encodeURIComponent(ACC_PASSWORD)}&role=${role}&confirm=1`, { headers: auth })
+      assert.equal(res.status, 200, `建 ${role}`)
+      return (await res.json()).user.id
+    }
+    accIds.view = await mkUser('viewer@acc.test', 'viewer')
+    accIds.approver = await mkUser('approver@acc.test', 'admin')
+
+    const mkToken = async (userId) => {
+      const res = await accCall('/tokens', `?action=create&userId=${encodeURIComponent(userId)}&name=acc&confirm=1`, { headers: auth })
+      assert.equal(res.status, 200)
+      const body = await res.json()
+      assert.match(body.token.token, /^cicd_/)
+      return body.token.token
+    }
+    accIds.viewToken = await mkToken(accIds.view)
+    accIds.approverToken = await mkToken(accIds.approver)
+
+    // 有了用户，bootstrap 就必须退场：匿名读也得 401。
+    const anon = await accCall('/runs', '?project=acc')
+    assert.equal(anon.status, 401, 'bootstrap 退场后匿名读也得 401')
+
+    // secret 要在任何一次跑之前就位，否则带 ${{ACC_SECRET}} 的 plan 会直接 PIPE_VAR。
+    const setSecret = await accCall('/secrets', `?project=accsec&name=ACC_SECRET&value=${encodeURIComponent(ACC_SECRET_VALUE)}&confirm=1`, { headers: auth })
+    assert.equal(setSecret.status, 200)
+
+    const denied = await accCall('/run', '?project=acc&target=dev&confirm=1', {
+      headers: { authorization: `Bearer ${accIds.viewToken}` },
+    })
+    assert.equal(denied.status, 403, 'viewer 触发部署必须 403')
+    const deniedBody = await denied.json()
+    assert.equal(deniedBody.code, 'POLICY_DENY')
+    assert.equal(deniedBody.action, 'run')
+
+    const audit = await accCall('/audit?name=policy.deny', '', { headers: auth })
+    assert.equal(audit.status, 200)
+    const rows = (await audit.json()).events
+    const row = rows.find((item) => item.action === 'policy.deny' && item.result === 'deny')
+    assert.ok(row, '审计里必须有这条 deny')
+    assert.equal(row.actorId, accIds.view, '审计要记到具体是谁')
+    assert.equal(row.projectId, 'acc')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+checkAsync('验收②：Admin 部署 prod 无审批 → APPROVAL_REQUIRED；到期收成 failed(approval_timeout)', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = envFetch
+  try {
+    const auth = { authorization: `Bearer ${accIds.adminToken}` }
+    const run = await accCall('/run', '?project=acc&target=prod&confirm=prod', { headers: auth })
+    assert.equal(run.status, 409, 'prod 部署没审批必须 409')
+    assert.equal((await run.json()).code, 'APPROVAL_REQUIRED')
+
+    const pending = await accCall('/approvals?status=pending', '', { headers: auth })
+    assert.equal(pending.status, 200)
+    const pendingBody = await pending.json()
+    assert.ok(pendingBody.approvals.length >= 1, '要能在面板上看到待审批')
+    const approval = pendingBody.approvals[0]
+    assert.ok(approval.artifactDigest, '审批必须绑 digest，否则批准的是什么说不清')
+    assert.equal(approval.requestedBy, accIds.admin)
+    assert.ok(approval.expiresAt, '审批必须有 TTL，不允许永久 pending')
+
+    const waiting = await accCall('/runs?project=acc&limit=50', '', { headers: auth })
+    const waitingRow = (await waiting.json()).runs.find((item) => item.id === approval.runId)
+    assert.ok(waitingRow, '待审批的运行记录要能查到（否则面板上「点过运行」和「什么都没发生」长得一样）')
+    assert.equal(waitingRow.status, 'waiting_approval')
+
+    // 把到期时间推到过去，再读一次审批列表触发懒扫描。
+    const db = openDatabase(accDbFile)
+    try {
+      db.prepare('UPDATE approvals SET expires_at = ? WHERE id = ?').run('2000-01-01T00:00:00.000Z', approval.id)
+    } finally { db.close() }
+
+    const expired = await accCall('/approvals?status=expired', '', { headers: auth })
+    const expiredBody = await expired.json()
+    assert.equal(expiredBody.stats.expired, 1, '过期审批要落成 expired')
+    assert.equal(expiredBody.approvals[0].reason, 'approval_timeout')
+
+    const after = await accCall('/runs?project=acc&limit=50', '', { headers: auth })
+    const stuck = (await after.json()).runs.find((item) => item.id === approval.runId)
+    assert.equal(stuck.status, 'failed', '过期后不能永远挂在 waiting_approval')
+    assert.equal(stuck.error, 'approval_timeout')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+checkAsync('验收③：审批人 = 请求人 → 403 SELF_APPROVAL_FORBIDDEN', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = envFetch
+  try {
+    const auth = { authorization: `Bearer ${accIds.adminToken}` }
+    const run = await accCall('/run', '?project=acc&target=prod&confirm=prod', { headers: auth })
+    assert.equal(run.status, 409)
+
+    const approvals = await accCall('/approvals?status=pending', '', { headers: auth })
+    const mine = (await approvals.json()).approvals.find((item) => item.requestedBy === accIds.admin && item.status === 'pending')
+    assert.ok(mine, '自己发起的那条')
+
+    const self = await accCall('/approve', `?approvalId=${encodeURIComponent(mine.id)}&decision=approve&confirm=1`, { headers: auth })
+    assert.equal(self.status, 403, '自批必须被服务端挡住，不能只靠前端藏按钮')
+    assert.equal((await self.json()).code, 'SELF_APPROVAL_FORBIDDEN')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+checkAsync('验收④：同一条审批不能用到第二个 digest → APPROVAL_CONSUMED', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = envFetch
+  try {
+    const auth = { authorization: `Bearer ${accIds.adminToken}` }
+    // 清掉验收③留下的那条 pending，避免与本次申请混在一起。
+    const run = await accCall('/run', '?project=acc&target=prod&confirm=prod', { headers: auth })
+    assert.equal(run.status, 409)
+    const approvals = await accCall('/approvals?status=pending', '', { headers: auth })
+    const mine = (await approvals.json()).approvals.find((item) => item.project === 'acc' && item.status === 'pending')
+    assert.ok(mine)
+
+    const ok = await accCall('/approve', `?approvalId=${encodeURIComponent(mine.id)}&decision=approve&confirm=1`, {
+      headers: { authorization: `Bearer ${accIds.approverToken}` },
+    })
+    assert.equal(ok.status, 200, '换个人批准应当成功')
+    assert.equal((await ok.json()).status, 'approved')
+
+    // 用这条审批跑 acc：digest 一致 → 放行并把它消费掉。
+    const use = await accCall('/run', `?project=acc&target=prod&confirm=prod&approvalId=${encodeURIComponent(mine.id)}`, { headers: auth })
+    assert.equal(use.status, 200, '审批 + 同一 digest 应当放行')
+    assert.equal((await use.json()).ok, true)
+
+    // 同一条审批去跑 acc2：内容同一份，但项目 id 不同 → digest 不同 → 必须拒。
+    const reuse = await accCall('/run', `?project=acc2&target=prod&confirm=prod&approvalId=${encodeURIComponent(mine.id)}`, { headers: auth })
+    assert.equal(reuse.status, 409, '已消费的审批不能再用')
+    assert.equal((await reuse.json()).code, 'APPROVAL_CONSUMED')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+checkAsync('验收⑤：日志里 grep 不到 secret 原文，且揭示动作有审计', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = envFetch
+  try {
+    const auth = { authorization: `Bearer ${accIds.adminToken}` }
+    const run = await accCall('/run', '?project=accsec&target=dev&confirm=1', { headers: auth })
+    assert.equal(run.status, 200)
+    const runId = (await run.json()).runId
+    assert.ok(runId)
+
+    const log = await accCall(`/log?runId=${encodeURIComponent(runId)}&tail=200`, '', { headers: auth })
+    assert.equal(log.status, 200)
+    const text = (await log.json()).text
+    assert.ok(text.length > 0, '日志不能是空的，否则这条验收等于没测')
+    assert.equal(text.includes(ACC_SECRET_VALUE), false, '日志里不能出现 secret 原文')
+    assert.ok(text.includes('***'), '被替换的位置要留痕')
+
+    // 列表默认不回值，只有显式 reveal 才回，且必须留审计。
+    const plain = await accCall('/secrets?project=accsec', '', { headers: auth })
+    const plainRows = (await plain.json()).secrets
+    assert.equal(plainRows.length, 1)
+    assert.equal(plainRows[0].value, undefined, '列表接口不能顺手把明文带出来')
+
+    const revealed = await accCall('/secrets?project=accsec&reveal=1&confirm=1', '', { headers: auth })
+    assert.equal(revealed.status, 200)
+    const revealedBody = await revealed.json()
+    assert.equal(revealedBody.revealed, true)
+    assert.equal(revealedBody.secrets[0].value, ACC_SECRET_VALUE)
+
+    const audit = await accCall('/audit?name=secret.revealed', '', { headers: auth })
+    const rows = (await audit.json()).events
+    assert.ok(rows.some((item) => item.action === 'secret.revealed' && item.actorId === accIds.admin), '揭示必须留痕')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+checkAsync('验收⑥：同 target 并发部署 → 第二把锁被拒，且重启服务后依然互斥', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = envFetch
+  try {
+    const holderDb = openDatabase(accDbFile)
+    const locks = internals.createDeployLocks({ db: holderDb })
+    const first = locks.acquire({ target: 'prod', projectId: 'acc', runId: 'acc-lock-holder', owner: 'admin@acc.test' })
+    assert.equal(first.ok, true)
+
+    const auth = { authorization: `Bearer ${accIds.adminToken}` }
+    const denied = await accCall('/run', '?project=acc&target=prod&confirm=prod', { headers: auth })
+    assert.equal(denied.status, 409)
+    assert.equal((await denied.json()).code, 'DEPLOY_IN_PROGRESS', '同 target 的第二条必须被锁挡住')
+
+    // 「重启后依然互斥」= 换一个全新 runtime（新连接、新内存态）读同一张表。
+    const restartedCtx = fakeContext()
+    apply(restartedCtx, {
+      projects: [{ id: 'acc', name: 'Acc', path: accAppDir, pipe: join(accAppDir, 'pipe.yml') }],
+      workDir: join(accRoot, 'state'),
+      remoteBase: 'http://127.0.0.1:7891',
+      scheduler: { enabled: false },
+    })
+    ctx.effects.push(...restartedCtx.effects.splice(0))
+    const runRoute = restartedCtx.routes.find((item) => item.path === `${internals.ROUTE_PREFIX}/run`)
+    const again = await runRoute.resource(new Request(`http://x${internals.ROUTE_PREFIX}/run?project=acc&target=prod&confirm=prod`, {
+      headers: { 'x-dsh-cicd': '1', ...auth },
+    }))
+    assert.equal(again.status, 409, '锁落库，重启不能把互斥弄丢')
+    assert.equal((await again.json()).code, 'DEPLOY_IN_PROGRESS')
+
+    const listed = await accCall('/locks', '', { headers: auth })
+    const lockRows = (await listed.json()).locks
+    assert.ok(lockRows.some((item) => item.target === 'prod' && item.runId === 'acc-lock-holder'), '持有者要能查得到')
+
+    locks.release({ target: 'prod', runId: 'acc-lock-holder' })
+    holderDb.close()
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+checkAsync('验收⑦：篡改审计表一行 → /audit?action=verify 报链断', async () => {
+  const auth = { authorization: `Bearer ${accIds.adminToken}` }
+  const db = openDatabase(accDbFile)
+  try {
+    const row = db.prepare('SELECT seq FROM audit_events ORDER BY seq ASC LIMIT 1 OFFSET 2').get()
+    assert.ok(row, '审计表里得先有记录')
+    db.prepare('UPDATE audit_events SET reason = ? WHERE seq = ?').run('tampered-by-test', row.seq)
+  } finally { db.close() }
+
+  const verify = await accCall('/audit?action=verify', '', { headers: auth })
+  assert.equal(verify.status, 200)
+  const body = await verify.json()
+  assert.equal(body.ok, false, '篡改必须被检出')
+  assert.equal(body.kind, 'hash')
+  assert.ok(body.brokenSeq > 0)
+})
+
+checkAsync('验收⑧：吊销 runner 后 3× 心跳周期内不再被调度', async () => {
+  const auth = { authorization: `Bearer ${accIds.adminToken}` }
+  const register = await accCall('/runner-register?runnerId=acc-runner&token=acc-join-token&labels=build')
+  assert.equal(register.status, 200)
+  const regBody = await register.json()
+  assert.equal(regBody.runnerId, 'acc-runner')
+  assert.equal(regBody.offlineAfterSec, regBody.heartbeatSec * 3, '判死阈值必须正好是 3× 心跳')
+
+  const pollBefore = await accCall('/runner-poll?runnerId=acc-runner&token=acc-join-token')
+  assert.equal(pollBefore.status, 200, '吊销前应当能领任务')
+
+  const revoke = await accCall('/runners?action=revoke&runnerId=acc-runner&confirm=1', '', { headers: auth })
+  assert.equal(revoke.status, 200)
+
+  const pollAfter = await accCall('/runner-poll?runnerId=acc-runner&token=acc-join-token')
+  assert.equal(pollAfter.status, 403, '吊销要立即生效，不能等心跳超时')
+  assert.equal((await pollAfter.json()).code, 'RUNNER_REVOKED')
+
+  // 被吊销的机器即使还在跑，回传的结果也必须丢弃。
+  const late = await accCall('/runner-result?runnerId=acc-runner&taskId=t-1&status=success')
+  assert.equal(late.status, 403)
+  assert.equal((await late.json()).code, 'RUNNER_REVOKED')
+
+  const list = await accCall('/runners', '', { headers: auth })
+  const row = (await list.json()).runners.find((item) => item.runnerId === 'acc-runner')
+  assert.equal(row.status, 'revoked')
+  assert.equal(row.revoked, true)
+})
+
+// ============================================================================
+// 04-pipe-v2.md §14 / S1-S6：DSL v2 执行内核（v3.0-P1）
+// 内核层（expr/model/jobs）直接调函数测，端到端走真实路由，避免只测到内部实现。
+// ============================================================================
+
+check('P1-S1：表达式求值器不做 JS 求值，三档白名单按档位拒绝', () => {
+  const { evaluate, evaluateCondition, evaluateTemplate, parseTier } = internals.expr
+  const ctx = {
+    branch: 'main',
+    vars: { JAVA: '21', N: 3 },
+    matrix: { java: '17' },
+    secrets: { TOKEN: 's3cret' },
+    needs: { a: 'success' },
+  }
+  assert.equal(evaluate("branch == 'main' && vars.JAVA == '21'", ctx, { tier: 't1' }), true)
+  assert.equal(evaluate('matrix.java == 17', ctx, { tier: 't1' }), true)
+  assert.equal(evaluate('needs.a == "success"', ctx, { tier: 't1' }), true)
+  assert.equal(evaluateCondition('!startsWith(branch, "dev")', ctx, { tier: 't1' }), true)
+  assert.equal(evaluateTemplate('mvn -Pjdk${{ vars.JAVA }}', ctx, { tier: 't1' }), 'mvn -Pjdk21')
+
+  // secrets 只在 T2 可见：T1 读到就是设计错误（值会进 run 记录和日志）。
+  for (const source of ['secrets.TOKEN == "s3cret"']) {
+    const allowed = (() => { try { evaluate(source, ctx, { tier: 't1' }); return true } catch { return false } })()
+    assert.equal(allowed, false, `T1 必须拒绝 ${source}`)
+    assert.equal(evaluate(source, ctx, { tier: 't2' }), true)
+  }
+
+  // 不是 JS 求值器：能跑出任意代码的输入必须被表达式语法挡住，而不是交给引擎执行。
+  for (const source of ['process.exit(0)', 'require("fs")', 'globalThis.x = 1', '(() => 1)()']) {
+    assert.throws(() => evaluate(source, ctx, { tier: 't2' }), (error) => error.code === 'PIPE_EXPR', `${source} 必须被拒`)
+  }
+})
+
+check('P1-S2：v1 pipe 归一化结果与改动前一致（老文件零改动回归）', () => {
+  const { normalizeModel } = internals.model
+  const pipe = internals.parsePipe([
+    'version: 1',
+    'name: legacy',
+    'targets:',
+    '  prod:',
+    '    hosts: [linux26]',
+    '    path: /srv/legacy',
+    'stages:',
+    '  - id: build',
+    '    steps:',
+    '      - name: b',
+    '        run: echo b',
+    '  - id: release',
+    '    steps:',
+    '      - name: ship',
+    '        deploy:',
+    '          target: prod',
+  ].join('\n'), { path: 'legacy.yml' })
+
+  const model = normalizeModel(pipe, { vars: {} })
+  // release 这个 stage 只有一步 deploy，没有构建步骤 → 不该凭空造一个空的 release-main。
+  assert.deepEqual(model.jobs.map((job) => job.id), ['build-main', 'release-deploy'])
+  const byId = Object.fromEntries(model.jobs.map((job) => [job.id, job]))
+  assert.deepEqual(byId['build-main'].needs, [])
+  assert.deepEqual(byId['release-deploy'].needs, ['build-main'], 'deploy 拆成独立 job，直接挂到上一个 stage')
+  assert.equal(byId['release-deploy'].kind, 'deploy')
+  // 顺序必须拓扑可用：每个 job 出现时它的依赖都已经出现过。
+  const seen = new Set()
+  for (const job of model.order) {
+    for (const need of job.needs) assert.ok(seen.has(need), `${job.id} 的依赖 ${need} 必须先出现`)
+    seen.add(job.id)
+  }
+})
+
+check('P1-S3：matrix 展开上限 64 实例 / 3 维，超限在解析期就报错', () => {
+  const { expandMatrix, MATRIX_MAX_INSTANCES } = internals.model
+  const small = expandMatrix({ java: ['17', '21'], os: ['linux'] })
+  assert.equal(small.length, 2)
+  assert.deepEqual(small[0], { java: '17', os: 'linux' })
+
+  assert.throws(
+    () => expandMatrix({ a: ['1', '2', '3', '4', '5'], b: ['1', '2', '3', '4'], c: ['1', '2', '3', '4'] }),
+    (error) => error.code === 'PIPE_MATRIX_TOO_LARGE',
+  )
+  assert.throws(
+    () => expandMatrix({ a: ['1'], b: ['1'], c: ['1'], d: ['1'] }),
+    (error) => error.code === 'PIPE_MATRIX_TOO_LARGE',
+  )
+  assert.equal(expandMatrix({ a: ['1', '2'], b: ['x', 'y'], c: ['p'] }).length, 4, `上限是 ${MATRIX_MAX_INSTANCES}，4 不该被拦`)
+})
+
+check('P1-S4：job 依赖成环 / 依赖不存在 都在解析期报错', () => {
+  const { normalizeModel } = internals.model
+  const cycle = internals.parsePipe([
+    'version: 2',
+    'name: cyc',
+    'stages:',
+    '  - id: s',
+    '    jobs:',
+    '      - id: one',
+    '        needs: [two]',
+    '        steps:',
+    '          - run: echo one',
+    '      - id: two',
+    '        needs: [one]',
+    '        steps:',
+    '          - run: echo two',
+  ].join('\n'), { path: 'cyc.yml' })
+  assert.throws(() => normalizeModel(cycle, { vars: {} }), (error) => error.code === 'PIPE_CYCLE')
+
+  const missing = internals.parsePipe([
+    'version: 2',
+    'name: miss',
+    'stages:',
+    '  - id: s',
+    '    jobs:',
+    '      - id: a',
+    '        needs: [nope]',
+    '        steps:',
+    '          - run: echo a',
+  ].join('\n'), { path: 'miss.yml' })
+  assert.throws(() => normalizeModel(missing, { vars: {} }), (error) => error.code === 'PIPE_UNKNOWN_JOB')
+})
+
+checkAsync('P1-S5：DAG 调度器并发、失败与 skipped 向下传播、并发池上限、取消', async () => {
+  const { scheduleJobs } = internals.jobs
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  // 并发：两个无依赖 job 各 120ms，串行要 240ms 以上。
+  {
+    const started = Date.now()
+    const results = await scheduleJobs({
+      jobs: [{ id: 'a', needs: [] }, { id: 'b', needs: [] }],
+      concurrency: 4,
+      runJob: async () => { await delay(120); return { status: 'success' } },
+    })
+    const elapsed = Date.now() - started
+    assert.ok(elapsed < 220, `两个无依赖 job 应该并行，实测 ${elapsed}ms`)
+    assert.equal(results.get('a').status, 'success')
+    assert.equal(results.get('b').status, 'success')
+  }
+
+  // 失败传播：a 失败 → b、c 跳过，但 z 没有依赖它，必须照跑。
+  {
+    const skipped = []
+    const results = await scheduleJobs({
+      jobs: [
+        { id: 'a', needs: [] },
+        { id: 'b', needs: ['a'] },
+        { id: 'c', needs: ['b'] },
+        { id: 'z', needs: [] },
+      ],
+      concurrency: 4,
+      onSkip: (job, reason) => skipped.push(`${job.id}:${reason}`),
+      runJob: async (job) => (job.id === 'a' ? { status: 'failed', error: 'boom' } : { status: 'success' }),
+    })
+    assert.equal(results.get('a').status, 'failed')
+    assert.equal(results.get('b').status, 'skipped')
+    assert.equal(results.get('c').status, 'skipped', 'skipped 必须继续向下传播，不能断链')
+    assert.equal(results.get('z').status, 'success', '无关分支不受影响')
+    assert.equal(skipped.length, 2)
+  }
+
+  // 并发池上限：concurrency=2 时同时在跑的 job 不能超过 2。
+  {
+    let running = 0
+    let peak = 0
+    await scheduleJobs({
+      jobs: Array.from({ length: 6 }, (_unused, index) => ({ id: `j${index}`, needs: [] })),
+      concurrency: 2,
+      runJob: async () => {
+        running += 1
+        peak = Math.max(peak, running)
+        await delay(30)
+        running -= 1
+        return { status: 'success' }
+      },
+    })
+    assert.ok(peak <= 2, `并发池上限 2 被突破（峰值 ${peak}）`)
+  }
+
+  // 取消：abort 之后未完成的 job 不能再启动。
+  {
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 40)
+    const results = await scheduleJobs({
+      jobs: [{ id: 'a', needs: [] }, { id: 'b', needs: ['a'] }],
+      concurrency: 1,
+      signal: controller.signal,
+      // runJob 只收 job —— signal 由闭包捕获（runner.js 里的 runJob 就是从 stepContext 闭包拿的，
+      // 再交给 executor 去杀子进程），这里照同样的形态写。
+      runJob: async () => {
+        const start = Date.now()
+        while (Date.now() - start < 200) {
+          if (controller.signal.aborted) return { status: 'canceled', error: '已取消' }
+          await delay(10)
+        }
+        return { status: 'success' }
+      },
+    })
+    assert.equal(results.get('a').status, 'canceled')
+    assert.equal(results.get('b').status, 'canceled')
+  }
+})
+
+// v2 端到端：真实 apply + v2 pipe 文件，走 /run，检查 job 图与 step 归属都落到接口返回值里。
+const v2Root = mkdtempSync(join(tmpdir(), 'cicd-v2-'))
+const v2Dir = join(v2Root, 'app')
+mkdirSync(v2Dir, { recursive: true })
+writeFileSync(join(v2Dir, 'pipe.yml'), [
+  'version: 2',
+  'name: v2-pipe',
+  'targets:',
+  '  dev:',
+  '    hosts: [api2]',
+  '    path: /srv/v2',
+  'stages:',
+  '  - id: check',
+  '    jobs:',
+  '      - id: unit',
+  '        matrix:',
+  '          java: ["17", "21"]',
+  '        steps:',
+  '          - name: test',
+  '            run: echo UNIT_${{ matrix.java }}',
+  '      - id: lint',
+  '        steps:',
+  '          - name: lint',
+  '            run: echo LINT_OK',
+  '  - id: ship',
+  '    jobs:',
+  '      - id: gate',
+  '        needs: [unit, lint]',
+  '        steps:',
+  '          - name: gate',
+  '            run: echo GATE_OK',
+].join('\n'), 'utf8')
+const v2Ctx = fakeContext()
+apply(v2Ctx, {
+  projects: [{ id: 'v2', name: 'V2', path: v2Dir, pipe: join(v2Dir, 'pipe.yml') }],
+  workDir: join(v2Root, 'state'),
+  remoteBase: 'http://127.0.0.1:1',
+  scheduler: { enabled: false },
+})
+ctx.effects.push(...v2Ctx.effects.splice(0))
+
+checkAsync('P1-S6：v2 pipe 端到端 —— matrix 展开成并行 job，step 归属记到 job，图落进 /run 返回值', async () => {
+  const route = v2Ctx.routes.find((item) => item.path === `${internals.ROUTE_PREFIX}/run`)
+  assert.ok(route, '/run 已注册')
+  const response = await route.resource(new Request(`http://x${internals.ROUTE_PREFIX}/run?project=v2&target=dev&confirm=1`, {
+    headers: { 'x-dsh-cicd': '1' },
+  }))
+  assert.equal(response.status, 200, await response.clone().text())
+  const body = await response.json()
+  assert.equal(body.status, 'success')
+
+  // matrix 展开成两个独立 job，名字里带维度值 —— 这是「一个 job 定义跑 N 份」的唯一可见证据。
+  assert.ok(body.jobs, 'v2 的 run 必须返回 job 图')
+  const ids = body.jobs.items.map((item) => item.id)
+  assert.ok(ids.includes('unit[java=17]'), `matrix 实例缺失：${ids.join(',')}`)
+  assert.ok(ids.includes('unit[java=21]'), `matrix 实例缺失：${ids.join(',')}`)
+  assert.ok(ids.includes('lint'))
+  assert.ok(ids.includes('gate'))
+  assert.equal(body.jobs.items.every((item) => item.status === 'success'), true, JSON.stringify(body.jobs.items))
+
+  // gate 显式依赖两个 matrix 实例 + lint（needs 写基名要展开成全部实例）。
+  const gate = body.jobs.items.find((item) => item.id === 'gate')
+  assert.deepEqual(gate.needs.slice().sort(), ['lint', 'unit[java=17]', 'unit[java=21]'])
+
+  // step 必须记到 job 一级：同 stage 多 job 时 idx 都从 0 起，只靠 stage+idx 会串台。
+  const unitSteps = body.stages.flatMap((stage) => stage.steps).filter((step) => step.jobId.startsWith('unit['))
+  assert.equal(unitSteps.length, 2)
+  assert.equal(unitSteps.every((step) => step.status === 'success'), true)
+  assert.equal(body.jobs.order.filter((id) => id.startsWith('unit[')).length, 2, 'order 里也要有两个实例')
+})
+
+check('P1-S7：v1 的 run 不返回 job 图（不能让老面板突然多出一块空视图）', async () => {
+  const route = ctx.routes.find((item) => item.path === `${internals.ROUTE_PREFIX}/plan`)
+  assert.ok(route, '/plan 已注册')
+  const response = await route.resource(new Request(`http://x${internals.ROUTE_PREFIX}/plan?project=demo&target=prod`, {
+    headers: { 'x-dsh-cicd': '1' },
+  }))
+  assert.equal(response.status, 200)
+  const body = await response.json()
+  assert.equal(body.ok, true)
+})
+
+
+checkAsync('P1-S8：配置快照 —— 跑完把 pipe.yml 原文与 sha256 落库，改文件后旧运行仍能解释自己', async () => {
+  const v1Dir = join(v2Root, 'snap')
+  mkdirSync(v1Dir, { recursive: true })
+  const pipePath = join(v1Dir, 'pipe.yml')
+  const source = ['version: 1', 'name: snap-pipe', 'targets:', '  dev:', '    hosts: [api2]', '    path: /srv/snap', 'stages:', '  - id: build', '    steps:', '      - name: b', '        run: echo SNAP_V1'].join('\n')
+  writeFileSync(pipePath, source, 'utf8')
+
+  const snapCtx = fakeContext()
+  apply(snapCtx, {
+    projects: [{ id: 'snap', name: 'Snap', path: v1Dir, pipe: pipePath }],
+    workDir: join(v2Root, 'state-snap'),
+    remoteBase: 'http://127.0.0.1:1',
+    scheduler: { enabled: false },
+  })
+  ctx.effects.push(...snapCtx.effects.splice(0))
+
+  const route = snapCtx.routes.find((item) => item.path === `${internals.ROUTE_PREFIX}/run`)
+  const runResponse = await route.resource(new Request(`http://x${internals.ROUTE_PREFIX}/run?project=snap&target=dev&confirm=1`, {
+    headers: { 'x-dsh-cicd': '1' },
+  }))
+  assert.equal(runResponse.status, 200, await runResponse.clone().text())
+  const runBody = await runResponse.json()
+  const runId = runBody.runId
+  assert.ok(runId)
+
+  // 改文件：模拟「跑完之后有人动了 pipe.yml」。旧运行不能跟着变。
+  writeFileSync(pipePath, source.replace('SNAP_V1', 'SNAP_V2'), 'utf8')
+
+  const db = openDatabase(join(v2Root, 'state-snap', 'cicd.db'))
+  try {
+    const row = db.prepare('SELECT config_snapshot, config_hash FROM runs WHERE id = ?').get(runId)
+    assert.ok(row, '运行记录必须存在')
+    assert.match(row.config_snapshot, /SNAP_V1/, '快照必须是当时那份配置，不能是改后的')
+    assert.equal(row.config_snapshot, source, '快照要存原始 YAML 全文')
+    assert.match(row.config_hash, /^[0-9a-f]{64}$/, 'hash 是 sha256')
+  } finally { db.close() }
+})
+
+checkAsync('P1-S9：日志按 job 分片 —— 并行 job 各有一份日志，主日志仍是合并时间线', async () => {
+  const route = v2Ctx.routes.find((item) => item.path === `${internals.ROUTE_PREFIX}/run`)
+  const response = await route.resource(new Request(`http://x${internals.ROUTE_PREFIX}/run?project=v2&target=dev&confirm=1`, {
+    headers: { 'x-dsh-cicd': '1' },
+  }))
+  assert.equal(response.status, 200, await response.clone().text())
+  const runId = (await response.json()).runId
+
+  const logRoute = v2Ctx.routes.find((item) => item.path === `${internals.ROUTE_PREFIX}/log`)
+  const whole = await (await logRoute.resource(new Request(`http://x${internals.ROUTE_PREFIX}/log?runId=${runId}`, {
+    headers: { 'x-dsh-cicd': '1' },
+  }))).json()
+  assert.equal(whole.ok, true)
+  assert.ok(whole.jobs.length >= 3, `应当有多个 job 的分片日志，实际 ${whole.jobs.map((j) => j.jobId).join(',')}`)
+  assert.match(whole.text, /LINT_OK/, '主日志仍要包含所有 job 的输出')
+
+  // 单个 matrix 实例：分片日志里只能有它自己的输出，不能沾另一个实例的。
+  const one = await (await logRoute.resource(new Request(
+    `http://x${internals.ROUTE_PREFIX}/log?runId=${runId}&jobId=${encodeURIComponent('unit[java=17]')}`,
+    { headers: { 'x-dsh-cicd': '1' } },
+  ))).json()
+  assert.equal(one.ok, true)
+  assert.match(one.text, /UNIT_17/)
+  assert.doesNotMatch(one.text, /UNIT_21/, '分片日志不能串台到另一个 matrix 实例')
+  assert.match(one.text, /echo UNIT_17/, '分片日志要能自己解释跑的是什么命令')
+  assert.match(one.logPath, /unit_java_17_\.log$/, `matrix 实例名里的方括号要做成合法文件名，实际 ${one.logPath}`)
+
+  // 不存在的 jobId 要明确报错，而不是默默返回空串让人以为「这个 job 没输出」。
+  const missing = await logRoute.resource(new Request(`http://x${internals.ROUTE_PREFIX}/log?runId=${runId}&jobId=nope`, {
+    headers: { 'x-dsh-cicd': '1' },
+  }))
+  assert.equal(missing.status, 404)
+  assert.equal((await missing.json()).code, 'RUN_NOT_FOUND')
+})
+
+
+
+// ---------------------------------------------------------------------------------------------
+// P2：工具链（05-toolchain.md §9 六条验收）
+//
+// 全部用 file:// 的本地包做夹具，不访问外网：验收要证明的是「声明 → 安装 → 注入 → 断言」
+// 这条链，不是「官方下载站今天通不通」。真实下载由 providers 的单元测试覆盖（另见 P2-S5）。
+
+const TC_NL = String.fromCharCode(10)
+const tcRoot = join(root, 'toolchain-fixture')
+mkdirSync(tcRoot, { recursive: true })
+const tcPlatform = currentPlatform()
+
+/** 造一个「官方安装包」：解出来是 <top>/bin/<bin>，脚本里写着版本号。 */
+function makeToolchainArchive({ lang, version, bins }) {
+  const stage = join(tcRoot, `stage-${lang}-${String(version).replace(/[^A-Za-z0-9._-]+/g, '_')}`)
+  const top = lang === 'java' ? `jdk-${version}` : `${lang}-${version}`
+  const tcDirRoot = join(stage, top)
+  mkdirSync(join(tcDirRoot, 'bin'), { recursive: true })
+  for (const [name, body] of Object.entries(bins)) {
+    const file = join(tcDirRoot, 'bin', name)
+    writeFileSync(file, body, 'utf8')
+    try { chmodSync(file, 0o755) } catch { /* Windows 上 chmod 只有只读位 */ }
+  }
+  const archive = join(tcRoot, `${top}.tgz`)
+  execFileSync('tar', ['-czf', archive, '-C', stage, top], { stdio: 'ignore' })
+  return { archive, sha256: sha256File(archive), stage, top }
+}
+
+/** JDK 的 bin 目录里放两个形态：POSIX 的 sh 脚本，Windows 的 .cmd（真机执行时按平台挑）。 */
+function javaBins(banner) {
+  return {
+    java: `#!/bin/sh${TC_NL}echo "${banner}" 1>&2${TC_NL}`,
+    'java.cmd': `@echo off${TC_NL}echo ${banner} 1>&2${TC_NL}`,
+  }
+}
+
+function javaBinFile(dir) {
+  return join(binDirOf('java', dir), process.platform === 'win32' ? 'java.cmd' : 'java')
+}
+
+/** 锁里的一条本地条目：url 指向 file://，checksum 用真实文件的 sha256。 */
+function localLockEntry(lang, spec, resolved, archive, sha256, platform = tcPlatform) {
+  const lock = emptyLock()
+  upsertLockEntry(lock, {
+    lang,
+    spec,
+    resolved,
+    platforms: { [platform]: { url: pathToFileURL(archive).href, sha256: `sha256:${sha256}` } },
+  })
+  return lock
+}
+
+const java17Pkg = makeToolchainArchive({ lang: 'java', version: '17.0.11+9', bins: javaBins('openjdk version "17.0.11" 2024-04-16') })
+const java21Pkg = makeToolchainArchive({ lang: 'java', version: '21.0.2+13', bins: javaBins('openjdk version "21.0.2" 2024-01-16') })
+
+checkAsync('P2-S1：宿主只有 JDK21、项目声明 17 → 注入的是 17，且宿主环境一个字节都没被改', async () => {
+  const store = join(tcRoot, 'store-s1')
+  const lockFile = join(tcRoot, 's1.lock')
+  writeLock(lockFile, localLockEntry('java', 'temurin-17', '17.0.11+9', java17Pkg.archive, java17Pkg.sha256))
+
+  // 离线也有戏：file:// 的包是内网镜像/预置包，不该被 offline 拦掉（那是唯一能用离线的地方）。
+  const tc = createToolchain({ storeDir: store, lockFile, platforms: tcPlatform, offline: true })
+  const resolved = await tc.resolve({ java: 'temurin-17' })
+  assert.equal(resolved[0].fromLock, true, '锁里已经有 17.0.11+9，应该直接命中')
+  assert.equal(resolved[0].resolved, '17.0.11+9')
+
+  const installed = await tc.ensure({ java: 'temurin-17' })
+  assert.equal(installed.length, 1)
+  assert.equal(installed[0].cached, false)
+  assert.ok(existsSync(join(installed[0].dir, '.ok')), '装完要留 .ok 标记，否则下次会重装')
+  assert.equal(installed[0].version, '17.0.11+9')
+
+  // 宿主：只有 JDK21，PATH 与 JAVA_HOME 都指向它
+  const hostJdk21 = join(tcRoot, 'host-jdk21')
+  mkdirSync(join(hostJdk21, 'bin'), { recursive: true })
+  const hostEnv = {
+    ...process.env,
+    JAVA_HOME: hostJdk21,
+    PATH: `${join(hostJdk21, 'bin')}${process.platform === 'win32' ? ';' : ':'}${process.env.PATH || ''}`,
+  }
+  const before = process.env.JAVA_HOME
+
+  const runEnv = envFor(installed, { base: hostEnv, platform: process.platform })
+  assert.equal(runEnv.JAVA_HOME, installed[0].root, 'JAVA_HOME 必须改成声明的那份 JDK，否则写死 JAVA_HOME 的脚本会绕过 PATH')
+  assert.ok(runEnv.PATH.startsWith(binDirOf('java', installed[0].root)), `PATH 首位要是声明的 JDK：${runEnv.PATH}`)
+  assert.equal(process.env.JAVA_HOME, before, '子进程的 env 是副本，父进程不能被改（§9.1 后半句）')
+
+  // 注入的 env 真的传到了子进程
+  const echo = runSync(process.execPath, ['-e', 'console.log(process.env.JAVA_HOME + "|" + process.env.DSH_CICD_TOOLCHAIN)'], { env: runEnv })
+  assert.equal(echo.status, 0, echo.stderr)
+  assert.ok(echo.stdout.includes(installed[0].root), `子进程应看到注入的 JAVA_HOME：${echo.stdout}`)
+  assert.ok(echo.stdout.includes('java=17.0.11+9'), `子进程应看到工具链指纹：${echo.stdout}`)
+
+  // 真跑一次那份 java：POSIX 上断言输出 17.0.11（Windows 的 .cmd 需要 cmd 壳，交给 assertVersions 的自定义 run 覆盖）
+  if (process.platform !== 'win32') {
+    const out = runSync(javaBinFile(installed[0].root), ['-version'], { env: runEnv })
+    assert.equal(out.status, 0, out.stderr)
+    assert.ok(matchesVersion(`${out.stdout}${out.stderr}`, '17.0.11'), `跑出来的应是 17.0.11：${out.stdout}${out.stderr}`)
+  }
+
+  // 版本断言：对上就静默，对不上要报清楚
+  const okProblems = assertVersions(installed, { run: () => ({ status: 0, stdout: 'openjdk version "17.0.11" 2024-04-16', stderr: '' }) })
+  assert.deepEqual(okProblems, [])
+  const badProblems = assertVersions(installed, { run: () => ({ status: 0, stdout: 'openjdk version "21.0.2" 2024-01-16', stderr: '' }) })
+  assert.equal(badProblems.length, 1)
+  assert.match(badProblems[0].message, /版本不符/)
+})
+
+checkAsync('P2-S2：同一台 runner 上两个 job 各自要 17 与 21 → 并发跑，互不污染', async () => {
+  const storeDir = join(tcRoot, 'store-s2')
+  const lockFile = join(tcRoot, 's2.lock')
+  const lock = localLockEntry('java', 'temurin-17', '17.0.11+9', java17Pkg.archive, java17Pkg.sha256)
+  upsertLockEntry(lock, {
+    lang: 'java',
+    spec: 'temurin-21',
+    resolved: '21.0.2+13',
+    platforms: { [tcPlatform]: { url: pathToFileURL(java21Pkg.archive).href, sha256: `sha256:${java21Pkg.sha256}` } },
+  })
+  writeLock(lockFile, lock)
+  const tc = createToolchain({ storeDir, lockFile, platforms: tcPlatform, offline: true })
+  const [j17, j21] = await Promise.all([tc.ensure({ java: 'temurin-17' }), tc.ensure({ java: 'temurin-21' })])
+  assert.equal(j17[0].root === j21[0].root, false, '两个版本必须是两份目录')
+
+  const store = createStore({ dir: join(tcRoot, 'state-s2') })
+  // Windows 上 sqlite 文件在 store 关掉之前删不掉；这个 store 是临时造的，用完必须自己收尾。
+  try {
+  const mkPipe = (name) => parsePipe([
+    'version: 1',
+    `name: ${name}`,
+    'targets:',
+    '  dev:',
+    '    hosts:',
+    '      - h1',
+    'stages:',
+    '  - id: build',
+    '    steps:',
+    '      - name: show',
+    '        run: node -e "console.log(\'TC=\' + process.env.DSH_CICD_TOOLCHAIN + \' JH=\' + process.env.JAVA_HOME)"',
+  ].join(TC_NL))
+
+  const runWith = (pipe, installed, id) => runPipeline({
+    pipe,
+    project: { id, path: join(tcRoot, `proj-${id}`) },
+    target: 'dev',
+    store,
+    toolchainSetup: async () => ({ envFor: (extra) => envFor(installed, { base: process.env, extraEnv: extra }) }),
+  })
+
+  mkdirSync(join(tcRoot, 'proj-a'), { recursive: true })
+  mkdirSync(join(tcRoot, 'proj-b'), { recursive: true })
+  const [a, b] = await Promise.all([runWith(mkPipe('a'), j17, 'a'), runWith(mkPipe('b'), j21, 'b')])
+  assert.equal(a.status, 'success', a.error)
+  assert.equal(b.status, 'success', b.error)
+
+  const logOf = (runId) => readFileSync(join(tcRoot, 'state-s2', 'logs', `${runId}.log`), 'utf8')
+  const logA = logOf(a.runId)
+  const logB = logOf(b.runId)
+  assert.ok(logA.includes('java=17.0.11+9'), `A 应该用 17：${logA}`)
+  assert.ok(!logA.includes('21.0.2'), `A 的日志里不该出现 21：${logA}`)
+  assert.ok(logB.includes('java=21.0.2+13'), `B 应该用 21：${logB}`)
+  assert.ok(!logB.includes('17.0.11'), `B 的日志里不该出现 17：${logB}`)
+  } finally {
+    store.close()
+  }
+})
+
+checkAsync('P2-S3：离线 + 锁命中 → 继续；离线 + 缺锁 + frozen → 立刻失败且说清缺哪条', async () => {
+  // 缺锁 + frozen：必须在联网之前就失败（否则「frozen」只是个装饰）
+  let fetched = 0
+  const providers = {
+    java: {
+      list: async () => {
+        fetched += 1
+        return { versions: ['17.0.11+9'], platforms: { [tcPlatform]: { url: 'https://example.invalid/jdk.tgz', sha256: `sha256:${'0'.repeat(64)}` } } }
+      },
+    },
+  }
+  const frozen = createToolchain({
+    storeDir: join(tcRoot, 'store-s3'),
+    lockFile: join(tcRoot, 's3-missing.lock'),
+    platforms: tcPlatform,
+    offline: true,
+    frozen: true,
+    providers,
+  })
+  await assert.rejects(
+    () => frozen.resolve({ java: 'temurin-17' }),
+    (error) => error.code === TOOLCHAIN_ERRORS.LOCK_MISSING && /锁文件缺少 java@temurin-17/.test(error.message) && /frozen/.test(error.message),
+  )
+  assert.equal(fetched, 0, 'frozen 下不该去问索引')
+
+  // 离线但没 frozen：允许读到锁，只是不许下载；没锁则报 OFFLINE 而不是去 fetch
+  const offlineNoLock = createToolchain({
+    storeDir: join(tcRoot, 'store-s3b'),
+    lockFile: join(tcRoot, 's3b.lock'),
+    platforms: tcPlatform,
+    offline: true,
+    providers,
+  })
+  const resolved = await offlineNoLock.resolve({ java: 'temurin-17' })
+  assert.equal(resolved[0].fromLock, false)
+  assert.equal(fetched, 1, '没有 frozen 时才允许读索引（但仍不下包）')
+  await assert.rejects(
+    () => offlineNoLock.ensure({ java: 'temurin-17' }),
+    (error) => error.code === TOOLCHAIN_ERRORS.OFFLINE,
+  )
+})
+
+checkAsync('P2-S4：包被改 1 个字节 → 校验失败、不写入 store、坏包删除', async () => {
+  const tampered = join(tcRoot, 'tampered.tgz')
+  writeFileSync(tampered, readFileSync(java17Pkg.archive))
+  const buffer = readFileSync(tampered)
+  buffer[buffer.length - 1] = buffer[buffer.length - 1] ^ 0xff
+  writeFileSync(tampered, buffer)
+
+  const store = join(tcRoot, 'store-s4')
+  const lockFile = join(tcRoot, 's4.lock')
+  writeLock(lockFile, localLockEntry('java', 'temurin-17', '17.0.11+9', tampered, java17Pkg.sha256))
+  const tc = createToolchain({ storeDir: store, lockFile, platforms: tcPlatform, offline: true })
+  await assert.rejects(
+    () => tc.ensure({ java: 'temurin-17' }),
+    (error) => error.code === TOOLCHAIN_ERRORS.CHECKSUM && /校验失败（sha256）/.test(error.message),
+  )
+  assert.equal(existsSync(join(store, 'java', '17.0.11+9', tcPlatform)), false, '校验失败不能留下半装目录')
+  assert.deepEqual(tc.list(), [], 'store 里不该有任何已装条目')
+  const leftover = readdirSync(join(store, '.downloads')).filter((name) => name.endsWith('.part') || name.includes('tampered'))
+  assert.deepEqual(leftover, [], `坏包要删干净，否则下次直接命中缓存：${leftover.join(',')}`)
+})
+
+checkAsync('P2-S5：同一份 pipe.yml 在 Windows 与 Linux 都能构建 → 锁里两个平台条目', async () => {
+  const providers = {
+    java: {
+      list: async () => ({
+        versions: ['17.0.11+9'],
+        platforms: {
+          'linux-x64': { url: 'https://example.invalid/linux/jdk.tgz', sha256: `sha256:${'a'.repeat(64)}` },
+          'win32-x64': { url: 'https://example.invalid/win/jdk.zip', sha256: `sha256:${'b'.repeat(64)}` },
+        },
+      }),
+    },
+  }
+  const lockFile = join(tcRoot, 's5.lock')
+  const linux = createToolchain({ storeDir: join(tcRoot, 'store-s5'), lockFile, platforms: 'linux-x64', providers })
+  await linux.resolve({ java: 'temurin-17' }, { writeLock: true })
+
+  const written = readLock(lockFile)
+  assert.equal(written.toolchain.length, 1)
+  assert.deepEqual(Object.keys(written.toolchain[0].platforms).sort(), ['linux-x64', 'win32-x64'], '一平台解析要把两个平台的地址都记下来')
+
+  // 换到 Windows 侧读同一份锁：必须命中，且拿到的是 win 的包（不是 linux 的）
+  const win = createToolchain({ storeDir: join(tcRoot, 'store-s5'), lockFile, platforms: 'win32-x64', offline: true, frozen: true })
+  const onWin = await win.resolve({ java: 'temurin-17' })
+  assert.equal(onWin[0].fromLock, true)
+  assert.match(onWin[0].platforms['win32-x64'].url, /win\/jdk\.zip$/)
+})
+
+checkAsync('P2-S6：二次构建命中缓存 → 不重新下载、不重新解包', async () => {
+  const store = join(tcRoot, 'store-s6')
+  const lockFile = join(tcRoot, 's6.lock')
+  writeLock(lockFile, localLockEntry('java', 'temurin-17', '17.0.11+9', java17Pkg.archive, java17Pkg.sha256))
+  const tc = createToolchain({ storeDir: store, lockFile, platforms: tcPlatform, offline: true })
+  const first = await tc.ensure({ java: 'temurin-17' })
+  assert.equal(first[0].cached, false)
+
+  // 把下载缓存整个删掉：如果第二次还想下载，离线模式会立刻炸——从而证明它没下载
+  rmSync(join(store, '.downloads'), { recursive: true, force: true })
+  mkdirSync(join(store, '.downloads'), { recursive: true })
+  const second = await tc.ensure({ java: 'temurin-17' })
+  assert.equal(second[0].cached, true, '第二次必须命中 .ok 标记')
+  assert.equal(second[0].root, first[0].root)
+
+  // list() 要能报出这份已装工具链（面板与 cicd_toolchain list 都靠它）
+  const listed = tc.list()
+  assert.equal(listed.length, 1)
+  assert.equal(listed[0].lang, 'java')
+  assert.equal(listed[0].version, '17.0.11+9')
+  assert.ok(listed[0].bytes > 0)
+})
+
+checkAsync('P2-S7：pipe.yml 声明了工具链但锁缺失 + frozen → /run 直接失败并留下可解释的 run 记录', async () => {
+  const tcRunRoot = mkdtempSync(join(tmpdir(), 'cicd-tc-'))
+  const tcProject = join(tcRunRoot, 'app')
+  mkdirSync(tcProject, { recursive: true })
+  writeFileSync(join(tcProject, 'pipe.yml'), [
+    'version: 1',
+    'name: tc',
+    'toolchain:',
+    '  java: temurin-17',
+    'targets:',
+    '  dev:',
+    '    hosts:',
+    '      - h1',
+    'stages:',
+    '  - id: build',
+    '    steps:',
+    '      - name: build',
+    '        run: echo SHOULD_NOT_RUN',
+  ].join(TC_NL))
+
+  const tcCtx = fakeContext()
+  apply(tcCtx, {
+    projects: [{ id: 'tc', name: 'TC', path: tcProject }],
+    workDir: join(tcRunRoot, 'state'),
+    remoteBase: 'http://127.0.0.1:1',
+    scheduler: { enabled: false },
+    toolchain: { offline: true, frozen: true },
+  })
+  const tcEffects = tcCtx.effects.splice(0)
+  ctx.effects.push(...tcEffects)
+  try {
+    const route = tcCtx.routes.find((item) => item.path === `${internals.ROUTE_PREFIX}/run`)
+    const response = await route.resource(new Request(`${'http://x'}${internals.ROUTE_PREFIX}/run?project=tc&target=dev&confirm=1`, {
+      headers: { 'x-dsh-cicd': '1' },
+    }))
+    const body = await response.json()
+    // 200 + status:failed，而不是一个 HTTP 错误码：请求本身是被接受并执行了的，
+    // 失败的是这次运行。跟「某一步构建失败」同一档，调用方看 status 与 code 就知道发生了什么；
+    // 换成 409 反而会把已经落库的 runId 丢掉，用户连日志都找不到。
+    assert.equal(response.status, 200, JSON.stringify(body))
+    assert.equal(body.status, 'failed', JSON.stringify(body))
+    assert.equal(body.code, 'TOOLCHAIN_LOCK_MISSING', JSON.stringify(body))
+    assert.match(body.error, /锁文件缺少 java@temurin-17/, `要指名缺哪一条：${body.error}`)
+
+    // 安装失败也必须落一条 failed 的 run：否则用户只看到一条 409、日志是空的，无从下手
+    const db = openDatabase(join(tcRunRoot, 'state', 'cicd.db'))
+    const row = db.prepare('SELECT status, error FROM runs ORDER BY started_at DESC LIMIT 1').get()
+    db.close()
+    assert.equal(row.status, 'failed')
+    assert.match(String(row.error), /锁文件缺少 java@temurin-17/)
+
+    const logs = readdirSync(join(tcRunRoot, 'state', 'logs')).filter((name) => name.endsWith('.log'))
+    assert.equal(logs.length, 1, '失败也要有日志文件')
+    const text = readFileSync(join(tcRunRoot, 'state', 'logs', logs[0]), 'utf8')
+    assert.match(text, /准备工具链：java=temurin-17/)
+    assert.doesNotMatch(text, /SHOULD_NOT_RUN/, '工具链没准备好就不该跑任何一步')
+  } finally {
+    // 用本地副本：这些 disposer 已经交给主 ctx 了，splice 之后 tcCtx.effects 是空的，
+    // 循环它会一条都不执行，然后 rmSync 撞上还开着的 sqlite 文件（Windows EBUSY）。
+    for (const effect of tcEffects) { try { effect() } catch { /* ignore */ } }
+    rmSync(tcRunRoot, { recursive: true, force: true })
+  }
+})
+
+check('P2-S1b：Maven / Gradle 双锁文件与声明推断', () => {
+  const dir = join(tcRoot, 'dual-lock')
+  mkdirSync(dir, { recursive: true })
+  const written = writeDualLocks({ runDir: dir, java: { root: '/s/jdk17', version: '17.0.11+9' }, vendor: 'temurin' })
+  const xml = readFileSync(written.toolchainsXml, 'utf8')
+  assert.match(xml, /<toolchain>/)
+  // 写 17.0.11 而不是 17：Maven toolchains 的 <version> 允许补丁位，截到 feature 位
+  // 反而会丢掉「这台机器上到底装了哪个补丁版本」这个唯一有用的信息。
+  assert.match(xml, /<version>17\.0\.11<\/version>/)
+  assert.match(xml, /\/s\/jdk17/)
+  const props = readFileSync(written.gradleProperties, 'utf8')
+  assert.match(props, /auto-detect=false/, '不能让 Gradle 自己去找 JDK，否则又回到「机器上装了什么就用什么」')
+  assert.match(props, /\/s\/jdk17/)
+
+  // 声明文件推断：pipe.yml 没写时才用，所以只测「读得对」
+  const declared = join(tcRoot, 'declared')
+  mkdirSync(declared, { recursive: true })
+  writeFileSync(join(declared, '.nvmrc'), `20.11.1${TC_NL}`)
+  writeFileSync(join(declared, '.python-version'), `3.11.9${TC_NL}`)
+  const inferred = inferFromFiles(declared)
+  assert.equal(inferred.node, '20.11.1')
+  assert.equal(inferred.python, '3.11.9')
+
+  // spec 解析与挑选：`17` 要拿到 17 系列最大，`17.0.11` 要能匹配 `17.0.11+9`
+  assert.deepEqual(parseSpec('java', 'temurin-17'), { vendor: 'temurin', exact: '', spec: '17', raw: 'temurin-17' })
+  assert.equal(pickVersion(['17.0.9+9', '17.0.11+9', '21.0.2+13'], '17'), '17.0.11+9')
+  assert.equal(pickVersion(['17.0.9+9', '17.0.11+9'], '17.0.11'), '17.0.11+9')
+  assert.equal(parseChecksum(`sha512:${'c'.repeat(128)}`).algo, 'sha512')
+  assert.equal(parseChecksum('d'.repeat(64)).algo, 'sha256')
+  assert.equal(parseChecksum('nothex'), null)
+})
+
+checkAsync('P2-S8：uses 动作 —— 未知动作与未知参数硬失败，缺能力不假装成功，verify 会重试', async () => {
+  const { runAction, ACTION_ERRORS, ACTION_NAMES } = internals.actions
+  assert.deepEqual(ACTION_NAMES, ['checkout', 'toolchain', 'cache', 'collect', 'deploy', 'verify', 'notify'])
+
+  // 未知动作必须硬失败。静默跳过会让流水线看起来绿了、实际什么都没做，
+  // 而「什么都没做」正是最难被发现的一类故障。
+  await assert.rejects(
+    () => runAction({ name: 'shell', with: {}, ctx: {} }),
+    (error) => error.code === 'ACTION_NOT_FOUND' && /不支持的动作/.test(error.message),
+  )
+
+  // `with` 里拼错的键同样必须失败：`path:` 写成 `paths:` 却照跑，
+  // 用户会一直以为缓存在工作，直到某天发现每次都全量构建。
+  await assert.rejects(
+    () => runAction({ name: 'cache', with: { key: 'k', paths: ['dist/**'], mode: 'both' }, ctx: {} }),
+    (error) => error.code === 'ACTION_UNAVAILABLE' && /缓存能力/.test(error.message),
+  )
+  const stubbed = { cache: { restore: async () => ({ hit: false }), save: async () => ({ ok: true }) }, log: () => {} }
+  await assert.rejects(
+    () => runAction({ name: 'cache', with: { key: 'k', path: ['dist/**'] }, ctx: stubbed }),
+    (error) => error.code === 'ACTION_INPUT_INVALID' && /不认识参数 “path”/.test(error.message),
+  )
+
+  // verify：前两次失败、第三次成功 —— 部署后的探针本来就要容忍启动窗口
+  let calls = 0
+  const outputs = []
+  const verifyResult = await runAction({
+    name: 'verify',
+    with: { url: 'http://127.0.0.1:1/health', contains: 'OK', retries: 3, interval: 1, timeout: 2000 },
+    ctx: {
+      log: (line) => outputs.push(line),
+      fetch: async () => {
+        calls += 1
+        if (calls < 3) throw new Error('ECONNREFUSED')
+        return new Response('{"status":"OK"}', { status: 200 })
+      },
+    },
+  })
+  assert.equal(calls, 3, '应该一直重试到成功')
+  assert.equal(verifyResult.outputs.attempts, 3)
+  assert.match(outputs.join('\n'), /第 3 次尝试/)
+
+  // verify 不给执行脚本的能力：只认 http(s) 与 GET/HEAD
+  await assert.rejects(
+    () => runAction({ name: 'verify', with: { url: 'file:///etc/passwd' }, ctx: { log: () => {}, fetch: async () => new Response('') } }),
+    (error) => error.code === 'ACTION_INPUT_INVALID' && /只接受 http/.test(error.message),
+  )
+
+  // checkout：HEAD 与声明不一致时必须失败并说清「不会替你切分支」。
+  // 悄悄 checkout 会改掉用户自己的工作副本，他下次 git status 会看到一堆莫名其妙的改动。
+  const gitCalls = []
+  const fakeGit = (sha) => async (args) => {
+    gitCalls.push(args.join(' '))
+    if (args[0] === 'rev-parse' && args[1] === '--verify') return { ok: true, stdout: `${sha}\n` }
+    if (args[0] === 'rev-parse') return { ok: true, stdout: '1111111111111111\n' }
+    return { ok: true, stdout: '' }
+  }
+  await assert.rejects(
+    () => runAction({ name: 'checkout', with: { ref: 'v2.0.0' }, ctx: { git: fakeGit('2222222222222222'), log: () => {}, project: {} } }),
+    (error) => error.code === 'ACTION_FAILED' && /不会替你切分支/.test(error.message),
+  )
+  assert.deepEqual(gitCalls, ['rev-parse HEAD', 'rev-parse --verify v2.0.0^{commit}'], '不一致时不该有任何写操作')
+  const sameHead = await runAction({
+    name: 'checkout',
+    with: { ref: 'v2.0.0', fetch_depth: 1, submodules: true },
+    ctx: { git: fakeGit('1111111111111111'), log: () => [], project: {} },
+  })
+  assert.equal(sameHead.outputs.ref, '1111111111111111')
+  assert.equal(sameHead.outputs.fetched, true)
+})
+
+checkAsync('P2-S9：缓存是「恢复-保存」两段式 —— 收尾钩子保存、前缀命中、绝对路径被拒', async () => {
+  const { createCacheStore, CACHE_ERRORS } = internals.cache
+  const cacheRoot = join(tcRoot, 'cache-roundtrip')
+  const projectPath = join(cacheRoot, 'proj')
+  mkdirSync(join(projectPath, 'dist', 'nested'), { recursive: true })
+  writeFileSync(join(projectPath, 'dist', 'a.txt'), 'AAA')
+  writeFileSync(join(projectPath, 'dist', 'nested', 'b.txt'), 'BBB')
+
+  const store = createCacheStore({ dir: join(cacheRoot, 'entries') })
+
+  // 绝对路径必须拒绝：否则 paths: ["/etc"] 能把宿主整个打包进缓存，
+  // 下一次构建再原样恢复到任何项目目录里。
+  for (const bad of ['/etc/passwd', 'C:\\Windows', 'dist/../../escape']) {
+    // save 是 async，抛错会变成 rejection —— 用 assert.throws 会静默通过（它只看同步抛出）
+    await assert.rejects(() => store.save({ projectId: 'p', projectPath, key: 'k', paths: [bad] }),
+      (error) => error.code === CACHE_ERRORS.PATH_INVALID, `应当拒绝 ${bad}`)
+  }
+
+  const none = await store.save({ projectId: 'p', projectPath, key: 'empty', paths: ['nothing/**'] })
+  assert.equal(none.ok, false)
+  assert.match(none.error, /没有匹配到任何文件/)
+
+  const saved = await store.save({ projectId: 'p', projectPath, key: 'Linux-node20-abc', paths: ['dist/**'] })
+  assert.equal(saved.ok, true, JSON.stringify(saved))
+  assert.equal(saved.files, 2)
+
+  // 抹掉工作副本再恢复，证明内容真的进了缓存，而不是「文件本来就在」
+  rmSync(join(projectPath, 'dist'), { recursive: true, force: true })
+  const exact = await store.restore({ projectId: 'p', projectPath, key: 'Linux-node20-abc', paths: ['dist/**'] })
+  assert.equal(exact.hit, true)
+  assert.equal(exact.exact, true)
+  assert.equal(readFileSync(join(projectPath, 'dist', 'nested', 'b.txt'), 'utf8'), 'BBB')
+
+  // 前缀命中：依赖没变但某个输入变了，旧的缓存远好过没有
+  rmSync(join(projectPath, 'dist'), { recursive: true, force: true })
+  const prefixed = await store.restore({ projectId: 'p', projectPath, key: 'Linux-node20-xyz', paths: ['dist/**'], restoreKeys: ['Linux-node20-'] })
+  assert.equal(prefixed.hit, true)
+  assert.equal(prefixed.exact, false)
+  assert.equal(prefixed.key, 'Linux-node20-abc')
+
+  // 项目之间互相隔离：同一个 key 在另一个项目里不能命中
+  const other = await store.restore({ projectId: 'other', projectPath, key: 'Linux-node20-abc', paths: ['dist/**'] })
+  assert.equal(other.hit, false, '缓存不该跨项目串味')
+})
+
+checkAsync('P2-S10：v1 pipe 里直接写 uses: —— cache 第一次未命中并保存，第二次命中；collect 收制品', async () => {
+  const actsRoot = mkdtempSync(join(tmpdir(), 'cicd-acts-'))
+  const actsProject = join(actsRoot, 'app')
+  mkdirSync(actsProject, { recursive: true })
+  writeFileSync(join(actsProject, 'pipe.yml'), [
+    'version: 1',
+    'name: acts',
+    'targets:',
+    '  dev:',
+    '    hosts:',
+    '      - h1',
+    'stages:',
+    '  - id: build',
+    '    steps:',
+    '      - uses: cache',
+    '        with:',
+    '          key: acts-cache-v1',
+    '          paths:',
+    '            - dist/**',
+    '          mode: both',
+    '      - name: make',
+    '        run: node -e "const f=require(\'fs\');f.mkdirSync(\'dist\',{recursive:true});f.writeFileSync(\'dist/out.txt\',\'hello\')"',
+    '      - uses: collect',
+    '        with:',
+    '          paths:',
+    '            - dist/**',
+    '          name: app',
+  ].join(TC_NL))
+
+  const actsCtx = fakeContext()
+  apply(actsCtx, {
+    projects: [{ id: 'acts', name: 'Acts', path: actsProject }],
+    workDir: join(actsRoot, 'state'),
+    remoteBase: 'http://127.0.0.1:1',
+    scheduler: { enabled: false },
+  })
+  const actsEffects = actsCtx.effects.splice(0)
+  ctx.effects.push(...actsEffects)
+  const runOnce = async () => {
+    const route = actsCtx.routes.find((item) => item.path === `${internals.ROUTE_PREFIX}/run`)
+    const response = await route.resource(new Request(`http://x${internals.ROUTE_PREFIX}/run?project=acts&target=dev&confirm=1`, {
+      headers: { 'x-dsh-cicd': '1' },
+    }))
+    const body = await response.json()
+    assert.equal(response.status, 200, JSON.stringify(body))
+    assert.equal(body.status, 'success', JSON.stringify(body))
+    const kinds = body.stages[0].steps.map((step) => step.kind)
+    assert.deepEqual(kinds, ['uses', 'run', 'uses'], 'v1 的 uses 步骤要被执行，而不是当成命令')
+    return body
+  }
+  try {
+    const first = await runOnce()
+    assert.equal(first.stages[0].steps[0].status, 'success')
+    // 收尾钩子（等同 GitHub 的 post 步骤）在 job 结束时才保存：
+    // 执行到 cache 那一步时还没 build，dist/ 是空的。
+    const firstLog = readFileSync(join(actsRoot, 'state', 'logs', `${first.runId}.log`), 'utf8')
+    assert.match(firstLog, /cache：未命中 acts-cache-v1/)
+    assert.match(firstLog, /cache：已保存 acts-cache-v1/)
+    assert.match(firstLog, /collect：app 收到 1 个文件/)
+
+    const second = await runOnce()
+    const secondLog = readFileSync(join(actsRoot, 'state', 'logs', `${second.runId}.log`), 'utf8')
+    assert.match(secondLog, /cache：命中 acts-cache-v1/, '第二次应该命中上一次保存的缓存')
+
+    // 未知动作在真运行里也必须让这一步失败，而不是跳过
+    writeFileSync(join(actsProject, 'pipe.yml'), [
+      'version: 1',
+      'name: bad-action',
+      'targets:',
+      '  dev:',
+      '    hosts:',
+      '      - h1',
+      'stages:',
+      '  - id: build',
+      '    steps:',
+      '      - uses: shell',
+      '        with:',
+      '          run: echo hi',
+    ].join(TC_NL))
+    const route = actsCtx.routes.find((item) => item.path === `${internals.ROUTE_PREFIX}/run`)
+    const response = await route.resource(new Request(`http://x${internals.ROUTE_PREFIX}/run?project=acts&target=dev&confirm=1`, {
+      headers: { 'x-dsh-cicd': '1' },
+    }))
+    const body = await response.json()
+    assert.equal(body.status, 'failed')
+    const badLog = readFileSync(join(actsRoot, 'state', 'logs', `${body.runId}.log`), 'utf8')
+    assert.match(badLog, /动作 shell 失败：不支持的动作/)
+  } finally {
+    for (const effect of actsEffects) { try { effect() } catch { /* ignore */ } }
+    rmSync(actsRoot, { recursive: true, force: true })
+  }
+})
+
+
+checkAsync('P3-S1：native 多实例端口与实例日志隔离', async () => {
+  const calls = []
+  const target = { path: '/srv/app', hosts: ['h1', 'h2'], restart: 'node app.js --port={{.port}}', instances: { count: 3, port: { base: 8080, step: 1 }, log: '/var/log/app-{{.index}}.log' }, health: { window: 0 } }
+  for (const hostName of target.hosts) {
+    const host = {
+      async exec(command) {
+        calls.push({ hostName, command })
+        if (command.startsWith('ss -ltnp')) return { stdout: '', exitCode: 0 }
+        if (command.includes('set -C')) return { stdout: 'CICD_SLOT_OK', exitCode: 0 }
+        return { stdout: '', exitCode: 0 }
+      },
+      async uploadFile() {},
+    }
+    const actuator = createNativeActuator({ host, target, hostName, onLog: () => {} })
+    const handle = await actuator.stage({ releaseId: 'p3-r1', artifactPath: '' })
+    await actuator.activate(handle)
+    assert.deepEqual(handle.slots, [8080, 8081, 8082])
+    assert.equal(new Set(handle.instances.map((item) => item.port)).size, 3)
+    assert.equal(new Set(handle.instances.map((item) => item.logPath)).size, 3)
+  }
+  assert.equal(calls.filter((item) => /--port=/.test(item.command)).length, 6)
+})
+
+checkAsync('P3-S2：stage 全完成前不 activate，失败后释放已占槽位', async () => {
+  const seen = { staged: [], activated: [], released: [] }
+  const factory = ({ hostName }) => ({
+    slots: { releaseAll: async () => { seen.released.push(hostName) } },
+    stage: async () => { if (hostName === 'h2') throw Object.assign(new Error('stage failed'), { code: 'ACTUATOR_STAGE_FAILED' }); seen.staged.push(hostName); return { host: hostName, releaseId: 'p3-r2', dir: '/r', instances: [], slots: [], previous: 'old' } },
+    activate: async () => { seen.activated.push(hostName) }, health: async () => ({ ok: true, layer: 'l2' }),
+    revert: async () => {}, writeManifest: async () => ({}), cleanup: async () => {},
+  })
+  const result = await deployTransaction({ remote: {}, target: { path: '/srv', hosts: ['h1', 'h2', 'h3'] }, releaseId: 'p3-r2', actuatorFactory: factory })
+  assert.equal(result.ok, false)
+  assert.deepEqual(seen.activated, [])
+  assert.deepEqual(seen.staged, ['h1'])
+  assert.deepEqual(seen.released, ['h1'])
+  assert.equal(result.hosts.find((item) => item.host === 'h3').skipped, true)
+})
+
+checkAsync('P3-S3：verify 失败补偿所有已激活主机', async () => {
+  const seen = { activated: [], reverted: [], manifests: [] }
+  const factory = ({ hostName }) => ({
+    slots: { releaseAll: async () => {} },
+    stage: async () => ({ host: hostName, releaseId: 'p3-r3', dir: '/r', instances: [], slots: [], previous: 'old' }),
+    activate: async () => { seen.activated.push(hostName) },
+    health: async () => hostName === 'h2' ? { ok: false, layer: 'l2', detail: 'probe failed' } : { ok: true, layer: 'l2' },
+    revert: async () => { seen.reverted.push(hostName) }, writeManifest: async () => { seen.manifests.push(hostName) }, cleanup: async () => {},
+  })
+  const result = await deployTransaction({ remote: {}, target: { path: '/srv', hosts: ['h1', 'h2'] }, releaseId: 'p3-r3', actuatorFactory: factory })
+  assert.equal(result.ok, false)
+  assert.deepEqual(seen.activated, ['h1', 'h2'])
+  assert.ok(seen.reverted.includes('h1'))
+  assert.ok(seen.reverted.includes('h2'))
+  assert.deepEqual(seen.manifests, [])
+  assert.equal(result.hosts.find((item) => item.host === 'h2').layer, 'l2')
+})
+
+checkAsync('P3-S4：僵尸槽位按 pid+端口证据回收', async () => {
+  let busy = true
+  const commands = []
+  const store = createSlotStore({ root: '/srv/app', run: async (command) => {
+    commands.push(command)
+    if (command.startsWith('cat ')) return { stdout: JSON.stringify({ pid: 999999, releaseId: 'old' }) }
+    if (command.startsWith('kill -0')) return { stdout: 'no' }
+    if (command.includes('ss -ltn')) return { stdout: 'no' }
+    if (command.startsWith('rm -f')) { busy = false; return { stdout: '' } }
+    if (command.includes('CICD_SLOT_OK')) return { stdout: busy ? 'CICD_SLOT_BUSY' : 'CICD_SLOT_OK' }
+    return { stdout: '' }
+  } })
+  const result = await store.claim({ port: 8080, releaseId: 'new', instanceId: 'h/0' })
+  assert.equal(result.ok, true)
+  assert.equal(result.reclaimed, true)
+  assert.ok(commands.some((command) => command.includes('set -C')))
+})
+
+checkAsync('P3-S5：release 存储保留不可变 artifact digest 与实例快照', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cicd-p3-release-'))
+  const store = createStore({ dir })
+  try {
+    store.appendRelease({ id: 'r-new@h1', project_id: 'p', target: 'prod', host: 'h1', run_id: 'r-new', commit: 'c', artifact_digest: 'sha256:oldbytes', artifact_sha256: 'oldbytes', mode: 'native', instances: [{ port: 8080 }], status: 'active' })
+    const saved = store.release('r-new@h1')
+    assert.equal(saved.artifactDigest, 'sha256:oldbytes')
+    assert.equal(saved.instances[0].port, 8080)
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+checkAsync('P3-S6：container/k8s 尚无 Actuator 时拒绝静默退回 native', async () => {
+  await assert.rejects(() => deployTransaction({ remote: {}, target: { mode: 'container', path: '/srv', hosts: ['h1'] }, releaseId: 'p3-r6' }), (error) => error.code === 'ACTUATOR_NOT_IMPLEMENTED')
+})
+
+checkAsync('P3-S7：断网仍可从 manifest 读取回滚现场', async () => {
+  const result = await readManifest({
+    remote: { exec: async (host, command) => /^readlink /.test(command)
+      ? { stdout: 'releases/r-old', exitCode: 0 }
+      : { stdout: JSON.stringify({ version: 1, releaseId: 'r-old', previous: 'r-before', artifact: { digest: 'sha256:bytes' }, instances: [{ port: 8080, pid: 42 }] }), exitCode: 0 } },
+    target: { path: '/srv/app' }, host: 'h1',
+  })
+  assert.equal(result.manifest.artifact.digest, 'sha256:bytes')
+  assert.equal(result.manifest.instances[0].port, 8080)
+  assert.equal(result.path, '/srv/app/releases/r-old/.dsh-manifest.json')
+})
+
+
+// ---------------------------------------------------------------------------------------------
+// P5 · 制品 CAS
+
+const casRoot = mkdtempSync(join(tmpdir(), 'dsh-cicd-cas-'))
+function casFile(name, content) {
+  const path = join(casRoot, name)
+  writeFileSync(path, content)
+  return path
+}
+
+checkAsync('P5-S1：CAS 流式收字节 → digest 恒等 → 重复 PUT 幂等不落第二份', async () => {
+  const { createArtifactStore, digestPath } = await import('../lib/artifacts.js')
+  const store = createArtifactStore({ dir: join(casRoot, 'cas-a') })
+  const file = casFile('a.bin', 'hello-artifact')
+  const first = await store.putFile(file)
+  assert.equal(first.digest, `sha256:${createHash('sha256').update('hello-artifact').digest('hex')}`)
+  assert.equal(first.bytes, 14)
+  assert.equal(first.deduped, false)
+  // 同一份内容换个路径再传：digest 相同，第二次是 deduped，且磁盘上只有一个 blob。
+  const second = await store.putFile(casFile('a-copy.bin', 'hello-artifact'))
+  assert.equal(second.digest, first.digest)
+  assert.equal(second.deduped, true)
+  assert.equal(store.listBlobs().length, 1)
+  assert.equal(store.stats().count, 1)
+  store.dispose()
+})
+
+checkAsync('P5-S2：上传时重算 sha256 —— 声明 digest 与实际字节不符直接拒收，且不写进 CAS', async () => {
+  const { createArtifactStore } = await import('../lib/artifacts.js')
+  const store = createArtifactStore({ dir: join(casRoot, 'cas-b') })
+  const file = casFile('tampered.bin', 'payload-v1')
+  const real = `sha256:${createHash('sha256').update('payload-v1').digest('hex')}`
+  await assert.rejects(
+    () => store.putFile(file, { expectDigest: `sha256:${'0'.repeat(64)}` }),
+    (error) => error.code === 'ARTIFACT_DIGEST_MISMATCH' && error.expected === `sha256:${'0'.repeat(64)}` && error.actual === real,
+  )
+  assert.equal(store.listBlobs().length, 0, '校验失败的字节不能留在 blob 目录里')
+  // 声明对了才收。
+  const ok = await store.putFile(file, { expectDigest: real.toUpperCase().replace('SHA256:', 'sha256:') })
+  assert.equal(ok.digest, real)
+  store.dispose()
+})
+
+checkAsync('P5-S3：磁盘上的字节被改 1 个 → verify 立即可证伪（digest 就是身份）', async () => {
+  const { createArtifactStore, digestPath } = await import('../lib/artifacts.js')
+  const store = createArtifactStore({ dir: join(casRoot, 'cas-c') })
+  const result = await store.putFile(casFile('v.bin', 'immutable-bytes'))
+  assert.equal((await store.verify(result.digest)).ok, true)
+  // 模拟有人绕过 API 直接改磁盘：翻转一个字节。
+  const path = digestPath(join(casRoot, 'cas-c'), result.digest)
+  const bytes = readFileSync(path)
+  bytes[0] = bytes[0] ^ 0xff
+  writeFileSync(path, bytes)
+  const verified = await store.verify(result.digest)
+  assert.equal(verified.ok, false)
+  assert.notEqual(verified.actual, result.digest)
+  store.dispose()
+})
+
+checkAsync('P5-S4：Range 单区间读取 —— 首段、尾段、超界降级、非法格式不 panic', async () => {
+  const { createArtifactStore, parseRange } = await import('../lib/artifacts.js')
+  const store = createArtifactStore({ dir: join(casRoot, 'cas-d') })
+  const file = casFile('range.bin', '0123456789')
+  const { digest, bytes } = await store.putFile(file)
+  assert.equal(bytes, 10)
+
+  const head = store.readRange(digest, 'bytes=0-3')
+  assert.equal(head.status, 206)
+  assert.equal(head.start, 0)
+  assert.equal(head.end, 3)
+  const chunk = []
+  for await (const piece of head.stream()) chunk.push(piece)
+  assert.equal(Buffer.concat(chunk).toString(), '0123')
+
+  const suffix = store.readRange(digest, 'bytes=-3')
+  assert.equal(suffix.start, 7)
+  assert.equal(suffix.end, 9)
+
+  const full = store.readRange(digest, '')
+  assert.equal(full.status, 200)
+  assert.equal(full.end, 9)
+
+  assert.equal(parseRange('bytes=20-30', 10), null, '越界范围应降级成全量而不是报错')
+  assert.equal(parseRange('bytes=abc', 10), null)
+  assert.equal(parseRange('bytes=5-2', 10), null)
+  store.dispose()
+})
+
+checkAsync('P5-S5：指针（tag）只动引用 —— 指向不存在的 digest 被拒，GC 按引用与 dry-run 行事', async () => {
+  const { createArtifactStore } = await import('../lib/artifacts.js')
+  const store = createArtifactStore({ dir: join(casRoot, 'cas-e') })
+  const live = await store.putFile(casFile('live.bin', 'kept-by-tag'))
+  const orphan = await store.putFile(casFile('orphan.bin', 'nobody-points-here'))
+
+  assert.throws(() => store.putRef('demo', 'latest', `sha256:${'a'.repeat(64)}`), (error) => error.code === 'ARTIFACT_NOT_FOUND')
+  const ref = store.putRef('demo', 'latest', live.digest)
+  assert.equal(ref.digest, live.digest)
+  assert.equal(store.readRef('demo', 'latest').digest, live.digest)
+
+  // 默认 dry-run：算出要删什么，但一个字节都不动。
+  const dry = store.gc()
+  assert.equal(dry.dryRun, true)
+  assert.deepEqual(dry.removed.map((item) => item.digest), [orphan.digest])
+  assert.deepEqual(dry.kept, [live.digest])
+  assert.equal(store.has(orphan.digest), true)
+
+  const real = store.gc({ dryRun: false })
+  assert.equal(real.removed.length, 1)
+  assert.equal(store.has(orphan.digest), false)
+  assert.equal(store.has(live.digest), true, '有指针的 blob 不能被回收')
+  store.dispose()
+})
+
+checkAsync('P5-S6：空文件与目录都被拒（0 字节几乎总是产物路径写错）', async () => {
+  const { createArtifactStore } = await import('../lib/artifacts.js')
+  const store = createArtifactStore({ dir: join(casRoot, 'cas-f') })
+  await assert.rejects(() => store.putFile(casFile('empty.bin', '')), (error) => error.code === 'ARTIFACT_EMPTY')
+  await assert.rejects(() => store.putFile(join(casRoot, 'no-such-file')), (error) => error.code === 'ARTIFACT_NOT_FOUND')
+  store.dispose()
+})
+
+check('P5-S7：digest 写法归一 —— 裸 hex、大写、带前缀都收；不合法直接 ARTIFACT_DIGEST_INVALID', () => {
+  const hex = 'a'.repeat(64)
+  assert.equal(internals.normalizeDigest(hex), `sha256:${hex}`)
+  assert.equal(internals.normalizeDigest(`sha256:${hex.toUpperCase()}`), `sha256:${hex}`)
+  throwsCode(() => internals.normalizeDigest('sha256:short'), 'ARTIFACT_DIGEST_INVALID')
+  throwsCode(() => internals.normalizeDigest(''), 'ARTIFACT_DIGEST_INVALID')
+})
+
+checkAsync('P5-S8：运行时 —— 上传落盘 + 元数据入表，列表按项目可见', async () => {
+  const runtime = internals.createRuntime(fakeContext(), {
+    projects: [{ id: 'demo', path: projectDir }],
+    workDir: join(root, 'state'),
+    scheduler: { enabled: false },
+  })
+  try {
+    const uploaded = await runtime.artifacts({ action: 'upload', path: casFile('rt.bin', 'runtime-artifact'), project: 'demo', runId: 'run-1' })
+    assert.equal(uploaded.ok, true)
+    assert.equal(uploaded.bytes, 16)
+    const listed = await runtime.artifacts({ action: 'list', project: 'demo' })
+    assert.equal(listed.artifacts.length, 1)
+    assert.equal(listed.artifacts[0].digest, uploaded.digest)
+    assert.equal(listed.artifacts[0].run_id, 'run-1')
+    assert.equal(listed.stats.count, 1)
+    // 目录不是制品。
+    await assert.rejects(() => runtime.artifacts({ action: 'upload', path: projectDir, project: 'demo' }), (error) => error.code === 'COMMAND_INVALID')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+checkAsync('P5-S9：/artifacts 路由 —— 下载字节一致、Range 返回 206、篡改后 verify 报 409', async () => {
+  const runtime = internals.createRuntime(fakeContext(), {
+    projects: [{ id: 'demo', path: projectDir }],
+    workDir: join(root, 'state'),
+    scheduler: { enabled: false },
+  })
+  try {
+    const uploaded = await runtime.artifacts({ action: 'upload', path: casFile('route.bin', 'route-bytes'), project: 'demo' })
+    // 下载（GET 不需要写头/confirm，但需要同源 + x-dsh-cicd 读头）。
+    const fresh = fakeContext()
+    internals.registerHttpRoutes(fresh, runtime)
+    const download = await fresh.routes.find((item) => item.path === `${internals.ROUTE_PREFIX}/artifacts`).resource(
+      new Request(`http://x/api/plugins/cicd/artifacts?digest=${uploaded.digest}`, { headers: { 'x-dsh-cicd': '1' } }),
+    )
+    assert.equal(download.status, 200)
+    assert.equal(download.headers.get('content-digest'), uploaded.digest)
+    assert.equal(download.headers.get('accept-ranges'), 'bytes')
+    const payload = Buffer.from(await download.arrayBuffer()).toString()
+    assert.equal(payload, 'route-bytes')
+
+    const ranged = await fresh.routes.find((item) => item.path === `${internals.ROUTE_PREFIX}/artifacts`).resource(
+      new Request(`http://x/api/plugins/cicd/artifacts?digest=${uploaded.digest}`, { headers: { 'x-dsh-cicd': '1', range: 'bytes=0-4' } }),
+    )
+    assert.equal(ranged.status, 206)
+    assert.equal(ranged.headers.get('content-range'), 'bytes 0-4/11')
+
+    // 篡改磁盘上的字节 → verify 走 409（不是 500，也不是静默成功）。
+    const blobPath = internals.digestPath(join(root, 'state', 'artifacts'), uploaded.digest)
+    const bytes = readFileSync(blobPath)
+    bytes[0] = bytes[0] ^ 0xff
+    writeFileSync(blobPath, bytes)
+    const corrupted = await fresh.routes.find((item) => item.path === `${internals.ROUTE_PREFIX}/artifacts`).resource(
+      new Request(`http://x/api/plugins/cicd/artifacts?action=verify&digest=${uploaded.digest}&confirm=1`, { method: 'POST', headers: { 'x-dsh-cicd': '1' } }),
+    )
+    assert.equal(corrupted.status, 409)
+    const body = await corrupted.json()
+    assert.equal(body.code, 'ARTIFACT_CORRUPTED')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+checkAsync('P5-S10：写操作一律要 confirm 与 x-dsh-cicd 头，缺一即拒', async () => {
+  const runtime = internals.createRuntime(fakeContext(), {
+    projects: [{ id: 'demo', path: projectDir }],
+    workDir: join(root, 'state'),
+    scheduler: { enabled: false },
+  })
+  try {
+    const fresh = fakeContext()
+    internals.registerHttpRoutes(fresh, runtime)
+    const route = fresh.routes.find((item) => item.path === `${internals.ROUTE_PREFIX}/artifacts`)
+    const noHeader = await route.resource(new Request('http://x/api/plugins/cicd/artifacts?action=gc&confirm=1', { method: 'POST' }))
+    assert.equal(noHeader.status, 403)
+    const noConfirm = await route.resource(new Request('http://x/api/plugins/cicd/artifacts?action=gc', { method: 'POST', headers: { 'x-dsh-cicd': '1' } }))
+    assert.equal(noConfirm.status, 400)
+  } finally {
+    runtime.dispose()
+  }
+})
+
+check('P5-S11：DB —— 制品表随 v10 迁出，artifact_blobs 只存索引不存字节', () => {
+  const db = openDatabase(join(root, 'artifacts-db.sqlite'))
+  try {
+    const columns = db.prepare('PRAGMA table_info(artifact_blobs)').all().map((row) => row.name)
+    assert.deepEqual(columns.sort(), ['bytes', 'created_at', 'digest', 'job_id', 'media_type', 'project_id', 'run_id', 'source_path'])
+    assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE name = 'idx_artifact_refs_digest'").get())
+  } finally { db.close() }
+})
+
 let passed = 0
 for (const item of checks) {
   try {

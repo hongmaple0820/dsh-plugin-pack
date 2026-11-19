@@ -2,9 +2,15 @@
  * @local/dsh-cicd · Client 半边。
  *
  * 在 layout 的 `main` 槽上注册整页视图「流水线」（入口是左侧栏全局面板行，同时保留会话内 View）：
- * 顶部工具条（项目切换 / 目标 / 计划 / 干跑 / 运行 / 刷新 / 发布），下面三列
- * 阶段与目标矩阵 → Run 详情（运行记录 + steps 时间线 + 跟随日志）→ Releases；
- * 窄屏（<1100px）退化为两列（详情与 Releases 上下叠），「发布」按钮仍可切到整页发布视图。
+ * 左侧固定导航（运行 / 发布 / 审批 / pipe.yml / 新建 / 构建主机 / Secrets / RBAC / 审计）
+ * → 主区面包屑 + 工具条（项目切换 / 目标 / 构建主机 / 计划 / 干跑 / 运行 / 刷新）
+ * → 三列内容（阶段与目标矩阵 → Run 详情（运行记录 + steps 时间线 + 跟随日志）→ Releases）；
+ * 窄屏（<1100px）退化为两列（详情与 Releases 上下叠）。
+ *
+ * v3.0-P0 路由：视图/项目/选中运行全部映射到 URL 片段
+ * `#/projects/:project[/runs/:runId | /releases | /approvals | /pipeline | /new | /runners | /secrets | /rbac | /audit][?target=&step=&line=]`。
+ * 用 hash 而不是 history API：面板挂在宿主页面里，`pushState` 会改掉宿主自身的路径、刷新后宿主不认识该路由；
+ * hash 只动片段，宿主刷新后仍能挂载面板，面板自己把视图还原回来。刷新不丢视图、地址可直接分享。
  *
  * 约束：只用 `require('react')`；颜色只用 `--dsw-alias-*` 主题 token；不 iframe、不碰别人的 DOM；
  * 数据全部走 Host 端路由 `/api/plugins/cicd/*`（全部 GET + `x-dsh-cicd: 1` 头）。
@@ -107,6 +113,7 @@ window.__ModuleLoader__.load({
 .cicd-step-flag{flex:none;color:var(--dsw-alias-label-dimmed);font-size:11px;line-height:15px;white-space:nowrap}
 .cicd-log{display:flex;flex-direction:column;gap:1px;margin:0;padding:8px 10px;border:.5px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-2);max-height:320px;overflow:auto;overscroll-behavior:contain}
 .cicd-log-line{margin:0;color:var(--dsw-alias-label-secondary);font-size:11.5px;line-height:16px;white-space:pre-wrap;overflow-wrap:anywhere}
+.cicd-log-line.is-highlight{border-radius:3px;background:var(--dsw-alias-state-warn-bg, rgba(255,159,10,.16));color:var(--dsw-alias-label-primary)}
 .cicd-note{margin:0;color:var(--dsw-alias-label-tertiary);font-size:11.5px;line-height:17px}
 .cicd-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:18px 10px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;text-align:center}
 .cicd-loading{display:flex;align-items:center;gap:8px;padding:10px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
@@ -163,6 +170,11 @@ window.__ModuleLoader__.load({
 .cicd-run-row.is-skipped{box-shadow:inset 2px 0 0 var(--dsw-alias-label-dimmed)}
 .cicd-timeline{display:flex;flex-direction:column;gap:1px}
 .cicd-timeline-stage{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:6px 0 2px;color:var(--dsw-alias-label-primary);font-size:12px;font-weight:600;line-height:17px}
+/* v3.0-P1：stage 与 step 之间的 job 行（并行 job / matrix 实例各一行） */
+.cicd-timeline-job{display:flex;align-items:center;gap:6px;margin:3px 0 1px;padding-left:3px;min-width:0;color:var(--dsw-alias-label-secondary);font-size:11.5px;line-height:16px}
+.cicd-timeline-job-name{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cicd-timeline-job-meta{flex:none;color:var(--dsw-alias-label-dimmed);font-size:10.5px;line-height:14px}
+.cicd-log-job-select{height:24px;padding:0 6px;font-size:11.5px;line-height:22px;max-width:220px}
 .cicd-timeline-step{display:flex;align-items:flex-start;gap:8px;padding:2px 0 2px 3px}
 .cicd-timeline-dot{flex:none;width:8px;height:8px;margin-top:5px;border-radius:50%;background:var(--dsw-alias-label-dimmed)}
 .cicd-timeline-dot.is-running{background:var(--dsw-alias-brand-primary)}
@@ -224,6 +236,23 @@ window.__ModuleLoader__.load({
 }
 .cicd-panel{display:flex;flex-direction:column;height:100%;min-height:0}
 .cicd-panel>.cicd-page{flex:1 1 auto;min-height:0}
+/* v3.0-P0：左侧视图导航 + 主区（工具条/详情）分层，替掉一排同权重的整页切换按钮 */
+.cicd-shell{display:flex;flex:1 1 auto;min-height:0;min-width:0}
+.cicd-nav{display:flex;flex-direction:column;gap:2px;flex:none;width:132px;box-sizing:border-box;padding:10px 8px;border-right:.5px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);overflow-y:auto;overscroll-behavior:contain}
+.cicd-nav-title{padding:0 8px 6px;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px;letter-spacing:.02em}
+.cicd-nav-item{appearance:none;box-sizing:border-box;display:flex;align-items:center;gap:7px;width:100%;height:28px;padding:0 8px;border:.5px solid transparent;border-radius:var(--dsw-radius-sm, 6px);background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12.5px;line-height:18px;text-align:left;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cicd-nav-item:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.cicd-nav-item[aria-current="page"]{border-color:var(--dsw-alias-border-l3);background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-primary);font-weight:500}
+.cicd-nav-badge{flex:none;min-width:16px;padding:0 5px;border-radius:999px;background:var(--dsw-alias-state-warn-primary);color:var(--dsw-alias-bg-base);font-size:10.5px;line-height:15px;text-align:center}
+.cicd-nav-sep{flex:none;height:1px;margin:6px 8px;background:var(--dsw-alias-border-l2)}
+.cicd-main{display:flex;flex-direction:column;flex:1 1 auto;min-width:0;min-height:0}
+.cicd-route{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 16px;border-bottom:.5px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-tertiary);font-size:11.5px;line-height:16px}
+.cicd-route-link{appearance:none;padding:0;border:0;background:none;color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer;text-decoration:underline;text-underline-offset:2px}
+.cicd-route-link:hover{color:var(--dsw-alias-label-primary)}
+.cicd-route-copy{border-color:var(--dsw-alias-border-l2)}
+@media (max-width:880px){
+.cicd-nav{width:108px}
+}
 /* v2-M0：项目卡 git meta */
 .cicd-project-git{display:block;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .cicd-project-git.is-dirty{color:var(--dsw-alias-state-warn-primary)}
@@ -380,6 +409,145 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * v3.0-P0：hash 路由。
+     *
+     * 之前所有状态都是组件内 `useState`，没有任何 URL 约束，所以刷新回到默认三栏、链接发不出、
+     * 也无法从审批消息里直接跳到某次运行。这里用 hash（`#/projects/:p/runs/:id`）而不是
+     * history API：面板挂在既有页面里，`pushState` 会改掉宿主页面自身的路径，刷新时宿主不认识这个
+     * 路由；hash 只动片段，宿主刷新后仍能挂载面板，面板自己把视图还原回来。
+     */
+    const ROUTE_VIEWS = ['run', 'releases', 'editor', 'create', 'approvals', 'rbac', 'secrets', 'runners', 'audit']
+    /** 视图 → 路径段（`run` 是默认视图，不带段，保证 `#/projects/x` 是最短可分享形式）。 */
+    const VIEW_SEGMENTS = {
+      releases: 'releases',
+      editor: 'pipeline',
+      create: 'new',
+      approvals: 'approvals',
+      rbac: 'rbac',
+      secrets: 'secrets',
+      runners: 'runners',
+      audit: 'audit',
+    }
+    const SEGMENT_VIEWS = Object.keys(VIEW_SEGMENTS).reduce((acc, view) => {
+      acc[VIEW_SEGMENTS[view]] = view
+      return acc
+    }, {})
+
+    function safeDecode(value) {
+      try {
+        return decodeURIComponent(String(value == null ? '' : value))
+      } catch (error) {
+        return String(value == null ? '' : value)
+      }
+    }
+
+    /** 把 `#/projects/p/runs/r1?target=prod` 解成对象；任何无法识别的片段都退化到安全默认值。 */
+    function parseHash(hash) {
+      const raw = String(hash == null ? '' : hash).replace(/^#/, '')
+      const [pathPart, searchPart] = raw.split('?')
+      const query = {}
+      if (searchPart) {
+        searchPart.split('&').forEach((pair) => {
+          if (!pair) return
+          const index = pair.indexOf('=')
+          const key = safeDecode(index < 0 ? pair : pair.slice(0, index))
+          if (!key) return
+          query[key] = index < 0 ? '' : safeDecode(pair.slice(index + 1))
+        })
+      }
+      const segments = String(pathPart || '').split('/').filter(Boolean).map(safeDecode)
+      const route = { project: '', view: 'run', runId: '', target: query.target || '', line: query.line || '', step: query.step || '' }
+      if (segments[0] === 'projects' && segments[1]) {
+        route.project = segments[1]
+        if (segments[2] === 'runs' && segments[3]) {
+          route.runId = segments[3]
+          route.view = 'run'
+        } else if (segments[2] && SEGMENT_VIEWS[segments[2]]) {
+          route.view = SEGMENT_VIEWS[segments[2]]
+        }
+      } else if (segments[0] === 'new') {
+        route.view = 'create'
+      }
+      return route
+    }
+
+    /** 反向：路由对象 → hash 字符串。 */
+    function buildHash(route) {
+      const view = ROUTE_VIEWS.indexOf(route && route.view) >= 0 ? route.view : 'run'
+      const segments = []
+      // 路径段必须整体 encode：项目 id / run id 里出现 `/`、`?`、`#` 时若不编码，
+      // 拼出来的 hash 会被解析成别的路由（`runs/a/b` 变成 runId=a 加一段垃圾）。
+      if (route && route.project) {
+        segments.push('projects', encodeURIComponent(route.project))
+        if (view === 'run') {
+          if (route.runId) segments.push('runs', encodeURIComponent(route.runId))
+        } else {
+          segments.push(VIEW_SEGMENTS[view])
+        }
+      } else if (view === 'create') {
+        segments.push('new')
+      }
+      const query = []
+      if (route && route.project && view !== 'create') {
+        if (route.target) query.push('target=' + encodeURIComponent(route.target))
+        if (view === 'run' && route.runId) {
+          if (route.step) query.push('step=' + encodeURIComponent(route.step))
+          if (route.line) query.push('line=' + encodeURIComponent(route.line))
+        }
+      }
+      const search = query.length ? '?' + query.join('&') : ''
+      return segments.length ? '#/' + segments.join('/') + search : ''
+    }
+
+    function readHash() {
+      try {
+        if (typeof window === 'undefined' || !window.location) return ''
+        return window.location.hash || ''
+      } catch (error) {
+        return ''
+      }
+    }
+
+    /**
+     * 写 URL。`replace` 用于「把用户直接带进合法路由」这类修正，避免污染返回历史；
+     * 用户主动切视图走 `pushState` 语义（这里用 `assign`）。
+     */
+    function writeHash(hash, replace) {
+      try {
+        if (typeof window === 'undefined' || !window.location) return
+        if (!hash) return
+        const current = window.location.hash || ''
+        if (current === hash) return
+        if (window.history && typeof window.history.replaceState === 'function') {
+          const base = window.location.pathname + window.location.search
+          window.history[replace ? 'replaceState' : 'pushState'](null, '', base + hash)
+          return
+        }
+        window.location.hash = hash
+      } catch (error) {
+        // 沙箱 / 禁用 history 时降级为「只更新内存状态」，路由仍可用，只是不能分享。
+      }
+    }
+
+    /** 订阅 hashchange：浏览器前进/后退、手改地址、外部深链都走这一条。 */
+    function useHashRoute() {
+      const [hash, setHash] = useState(() => readHash())
+      useEffect(() => {
+        if (typeof window === 'undefined' || !window.addEventListener) return undefined
+        const onChange = () => setHash(readHash())
+        // 我们自己是 `pushState` 写地址，浏览器前进/后退会发 popstate；同一文档内的片段跳转还会发 hashchange。
+        // 两个都听：只听其中一个时，某些浏览器组合下后退不会重绘视图。
+        window.addEventListener('hashchange', onChange)
+        window.addEventListener('popstate', onChange)
+        return () => {
+          window.removeEventListener('hashchange', onChange)
+          window.removeEventListener('popstate', onChange)
+        }
+      }, [])
+      return hash
+    }
+
     /** v2-M0：从 /project-meta 的返回里拼出项目卡上的 git 元信息行（分支 · 提交 · tag · 是否脏）。 */
     function projectGitMeta(meta) {
       if (!meta || meta.status !== 'ready' || !meta.data) return { text: '', dirty: false, isRepo: false }
@@ -394,17 +562,59 @@ window.__ModuleLoader__.load({
       return { text: parts.join(' · '), dirty: Boolean(data.dirty), isRepo: Boolean(data.isRepo) }
     }
 
-    /** 把 stage 树摊平成时间线行：stage 标题行 + 每步一行（状态点 / 耗时 / 一行摘要）。 */
-    function timelineRows(stages) {
+    /**
+     * 把 stage 树摊平成时间线行：stage 标题行 + 每步一行（状态点 / 耗时 / 一行摘要）。
+     *
+     * v3.0-P1：DSL v2 里一个 stage 可以挂多个 job（含 matrix 实例），它们并行执行、
+     * 各有一份日志。只按 stage → step 两级摊平的话，「哪几步是并行的」「哪个 job 失败了」
+     * 都看不出来，所以有 job 图时在 stage 与 step 之间插一层 job 行。
+     * 没有 job 图（v1 的 pipe、或老的历史运行）时行为与以前完全一致。
+     */
+    function timelineRows(stages, jobs) {
       const rows = []
       if (!Array.isArray(stages)) return rows
+      const jobsByStage = new Map()
+      ;(Array.isArray(jobs) ? jobs : []).forEach((job) => {
+        const stageKey = job && job.stage ? job.stage : ''
+        if (!jobsByStage.has(stageKey)) jobsByStage.set(stageKey, [])
+        jobsByStage.get(stageKey).push(job)
+      })
+      const pushSteps = (stageKey, prefix, steps) => {
+        steps.forEach((step, stepIndex) => {
+          rows.push({
+            kind: 'step',
+            key: prefix + ':' + (step && step.index !== undefined ? step.index : stepIndex),
+            step,
+          })
+        })
+      }
       stages.forEach((stage, stageIndex) => {
         const stageKey = stage && stage.id ? stage.id : 'stage-' + stageIndex
         rows.push({ kind: 'stage', key: stageKey, stage })
         const steps = Array.isArray(stage && stage.steps) ? stage.steps : []
-        steps.forEach((step, stepIndex) => {
-          rows.push({ kind: 'step', key: stageKey + ':' + (step && step.index !== undefined ? step.index : stepIndex), step })
+        const stageJobs = jobsByStage.get(stageKey) || []
+        if (stageJobs.length === 0) {
+          pushSteps(stageKey, stageKey, steps)
+          return
+        }
+        // 先按 job 分组、保持 job 声明顺序；认不出归属的 step 落到末尾一个「未分组」块，
+        // 宁可多显示一行也不要把已有的步骤藏起来。
+        const groups = new Map()
+        stageJobs.forEach((job) => groups.set(job.id, { job, steps: [] }))
+        const loose = []
+        steps.forEach((step) => {
+          const group = groups.get(step && step.jobId ? step.jobId : '')
+          if (group) group.steps.push(step)
+          else loose.push(step)
         })
+        groups.forEach((group, jobId) => {
+          rows.push({ kind: 'job', key: stageKey + '/' + jobId, job: group.job })
+          pushSteps(stageKey, stageKey + '/' + jobId, group.steps)
+        })
+        if (loose.length > 0) {
+          rows.push({ kind: 'job', key: stageKey + '/-', job: null })
+          pushSteps(stageKey, stageKey + '/-', loose)
+        }
       })
       return rows
     }
@@ -752,7 +962,7 @@ window.__ModuleLoader__.load({
     }
 
     /** 中列「Run 详情」：上方运行记录（选择器），下方选中运行的 steps 时间线与日志。 */
-    function RunsDetailColumn({ runs, onRefreshRuns, selectedRunId, onSelectRun, run, stages, canary, logState, onReloadLog }) {
+    function RunsDetailColumn({ runs, onRefreshRuns, selectedRunId, onSelectRun, run, stages, canary, jobs, logState, onReloadLog, highlightLine, logJobId, onSelectJob }) {
       // v0.6 A：灰度信息只在「刚跑完的这次 run」的返回里，历史运行没有；批次行来自 canary.batches。
       const batches = canary && Array.isArray(canary.batches) ? canary.batches.filter(Boolean) : []
       const firstDone = batches.some((batch) => Number(batch.index) === 1 && batch.ok === true)
@@ -763,6 +973,8 @@ window.__ModuleLoader__.load({
       const canaryWait = canary && Number(canary.waitSec) > 0 ? Number(canary.waitSec) : 0
       const remaining = hostTotal > canaryFirst ? hostTotal - canaryFirst : 0
       const hold = Boolean(run && run.status === 'running' && canaryFirst > 0 && firstDone)
+      // v3.0-P1：job 行有两个来源（见 runJobsOf），合并后既供时间线分层，也供日志区下拉。
+      const jobRows = runJobsOf(jobs, logState && logState.jobs)
       return h('section', { className: 'cicd-col cicd-col-detail' },
         h('div', { className: 'cicd-col-head' },
           h('span', { className: 'cicd-col-title' }, run ? 'Run 详情 · ' + shortId(run.id, 20) : 'Run 详情'),
@@ -823,15 +1035,37 @@ window.__ModuleLoader__.load({
               stages && stages.length > 0
                 ? h('div', null,
                   h('div', { className: 'cicd-section-title' }, '步骤时间线'),
-                  h(StepsTimeline, { stages }))
+                  h(StepsTimeline, { stages, jobs: jobRows }))
                 : h('p', { className: 'cicd-note' }, '运行列表只带状态与时间；这条运行是历史记录，Host 没有单独返回它的 step 明细，日志见下方。'),
-              h(LogView, { runId: run.id, logState, onReloadLog }))
+              h(LogView, {
+                runId: run.id,
+                logState,
+                onReloadLog,
+                highlightLine,
+                logJobId: logJobId || '',
+                jobOptions: jobRows,
+                onSelectJob,
+              }))
             : h(EmptyState, { text: '在上方运行记录里选一条，这里显示 steps 时间线与日志。' })))
     }
 
-    /** steps 时间线：stage 标题行 + 每步一行（状态点 / 耗时 / 一行摘要）。 */
-    function StepsTimeline({ stages }) {
-      const rows = timelineRows(stages)
+    /**
+     * 这次运行有哪些 job（v3.0-P1）。
+     *
+     * 两个来源：`/run` 的返回带完整 job 图（有状态、耗时、错误），历史运行只有 `/log` 返回的
+     * 分片日志文件名清单（只有 id）。两者都归一成 `{id, status, ...}`，UI 不必分情况处理；
+     * 状态缺失时按「未知」渲染，而不是假装成功。
+     */
+    function runJobsOf(jobGraph, jobLogs) {
+      const fromGraph = jobGraph && Array.isArray(jobGraph.items) ? jobGraph.items : null
+      if (fromGraph && fromGraph.length > 0) return fromGraph
+      const listed = Array.isArray(jobLogs) ? jobLogs : []
+      return listed.map((item) => ({ id: item.jobId || item.id || '', status: '', stage: '' }))
+    }
+
+    /** steps 时间线：stage 标题行 +（有 job 图时）job 行 + 每步一行（状态点 / 耗时 / 一行摘要）。 */
+    function StepsTimeline({ stages, jobs }) {
+      const rows = timelineRows(stages, jobs)
       if (rows.length === 0) return null
       return h('div', { className: 'cicd-timeline' },
         rows.map((row) => {
@@ -839,6 +1073,17 @@ window.__ModuleLoader__.load({
             return h('div', { className: 'cicd-timeline-stage', key: row.key },
               h('span', null, (row.stage && (row.stage.name || row.stage.id)) || '未命名阶段'),
               row.stage && row.stage.status ? h(StatusBadge, { status: row.stage.status }) : null)
+          }
+          if (row.kind === 'job') {
+            const job = row.job
+            const jobMeta = job
+              ? [job.kind && job.kind !== 'build' ? job.kind : '', typeof job.durationMs === 'number' ? '耗时 ' + formatDuration(job.durationMs) : '']
+                .filter(Boolean).join(' · ')
+              : '未归属任何 job'
+            return h('div', { className: 'cicd-timeline-job', key: row.key, title: job && job.needs && job.needs.length ? '依赖：' + job.needs.join('、') : '' },
+              h('span', { className: 'cicd-timeline-job-name cicd-mono' }, job ? shortId(job.id, 40) : '（未分组）'),
+              jobMeta ? h('span', { className: 'cicd-timeline-job-meta' }, jobMeta) : null,
+              job && job.status ? h(StatusBadge, { status: job.status }) : null)
           }
           const step = row.step
           const status = step && STATUS_LABELS[step.status] ? step.status : 'pending'
@@ -874,12 +1119,22 @@ window.__ModuleLoader__.load({
         }))
     }
 
-    /** 日志区：跟随末尾（上滚暂停 / 点击恢复）+ 下载 + 重新读取。 */
-    function LogView({ runId, logState, onReloadLog }) {
+    /**
+     * 日志区：跟随末尾（上滚暂停 / 点击恢复）+ 下载 + 重新读取。
+     *
+     * v3.0-P1：DSL v2 里一个 stage 的多个 job 是并行的，主日志是一份交错时间线；
+     * `logJobId` 选某条分片时只显示那个 job 自己的输出。「全部」= 老行为。
+     */
+    function LogView({ runId, logState, onReloadLog, highlightLine, logJobId, jobOptions, onSelectJob }) {
       const logRef = useRef(null)
       const [follow, setFollow] = useState(true)
       const lines = Array.isArray(logState.lines) ? logState.lines : []
       const linesCount = lines.length
+      const mark = Number(highlightLine) > 0 ? Number(highlightLine) : 0
+      const jobId = logJobId || ''
+      // 只有一个 job（或根本没分片）时下拉没有意义：唯一选项等于没有选择，还占一行工具条。
+      const jobs = (Array.isArray(jobOptions) ? jobOptions : []).filter((job) => job && job.id)
+      const showJobPicker = jobs.length > 1 && typeof onSelectJob === 'function'
 
       // 跟随中且新日志到达（或刚恢复跟随）时滚到末尾；用户上滚后不再打扰。
       useEffect(() => {
@@ -887,6 +1142,22 @@ window.__ModuleLoader__.load({
         const node = logRef.current
         if (node) node.scrollTop = node.scrollHeight
       }, [follow, logState.lines])
+
+      /**
+       * v3.0-P0 深链定位：`#/projects/p/runs/<id>?line=1204` 打开时把那一行高亮并滚进视野。
+       * 深链只说「第几行」而不是「第几条消息」——日志每次拉取都会变（tail 窗口滑动），
+       * 行号是唯一在多次刷新间稳定的锚点。
+       */
+      useEffect(() => {
+        if (!mark) return
+        const node = logRef.current
+        if (!node || typeof node.querySelector !== 'function') return
+        const target = node.querySelector('[data-log-line="' + mark + '"]')
+        if (!target) return
+        setFollow(false)
+        if (typeof target.scrollIntoView === 'function') target.scrollIntoView({ block: 'center' })
+        else node.scrollTop = Math.max(0, target.offsetTop - node.clientHeight / 2)
+      }, [mark, logState.lines])
 
       const onScroll = useCallback((event) => {
         const node = event && event.currentTarget
@@ -908,7 +1179,7 @@ window.__ModuleLoader__.load({
           const url = URL.createObjectURL(blob)
           const anchor = document.createElement('a')
           anchor.href = url
-          anchor.download = (runId || 'run') + '.log'
+          anchor.download = (runId || 'run') + (jobId ? '-' + jobId.replace(/[^A-Za-z0-9_.-]+/g, '_') : '') + '.log'
           if (document.body && typeof document.body.appendChild === 'function') {
             document.body.appendChild(anchor)
             anchor.click()
@@ -918,11 +1189,22 @@ window.__ModuleLoader__.load({
         } catch (error) {
           // 环境不支持 Blob / DOM 下载时静默：日志仍可在线查看。
         }
-      }, [lines, linesCount, runId])
+      }, [lines, linesCount, runId, jobId])
 
       return h('div', { className: 'cicd-log-section' },
         h('div', { className: 'cicd-section-title' },
           h('span', { className: 'cicd-log-tools' },
+            showJobPicker
+              ? h('select', {
+                className: 'cicd-select cicd-log-job-select',
+                value: jobId || '',
+                onChange: (event) => onSelectJob(event.currentTarget.value),
+                'aria-label': '只看某个 job 的日志',
+                title: '并行 job 的日志在主时间线里是交错的；选一个 job 只看它自己的输出',
+              },
+              h('option', { value: '' }, '全部 job（合并时间线）'),
+              jobs.map((job) => h('option', { key: job.id, value: job.id }, job.id)))
+              : null,
             h('button', {
               className: 'cicd-button cicd-log-follow',
               type: 'button',
@@ -932,13 +1214,23 @@ window.__ModuleLoader__.load({
             }, follow ? '跟随末尾' : '恢复跟随'),
             h('button', { className: 'cicd-button cicd-log-download', type: 'button', onClick: onDownload, disabled: linesCount === 0 }, '下载日志'),
             h('button', { className: 'cicd-button', type: 'button', onClick: onReloadLog, disabled: logState.status === 'loading' }, logState.status === 'loading' ? '读取…中' : '重新读取')),
-          h('span', null, '日志 tail（' + linesCount + ' 行）')),
+          h('span', null, jobId
+            ? '仅 ' + shortId(jobId, 28) + ' · ' + linesCount + ' 行'
+            : '日志 tail（' + linesCount + ' 行）')),
         logState.status === 'error'
-          ? h(ErrorState, { error: logState.error, onRetry: onReloadLog })
+          ? h(ErrorState, {
+            error: logState.error,
+            // 读某个 job 的分片失败时，「重试」重试的是同一个坏名字；这时用户真正需要的是回合并时间线。
+            onRetry: jobId && typeof onSelectJob === 'function' ? () => onSelectJob('') : onReloadLog,
+          })
           : linesCount === 0
             ? h(EmptyState, { text: '这个运行还没有日志输出。' })
             : h('div', { className: 'cicd-log', ref: logRef, onScroll },
-              lines.map((line, index) => h('p', { className: 'cicd-log-line cicd-mono', key: index }, line))))
+              lines.map((line, index) => h('p', {
+                className: 'cicd-log-line cicd-mono' + (mark === index + 1 ? ' is-highlight' : ''),
+                key: index,
+                'data-log-line': index + 1,
+              }, line))))
     }
 
     /** 发布记录表格（列：版本 / 目标 / 主机 / 部署时间 / 状态 / 操作），整页视图与右列共用。 */
@@ -1340,18 +1632,33 @@ window.__ModuleLoader__.load({
     }
 
     function CicdPage() {
+      /**
+       * v3.0-P0：视图/项目/选中运行三件事的初值全部从 hash 读，
+       * 这样刷新、前进后退、别人发来的深链落在同一处状态上。
+       */
+      const routeHash = useHashRoute()
+      const bootRoute = useRef(null)
+      if (bootRoute.current === null) bootRoute.current = parseHash(routeHash)
+
       const [projects, setProjects] = useState({ status: 'loading', items: [], error: null })
-      const [projectId, setProjectId] = useState('')
+      const [projectId, setProjectId] = useState(bootRoute.current.project || '')
       const [targets, setTargets] = useState({ status: 'idle', items: [], error: null })
-      const [targetName, setTargetName] = useState('')
+      const [targetName, setTargetName] = useState(bootRoute.current.target || '')
       const [runs, setRuns] = useState({ status: 'idle', items: [], error: null })
-      const [selectedRunId, setSelectedRunId] = useState('')
-      const [log, setLog] = useState({ status: 'idle', lines: [], error: null })
+      const [selectedRunId, setSelectedRunId] = useState(bootRoute.current.runId || '')
+      const [log, setLog] = useState({ status: 'idle', lines: [], jobs: [], jobId: '', error: null })
+      /**
+       * v3.0-P1：日志当前看的是哪个 job 的分片（空串 = 合并时间线）。
+       *
+       * 单独用一个 state 而不是把它塞进 `log` 里：轮询每 2 秒重拉一次日志，
+       * 若「看哪个 job」跟着响应走，用户在轮询间隙切换就会被拨回上一个值。
+       */
+      const [logJobId, setLogJobId] = useState('')
       /** /run 的返回里带 stage 树，留着给刚启动的这次运行显示明细。 */
       const [runDetail, setRunDetail] = useState(null)
       const [plan, setPlan] = useState(null)
       const [releases, setReleases] = useState({ status: 'idle', items: [], error: null })
-      const [view, setView] = useState('run')
+      const [view, setView] = useState(bootRoute.current.view || 'run')
       const [action, setAction] = useState({ status: 'idle', message: '', error: null })
       const [busy, setBusy] = useState(false)
       const [armed, setArmed] = useState(false)
@@ -1479,18 +1786,35 @@ window.__ModuleLoader__.load({
         }
       }, [freshSignal])
 
-      const loadLog = useCallback(async (runId, quiet) => {
+      const loadLog = useCallback(async (runId, quiet, jobId) => {
         if (!runId) {
-          setLog({ status: 'idle', lines: [], error: null })
+          setLog({ status: 'idle', lines: [], jobs: [], jobId: '', error: null })
           return
         }
-        if (!quiet) setLog({ status: 'loading', lines: [], error: null })
+        if (!quiet) setLog({ status: 'loading', lines: [], jobs: [], jobId: jobId || '', error: null })
         try {
-          const payload = await callApi('log', { runId, tail: LOG_TAIL }, freshSignal('log'))
-          setLog({ status: 'ready', lines: logLines(payload), error: null })
+          const payload = await callApi('log', { runId, tail: LOG_TAIL, jobId: jobId || '' }, freshSignal('log'))
+          setLog({
+            status: 'ready',
+            lines: logLines(payload),
+            // v3.0-P1：并行 job 各自有一份分片日志，主日志是交错时间线。
+            // 这里把 Host 报告的分片清单留着，日志区据此给出「只看某个 job」的下拉。
+            jobs: Array.isArray(payload.jobs) ? payload.jobs : [],
+            jobId: payload.jobId || '',
+            error: null,
+          })
         } catch (error) {
           if (error && error.name === 'AbortError') return
-          if (!quiet) setLog({ status: 'error', lines: [], error })
+          if (!quiet) {
+            // 保留上一次的分片清单：读单个 job 失败时下拉不能消失，否则用户回不到「全部 job」。
+            setLog((prev) => ({
+              status: 'error',
+              lines: [],
+              jobs: Array.isArray(prev.jobs) ? prev.jobs : [],
+              jobId: jobId || '',
+              error,
+            }))
+          }
         }
       }, [freshSignal])
 
@@ -1562,14 +1886,30 @@ window.__ModuleLoader__.load({
         void loadAudit(auditLimit)
       }, [view, auditLimit, loadAudit])
 
-      // 选中项：列表变化时保持选中，失效则回落到第一条。
+      // 选中项：列表变化时保持选中。
+      // v3.0-P0：这里**不再**在「选中的运行不在最近列表里」时回落到第一条 ——
+      /**
+       * 切运行：同时把「看哪个 job 的日志」清掉。
+       *
+       * 不清的话，从 A 的 `unit[java=17]` 切到 B 会带着一个 B 里不存在的 jobId 去请求日志，
+       * Host 只能回 404，用户看到的是「切过去就没日志了」。
+       */
+      const selectRun = useCallback((runId) => {
+        setSelectedRunId(runId || '')
+        setLogJobId('')
+      }, [])
+
+      // 深链 `#/projects/p/runs/<id>` 打开的就是那一次运行，偷偷换成别的正是「刷新丢视图」的老毛病；
+      // 列表还没就绪时更不能回落，否则深链会在首帧被清掉。
       useEffect(() => {
-        if (selectedRunId && runs.items.some((run) => run.id === selectedRunId)) return
+        if (selectedRunId) return
         const first = runs.items[0]
-        setSelectedRunId(first ? first.id : '')
+        if (first) setSelectedRunId(first.id)
       }, [runs.items, selectedRunId])
 
-      useEffect(() => { void loadLog(selectedRunId, false) }, [selectedRunId, loadLog])
+      useEffect(() => {
+        void loadLog(selectedRunId, false, logJobId)
+      }, [selectedRunId, logJobId, loadLog])
 
       const selectedRun = runs.items.find((run) => run.id === selectedRunId) || null
       const isRunning = runs.items.some((run) => run.status === 'running' || run.status === 'queued')
@@ -1579,10 +1919,10 @@ window.__ModuleLoader__.load({
         if (view !== 'run' || !projectId || !isRunning) return undefined
         const timer = setInterval(() => {
           void loadRuns(projectId, true)
-          if (selectedRunId) void loadLog(selectedRunId, true)
+          if (selectedRunId) void loadLog(selectedRunId, true, logJobId)
         }, POLL_MS)
         return () => clearInterval(timer)
-      }, [view, projectId, isRunning, selectedRunId, loadRuns, loadLog])
+      }, [view, projectId, isRunning, selectedRunId, logJobId, loadRuns, loadLog])
 
       const clearArmed = useCallback(() => {
         if (armTimer.current) {
@@ -1635,11 +1975,19 @@ window.__ModuleLoader__.load({
             error: null,
           })
           if (run && run.id) {
-            setRunDetail({ id: run.id, stages: Array.isArray(run.stages) ? run.stages : [], canary: run.canary || null })
+            setRunDetail({
+              id: run.id,
+              stages: Array.isArray(run.stages) ? run.stages : [],
+              canary: run.canary || null,
+              // v3.0-P1：v2 的 pipe 才有 job 图（v1 是 null），保留下来给时间线分层。
+              jobs: run.jobs || null,
+            })
             setSelectedRunId(run.id)
+            // 新的一次运行从头看合并时间线：上一条运行选的 job 在这里根本不存在。
+            setLogJobId('')
           }
           await loadRuns(projectId, true)
-          if (run && run.id) await loadLog(run.id, false)
+          if (run && run.id) await loadLog(run.id, false, '')
         } catch (error) {
           if (error && error.name === 'AbortError') return
           // 生产护栏：Host 拒绝并要求二次确认时把受影响主机摆出来，等用户点「确认发布到生产」。
@@ -1824,57 +2172,99 @@ window.__ModuleLoader__.load({
         if (view === 'runners') void loadRunners()
       }, [clearArmed, clearRollback, loadProjects, loadTargets, loadRuns, loadReleases, projectId, targetName, view, loadAudit, auditLimit, loadApprovals, loadRbac, loadSecrets, loadRunners])
 
-      const toggleReleases = useCallback(() => {
+      /**
+       * v3.0-P0：进入各视图时按需拉自己的数据。
+       * 以前只有 `refreshAll` 会按 view 分派，直接打开「审批」视图（尤其是深链
+       * `#/projects/p/approvals`）看到的是空表，必须手动点一次刷新才有内容。
+       */
+      useEffect(() => {
+        if (view === 'approvals') void loadApprovals()
+        if (view === 'rbac') void loadRbac()
+        if (view === 'secrets') void loadSecrets(projectId)
+        if (view === 'runners') void loadRunners()
+      }, [view, projectId, loadApprovals, loadRbac, loadSecrets, loadRunners])
+
+      /**
+       * v3.0-P0：切视图只有一个入口。
+       * 以前八个 `toggleXxx` 各自 `setView`，视图和 URL 没有任何关系，所以刷新必丢、也无法分享；
+       * 现在统一走 `goView`，URL 由一个同步 effect 从这三个状态（项目/视图/选中运行）推出来。
+       */
+      const goView = useCallback((next) => {
         clearRollback()
-        setView((current) => {
-          const next = current === 'releases' ? 'run' : 'releases'
-          if (next === 'releases' && targetName) void loadReleases(targetName)
-          if (next === 'run' && projectId) void loadRuns(projectId, false)
-          return next
-        })
+        const target = ROUTE_VIEWS.indexOf(next) >= 0 ? next : 'run'
+        setView(target)
+        if (target === 'releases' && targetName) void loadReleases(targetName)
+        if (target === 'run' && projectId) void loadRuns(projectId, false)
       }, [clearRollback, targetName, projectId, loadReleases, loadRuns])
 
-      /** v0.6 C：审计视图开关（与「发布」同级，互斥）。 */
-      const toggleAudit = useCallback(() => {
-        clearRollback()
-        setView((current) => (current === 'audit' ? 'run' : 'audit'))
-      }, [clearRollback])
-
-      /** v2-M0：编辑器视图开关（与「发布」「审计」互斥）。 */
-      const toggleEditor = useCallback(() => {
-        clearRollback()
-        setView((current) => (current === 'editor' ? 'run' : 'editor'))
-      }, [clearRollback])
-
-      /** v2-M0：新建向导视图开关（与「发布」「审计」「编辑」互斥）。 */
+      /**
+       * 路由稳定后再删掉这层：`toggleCreate` 只服务工具条下拉里的「+ 新建项目…」，
+       * 其余八个整页切换按钮已随左侧导航一起删除（导航点当前项即回到运行，由 `goView` 覆盖）。
+       */
       const toggleCreate = useCallback(() => {
         clearRollback()
         setView((current) => (current === 'create' ? 'run' : 'create'))
       }, [clearRollback])
 
-      /** P1：审批视图开关。 */
-      const toggleApprovals = useCallback(() => {
-        clearRollback()
-        setView((current) => (current === 'approvals' ? 'run' : 'approvals'))
-      }, [clearRollback])
+      /**
+       * hash → state。
+       * 只依赖 `routeHash`：这个 effect 是「外面改了地址」的唯一落点，若把 projectId/view 等
+       * 也放进依赖，它就会反向响应自己写出去的值，陷入「写→读→写」的抖动。
+       */
+      const routeSync = useRef({})
+      routeSync.current = { projectId, view, selectedRunId, targetName, items: projects.items }
+      const deepLink = useRef({
+        runId: bootRoute.current.runId || '',
+        step: bootRoute.current.step || '',
+        line: bootRoute.current.line || '',
+      })
+      const lastRouteHash = useRef(routeHash)
+      useEffect(() => {
+        if (routeHash === lastRouteHash.current) return
+        lastRouteHash.current = routeHash
+        const route = parseHash(routeHash)
+        const current = routeSync.current
+        const known = (id) => current.items.length === 0 || current.items.some((project) => project.id === id)
+        if (route.project && route.project !== current.projectId && known(route.project)) {
+          writeStoredProject(route.project)
+          setProjectId(route.project)
+          setPlan(null)
+          setRunDetail(null)
+          setAction({ status: 'idle', message: '', error: null })
+        }
+        if (route.view !== current.view) setView(route.view)
+        if ((route.runId || '') !== (current.selectedRunId || '')) {
+          setSelectedRunId(route.runId || '')
+          // 深链换了运行，上一条运行选的 job 分片在这里不存在：跟着清掉，别去请求一个必定 404 的名字。
+          setLogJobId('')
+        }
+        if (route.target && route.target !== current.targetName) setTargetName(route.target)
+        deepLink.current = { runId: route.runId || '', step: route.step || '', line: route.line || '' }
+      }, [routeHash])
 
-      /** P1：RBAC 管理视图开关（仅 server 模式有意义，但始终可打开查看用户/审计）。 */
-      const toggleRbac = useCallback(() => {
-        clearRollback()
-        setView((current) => (current === 'rbac' ? 'run' : 'rbac'))
-      }, [clearRollback])
-
-      /** P1：Secrets 管理视图开关。 */
-      const toggleSecrets = useCallback(() => {
-        clearRollback()
-        setView((current) => (current === 'secrets' ? 'run' : 'secrets'))
-      }, [clearRollback])
-
-      /** P1：Runner 管理视图开关。 */
-      const toggleRunners = useCallback(() => {
-        clearRollback()
-        setView((current) => (current === 'runners' ? 'run' : 'runners'))
-      }, [clearRollback])
+      /**
+       * state → hash。
+       * 首次进入用 `replaceState`（打开面板本身不该在历史里多一条），之后切换才 push。
+       * `writeHash` 在值相同时直接返回，所以「读进来的值再写出去」不会产生额外历史项。
+       */
+      const hashSeeded = useRef(false)
+      useEffect(() => {
+        const deep = deepLink.current
+        const sameRun = deep.runId && deep.runId === selectedRunId
+        const next = buildHash({
+          project: projectId,
+          view,
+          runId: selectedRunId,
+          target: targetName,
+          step: sameRun ? deep.step : '',
+          line: sameRun ? deep.line : '',
+        })
+        if (!next) return
+        const replace = !hashSeeded.current
+        writeHash(next, replace)
+        hashSeeded.current = true
+        lastRouteHash.current = readHash()
+      }, [projectId, view, selectedRunId, targetName])
 
       /** v2-M0：进入编辑器时从 /project-meta 拉 pipeSource。 */
       const loadEditor = useCallback(async (id) => {
@@ -2120,60 +2510,6 @@ window.__ModuleLoader__.load({
             disabled: busy || !targetName,
           }, busy ? '运行…中' : armed ? '确认运行' : '运行'),
           h('button', {
-            className: 'cicd-button cicd-view-releases',
-            type: 'button',
-            'aria-pressed': view === 'releases',
-            onClick: toggleReleases,
-          }, view === 'releases' ? '回到运行' : '发布'),
-          h('button', {
-            className: 'cicd-button cicd-view-audit',
-            type: 'button',
-            'aria-pressed': view === 'audit',
-            onClick: toggleAudit,
-          }, view === 'audit' ? '回到运行' : '审计'),
-          h('button', {
-            className: 'cicd-button cicd-view-editor',
-            type: 'button',
-            'aria-pressed': view === 'editor',
-            title: view === 'editor' ? '切回 阶段/Run详情/Releases 三栏' : '打开编辑器修改 pipe.yml（校验 + 保存）',
-            onClick: toggleEditor,
-          }, view === 'editor' ? '返回运行视图' : '编辑 pipe.yml'),
-          h('button', {
-            className: 'cicd-button cicd-view-create',
-            type: 'button',
-            'aria-pressed': view === 'create',
-            title: view === 'create' ? '切回 阶段/Run详情/Releases 三栏' : '创建新项目并登记（本地目录 / Git 仓库 + 脚手架模板）',
-            onClick: toggleCreate,
-          }, view === 'create' ? '返回运行视图' : '新建项目'),
-          h('button', {
-            className: 'cicd-button cicd-view-approvals',
-            type: 'button',
-            'aria-pressed': view === 'approvals',
-            title: view === 'approvals' ? '切回 阶段/Run详情/Releases 三栏' : '审批门：通过/拒绝待审批的部署（prod 默认停在待审批）',
-            onClick: toggleApprovals,
-          }, view === 'approvals' ? '返回运行视图' : '审批'),
-          h('button', {
-            className: 'cicd-button cicd-view-rbac',
-            type: 'button',
-            'aria-pressed': view === 'rbac',
-            title: view === 'rbac' ? '切回 阶段/Run详情/Releases 三栏' : 'RBAC：签发/校验/吊销 token（viewer/operator/admin）+ 审计时间线',
-            onClick: toggleRbac,
-          }, view === 'rbac' ? '返回运行视图' : 'RBAC'),
-          h('button', {
-            className: 'cicd-button cicd-view-secrets',
-            type: 'button',
-            'aria-pressed': view === 'secrets',
-            title: view === 'secrets' ? '切回 阶段/Run详情/Releases 三栏' : 'Secrets：列出/设置项目 secret（载荷落 workDir/.secrets.json 0600）',
-            onClick: toggleSecrets,
-          }, view === 'secrets' ? '返回运行视图' : 'Secrets'),
-          h('button', {
-            className: 'cicd-button cicd-view-runners',
-            type: 'button',
-            'aria-pressed': view === 'runners',
-            title: view === 'runners' ? '切回 阶段/Run详情/Releases 三栏' : '构建主机：列出已注册 runner（拉取式协议 + journal 幂等）',
-            onClick: toggleRunners,
-          }, view === 'runners' ? '返回运行视图' : 'Runner'),
-          h('button', {
             className: 'cicd-button cicd-notify-test' + (notifyArmed ? ' cicd-button-armed' : ''),
             type: 'button',
             'aria-pressed': notifyArmed,
@@ -2282,12 +2618,18 @@ window.__ModuleLoader__.load({
             runs: { ...runs, retry: () => void loadRuns(projectId, false) },
             onRefreshRuns: () => void loadRuns(projectId, false),
             selectedRunId,
-            onSelectRun: setSelectedRunId,
+            onSelectRun: selectRun,
             run: selectedRun,
             stages: runDetail && selectedRun && runDetail.id === selectedRun.id ? runDetail.stages : (selectedRun && Array.isArray(selectedRun.stages) ? selectedRun.stages : []),
             canary: runDetail && selectedRun && runDetail.id === selectedRun.id ? runDetail.canary : null,
+            // v3.0-P1：job 图只在跑完/刚发起的那次运行里有；历史运行退回 /log 的分片清单。
+            jobs: runDetail && selectedRun && runDetail.id === selectedRun.id ? runDetail.jobs : null,
             logState: log,
-            onReloadLog: () => void loadLog(selectedRunId, false),
+            logJobId,
+            onSelectJob: (jobId) => setLogJobId(String(jobId || '')),
+            onReloadLog: () => void loadLog(selectedRunId, false, logJobId),
+            // v3.0-P0：深链 `?line=` 只在「深链指定的那一次运行」上生效，切到别的运行就不再高亮。
+            highlightLine: deepLink.current.runId && deepLink.current.runId === selectedRunId ? deepLink.current.line : '',
           }),
           h(ReleasesColumn, {
             state: releases,
@@ -2298,11 +2640,112 @@ window.__ModuleLoader__.load({
             busy,
           }))
 
-      return h('div', { className: 'cicd-page', 'data-dsh-cicd-page': '' },
+      /**
+       * v3.0-P0：左侧视图导航。
+       * 原来八个「整页切换」按钮和项目/目标/主机/运行挤在同一条工具条里，权重完全一样，
+       * 用户既看不出「哪些是我的操作、哪些是去别的页面」，也不知道自己现在在哪。
+       * 现在把「去哪」收进左侧固定栏（aria-current 标当前位置），工具条只留「对当前项目做什么」。
+       */
+      const pendingApprovals = approvals.items.filter((item) => item.status === 'pending').length
+      const navSections = [
+        {
+          title: '流水线',
+          entries: [
+            { view: 'run', label: '运行', hint: '阶段 / 运行历史 / 发布三栏' },
+            { view: 'releases', label: '发布', hint: '当前目标的发布记录与回滚' },
+            { view: 'approvals', label: '审批', hint: '待审批的 prod 部署', badge: pendingApprovals },
+          ],
+        },
+        {
+          title: '配置',
+          entries: [
+            { view: 'editor', label: 'pipe.yml', hint: '在线编辑并校验流水线定义' },
+            { view: 'create', label: '新建项目', hint: '登记本地目录或 Git 仓库' },
+          ],
+        },
+        {
+          title: '管理',
+          entries: [
+            { view: 'runners', label: '构建主机', hint: '已注册的 runner 与吊销' },
+            { view: 'secrets', label: 'Secrets', hint: '项目级密钥（不回流明文）' },
+            { view: 'rbac', label: 'RBAC', hint: 'token 与审计时间线' },
+            { view: 'audit', label: '审计', hint: '操作记录与哈希链校验' },
+          ],
+        },
+      ]
+
+      const nav = h('nav', { className: 'cicd-nav', 'aria-label': '流水线视图' },
+        ...navSections.map((section, index) => [
+          index > 0 ? h('div', { className: 'cicd-nav-sep', key: 'sep-' + section.title }) : null,
+          h('div', { className: 'cicd-nav-title', key: 'title-' + section.title }, section.title),
+          ...section.entries.map((entry) => h('button', {
+            key: entry.view,
+            className: 'cicd-nav-item cicd-nav-' + entry.view,
+            type: 'button',
+            'aria-current': view === entry.view ? 'page' : undefined,
+            title: entry.hint,
+            onClick: () => goView(entry.view),
+          },
+          h('span', { className: 'cicd-nav-label' }, entry.label),
+          entry.badge ? h('span', { className: 'cicd-nav-badge' }, String(entry.badge)) : null)),
+        ]))
+
+      /**
+       * 面包屑 + 复制链接。
+       * 深链只有在「能看见自己在哪、能把当前地址发给别人」时才算真的可用；
+       * 这两件事以前都没有，用户只能靠截图描述自己在哪个页面。
+       */
+      const currentProject = projects.items.find((project) => project.id === projectId) || null
+      const viewEntry = navSections
+        .reduce((all, section) => all.concat(section.entries), [])
+        .find((entry) => entry.view === view)
+      const routeTrail = [
+        h('button', {
+          key: 'project',
+          className: 'cicd-route-link',
+          type: 'button',
+          onClick: () => goView('run'),
+          title: '回到运行视图',
+        }, currentProject ? (currentProject.name || currentProject.id) : '未选择项目'),
+        h('span', { key: 'sep', 'aria-hidden': 'true' }, '›'),
+        h('span', { key: 'view' }, viewEntry ? viewEntry.label : '运行'),
+        view === 'run' && selectedRunId
+          ? h('span', { key: 'run' }, '› ', h('span', { className: 'cicd-mono' }, selectedRunId))
+          : null,
+      ]
+      const routeBar = h('div', { className: 'cicd-route' },
+        routeTrail,
+        h('span', { style: { flex: '1 1 auto' } }),
+        h('button', {
+          className: 'cicd-button cicd-route-copy',
+          type: 'button',
+          title: '把当前视图的地址复制到剪贴板',
+          onClick: () => {
+            const hash = buildHash({ project: projectId, view, runId: selectedRunId, target: targetName })
+            const link = (typeof window !== 'undefined' && window.location ? window.location.href.split('#')[0] : '') + hash
+            const done = () => setAction({ status: 'ok', message: '链接已复制：' + link, error: null })
+            const fail = () => setAction({ status: 'error', message: '复制失败，请手动复制地址栏', error: null })
+            try {
+              if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(link).then(done, fail)
+                return
+              }
+            } catch (error) {
+              // 非安全上下文没有 clipboard，退回到提示用户手动复制
+            }
+            fail()
+          },
+        }, '复制链接'))
+
+      const main = h('div', { className: 'cicd-main' },
+        routeBar,
         toolbar,
         actionBar,
         prodGuardBar,
-        body,
+        body)
+
+      return h('div', { className: 'cicd-page', 'data-dsh-cicd-page': '' },
+        h('div', { className: 'cicd-shell' }, nav, main),
         h('div', { className: 'cicd-footer' },
           '数据来自 Host 的 /api/plugins/cicd/*；命令在 Host 本机执行，部署经 dsh-remote 的 SSH 通道送达目标机。'))
     }

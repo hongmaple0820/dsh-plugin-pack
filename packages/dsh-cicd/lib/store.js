@@ -3,14 +3,14 @@
  * 表：runs / steps / artifacts / releases / operations；日志仍按 runId 落成文本文件，便于 tail 与下载。
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { DB_FILE_NAME, int, openDatabase, text } from './db.js'
 
 export const DEFAULT_WORK_DIR = join(homedir(), '.dsh-cicd')
 
-const RUN_COLUMNS = ['id', 'project_id', 'pipeline_name', 'trigger', 'branch', 'commit_sha', 'target', 'status', 'dry_run', 'error', 'started_at', 'finished_at', 'updated_at']
+const RUN_COLUMNS = ['id', 'project_id', 'pipeline_name', 'trigger', 'branch', 'commit_sha', 'target', 'status', 'dry_run', 'error', 'started_at', 'finished_at', 'updated_at', 'config_snapshot', 'config_hash']
 
 const PROJECT_COLUMNS = ['id', 'name', 'source_type', 'repo_url', 'default_branch', 'path', 'pipe_path', 'created_at', 'updated_at']
 
@@ -58,7 +58,18 @@ function runRow(run = {}) {
     started_at: text(run.started_at ?? run.startedAt),
     finished_at: text(run.finished_at ?? run.finishedAt),
     updated_at: new Date().toISOString(),
+    // v8：配置快照。重跑/重试只用它，不重新读仓库 —— 否则「那次失败跑的到底是哪版 pipe.yml」说不清。
+    config_snapshot: text(run.config_snapshot ?? run.configSnapshot),
+    config_hash: text(run.config_hash ?? run.configHash),
   }
+}
+
+/** 取文本末尾 tail 行；tail<=0 表示整份返回。两个读日志入口共用，避免两处切行逻辑漂移。 */
+function sliceTail(content, tail = 0) {
+  if (!tail || tail <= 0) return content
+  const lines = content.split('\n')
+  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
+  return lines.slice(-tail).join('\n')
 }
 
 export function createStore({ dir = DEFAULT_WORK_DIR, file = '' } = {}) {
@@ -74,21 +85,22 @@ export function createStore({ dir = DEFAULT_WORK_DIR, file = '' } = {}) {
       ON CONFLICT(id) DO UPDATE SET ${RUN_COLUMNS.filter((column) => column !== 'id').map((column) => `${column} = excluded.${column}`).join(', ')}`),
     selectRuns: db.prepare('SELECT * FROM runs WHERE (? = \'\' OR project_id = ?) ORDER BY started_at DESC LIMIT ?'),
     selectRun: db.prepare('SELECT * FROM runs WHERE id = ?'),
-    upsertStep: db.prepare(`INSERT INTO steps (run_id, stage_id, idx, name, command, status, exit_code, duration_ms, attempts, timeout_s, log_path, started_at, finished_at, runner_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(run_id, stage_id, idx) DO UPDATE SET name = excluded.name, command = excluded.command, status = excluded.status,
+    upsertStep: db.prepare(`INSERT INTO steps (run_id, stage_id, job_id, idx, name, command, status, exit_code, duration_ms, attempts, timeout_s, log_path, started_at, finished_at, runner_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(run_id, stage_id, job_id, idx) DO UPDATE SET name = excluded.name, command = excluded.command, status = excluded.status,
         exit_code = excluded.exit_code, duration_ms = excluded.duration_ms, attempts = excluded.attempts, timeout_s = excluded.timeout_s,
         log_path = excluded.log_path, started_at = excluded.started_at, finished_at = excluded.finished_at,
         runner_id = excluded.runner_id`),
-    selectSteps: db.prepare('SELECT * FROM steps WHERE run_id = ? ORDER BY started_at ASC, idx ASC'),
+    selectSteps: db.prepare('SELECT * FROM steps WHERE run_id = ? ORDER BY started_at ASC, job_id ASC, idx ASC'),
     insertArtifact: db.prepare('INSERT INTO artifacts (run_id, path, bytes, sha256, created_at) VALUES (?, ?, ?, ?, ?)'),
     selectArtifacts: db.prepare('SELECT * FROM artifacts WHERE run_id = ? ORDER BY id ASC'),
-    upsertRelease: db.prepare(`INSERT INTO releases (id, project_id, target, host, env, run_id, commit_sha, status, created_at, activated_at, deactivated_at, manifest_path, revisions_offset, previous, artifact_sha256)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    upsertRelease: db.prepare(`INSERT INTO releases (id, project_id, target, host, env, run_id, commit_sha, status, created_at, activated_at, deactivated_at, manifest_path, revisions_offset, previous, artifact_sha256, artifact_digest, mode, strategy, instances, operator)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET project_id = excluded.project_id, target = excluded.target, host = excluded.host, env = excluded.env, run_id = excluded.run_id,
         commit_sha = excluded.commit_sha, status = excluded.status, created_at = excluded.created_at, activated_at = excluded.activated_at,
         deactivated_at = excluded.deactivated_at, manifest_path = excluded.manifest_path, revisions_offset = excluded.revisions_offset,
-        previous = excluded.previous, artifact_sha256 = excluded.artifact_sha256`),
+        previous = excluded.previous, artifact_sha256 = excluded.artifact_sha256, artifact_digest = excluded.artifact_digest,
+        mode = excluded.mode, strategy = excluded.strategy, instances = excluded.instances, operator = excluded.operator`),
     selectReleases: db.prepare("SELECT * FROM releases WHERE (? = '' OR target = ?) AND (? = '' OR host = ?) AND (? = '' OR env = ?) ORDER BY created_at DESC LIMIT ?"),
     selectRelease: db.prepare('SELECT * FROM releases WHERE id = ?'),
     selectActive: db.prepare(`SELECT * FROM releases WHERE status = 'active' AND (? = '' OR target = ?) AND (? = '' OR host = ?)
@@ -109,7 +121,27 @@ export function createStore({ dir = DEFAULT_WORK_DIR, file = '' } = {}) {
   }
 
   const runOut = (row) => ({ ...row, dry_run: int(row.dry_run, 0), commit: text(row.commit_sha) })
-  const releaseOut = (row) => (row ? { ...row, commit: text(row.commit_sha) } : null)
+  const releaseOut = (row) => {
+    if (!row) return null
+    let instances = []
+    // v9：instances 是 JSON 字符串。坏数据不该让整个列表接口 500 —— 一条 release 的实例
+    // 清单读不出来时，用户仍然应该能看到「这次发布发生过」，只是看不到端口明细。
+    if (typeof row.instances === 'string' && row.instances.trim()) {
+      try {
+        const parsed = JSON.parse(row.instances)
+        if (Array.isArray(parsed)) instances = parsed
+      } catch { instances = [] }
+    } else if (Array.isArray(row.instances)) {
+      instances = row.instances
+    }
+    return {
+      ...row,
+      commit: text(row.commit_sha),
+      instances,
+      artifactDigest: text(row.artifact_digest),
+      artifact_digest: text(row.artifact_digest),
+    }
+  }
 
   // 老版本写的是 runs.jsonl：首次打开时把历史事件导入 SQLite，然后改名留档，之后只写数据库
   const legacyFile = join(root, 'runs.jsonl')
@@ -139,6 +171,9 @@ export function createStore({ dir = DEFAULT_WORK_DIR, file = '' } = {}) {
     dir: root,
     dbFile,
     logsDir,
+    // v3.0-P0：审计 / 部署锁 / 身份三个子模块共用同一个 DatabaseSync 句柄（各自 prepare 自己的语句），
+    // 避免把身份与审计逻辑塞进这个只关心运行记录的模块。
+    db,
 
     appendRun(run = {}) {
       guard()
@@ -152,6 +187,7 @@ export function createStore({ dir = DEFAULT_WORK_DIR, file = '' } = {}) {
       statements.upsertStep.run(
         text(step.run_id ?? step.runId),
         text(step.stage_id ?? step.stageId),
+        text(step.job_id ?? step.jobId),
         int(step.idx, 0),
         text(step.name),
         text(step.command),
@@ -198,6 +234,15 @@ export function createStore({ dir = DEFAULT_WORK_DIR, file = '' } = {}) {
         int(release.revisions_offset ?? release.revisionsOffset, 0),
         text(release.previous),
         text(release.artifact_sha256 ?? release.artifactSha256),
+        text(release.artifact_digest ?? release.artifactDigest),
+        text(release.mode),
+        text(release.strategy),
+        // instances 存 JSON 字符串而不是另开一张表：一份 release 行的实例清单永远是「那一刻的快照」，
+        // 它不该跟着别的 release 一起变，也不需要按端口查询。真要做「按实例查历史」时再加派生索引。
+        typeof release.instances === 'string'
+          ? release.instances
+          : JSON.stringify(Array.isArray(release.instances) ? release.instances : []),
+        text(release.operator),
       )
       return release
     },
@@ -299,14 +344,44 @@ export function createStore({ dir = DEFAULT_WORK_DIR, file = '' } = {}) {
       return join(logsDir, `${runId}.log`)
     },
 
+    /**
+     * v3.0-P1：单个 job 的日志文件（`logs/<runId>/<jobId>.log`）。
+     * 主日志是一条按时间合并的时间线，并行 job 全写进去必然交错；分开存一份，
+     * 「这个 job 到底输出了什么」才能按 job 读，而不是靠人眼在大杂烩里挑。
+     * jobId 里的 `[`、`]`、`=`、`,` 会被替换掉：它们是 matrix 实例名的一部分，但在 Windows 上是非法文件名字符。
+     */
+    jobLogPath(runId, jobId) {
+      if (!/^[A-Za-z0-9_-]+$/.test(String(runId))) throw new Error('runId 不合法')
+      const safe = String(jobId).replace(/[^A-Za-z0-9_.-]+/g, '_')
+      if (!safe) throw new Error('jobId 不合法')
+      return join(logsDir, String(runId), `${safe}.log`)
+    },
+
+    readJobLog(runId, jobId, { tail = 0 } = {}) {
+      const file = this.jobLogPath(runId, jobId)
+      if (!existsSync(file)) return ''
+      return sliceTail(readFileSync(file, 'utf8'), tail)
+    },
+
+    /** 这次运行里所有有独立日志的 job（按文件名排序，便于稳定展示）。 */
+    jobLogs(runId) {
+      if (!/^[A-Za-z0-9_-]+$/.test(String(runId))) return []
+      const dir = join(logsDir, String(runId))
+      if (!existsSync(dir)) return []
+      return readdirSync(dir)
+        .filter((name) => name.endsWith('.log'))
+        .sort()
+        .map((name) => {
+          const file = join(dir, name)
+          const stat = statSync(file)
+          return { jobId: name.slice(0, -4), bytes: stat.size, updatedAt: stat.mtime.toISOString() }
+        })
+    },
+
     readLog(runId, { tail = 0 } = {}) {
       const file = this.logPath(runId)
       if (!existsSync(file)) return ''
-      const content = readFileSync(file, 'utf8')
-      if (!tail || tail <= 0) return content
-      const lines = content.split('\n')
-      if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
-      return lines.slice(-tail).join('\n')
+      return sliceTail(readFileSync(file, 'utf8'), tail)
     },
 
     stats() {

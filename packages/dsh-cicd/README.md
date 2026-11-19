@@ -25,15 +25,19 @@
 | v2.0-M3 | Five deploy strategies (serial / parallel / rolling / canary / blue-green) + strategy lock; `target.strategy` in `pipe.yml`, batch progress resumable |
 | v2.0-M4 | Environments (dev < staging < prod + protected / approval flags), approval gate (prod stops at "pending approval"), secrets (DB stores ref only, payload in `workDir/.secrets.json` 0600, auto-injected into `${{SECRET_NAME}}`) |
 | v2.0-M5 | RBAC for server mode: 3 roles (viewer / operator / admin) + project scope + short-TTL tokens, full audit |
+| **v3.0-P0** | **Security baseline**: local accounts + sessions + API tokens (`lib/auth.js`), `can()` policy with default-deny (`lib/policy.js`), deploy locks persisted in SQLite (`lib/locks.js`), hash-chained audit log (`lib/audit.js`), runner registry with revoke (`lib/runners.js`), approval bound to artifact digest + TTL + no self-approval; UI gets hash routing, left nav, breadcrumb and deep links. DSL unchanged. |
+| **v3.0-P1** | **Execution core**: DSL v2 (`stages[].jobs[]` + `needs` + `matrix`) normalised into a job graph (`lib/model.js`), executed as a topological DAG with a concurrency pool (default 4, `jobs.concurrency`) by `lib/jobs.js`, a sandboxed expression evaluator that never calls `eval` (`lib/expr.js`), T0/T1/T2 evaluation tiers, per-job log shards, and a `pipe.yml` snapshot + sha256 stored on every run. v1 `pipe.yml` files keep working untouched. |
+| **v3.0-P5** | **Artifact CAS**: bytes live in a content-addressed store (`<workDir>/artifacts/blobs/sha256/<aa>/<hex>`), written through a temp file and committed with an atomic `rename`, so a half-written blob can never appear. Every upload re-hashes the bytes and rejects a mismatched declared digest (one flipped byte is a `409`, not a silent success). `GET /artifacts?digest=…` serves single-range requests with `content-digest` / `ETag` / immutable caching; `POST action=tag` moves a pointer without copying bytes; `gc` refuses to delete anything a tag or a release still references and defaults to dry-run. Metadata lands in SQLite (`artifact_blobs`, `artifact_refs`, schema v10); the bytes never do. Upload takes a **local path** only — the build artifact is already on the build host, and opening HTTP writes would widen the auth surface from same-origin to publicly writable. |
+| **v3.0-P2** | **Toolchains & actions**: `toolchain:` declares vendor+version only (never a URL) and the installer resolves → downloads → checksums → extracts into its own store, then injects a **whitelisted** env into the child process (the host's `JAVA_HOME` / `NODE_OPTIONS` never leak in, and the host itself is never modified). Lock file + `frozen` + offline mode, Maven `toolchains.xml` and Gradle `installations.paths` so the daemon uses the same JDK. `uses:` executes seven built-in actions (checkout / toolchain / cache / collect / deploy / verify / notify) — **no external actions**, and an unknown action or unknown `with` key is a hard failure, not a silent skip. |
 
 ### Layout
 
 | File | Responsibility |
 | --- | --- |
-| `index.js` | Host entry: 20 tools + 28 exact GET routes + 1 prefix route (webhook) + 1 WebSocket upgrade (live logs); assembles the runtime |
-| `lib/pipe.js` | YAML-subset parser, `${{VAR}}` interpolation, restricted `when` expressions, glob, stage-DAG planning, `triggers` normalisation |
-| `lib/runner.js` | Local executor: runs steps stage by stage, writes logs & run records; supports external `runId`, `AbortSignal` cancel, live-log hub |
-| `lib/db.js` | SQLite open / DDL / migration: runs, steps, artifacts, releases, operations, projects + indexes; `PRAGMA user_version` tracks schema (v5, adds `steps.runner_id`) |
+| `index.js` | Host entry: 27 tools + 34 exact GET routes + 1 prefix route (webhook) + 1 WebSocket upgrade (live logs); assembles the runtime |
+| `lib/pipe.js` | YAML-subset parser (v1 and v2), `${{VAR}}` interpolation, restricted `when` expressions, glob, `buildStep()` normalisation shared by the plan and the DAG runner, `triggers` normalisation |
+| `lib/runner.js` | Executor with two paths sharing one step implementation: v1 walks stages sequentially, v2 (`stages[].jobs[]`) runs the job DAG through `lib/jobs.js`. Writes the merged log plus one shard per job, redacts secrets before every sink, supports external `runId`, `AbortSignal` cancel, live-log hub |
+| `lib/db.js` | SQLite open / DDL / migration: runs, steps, artifacts, releases, operations, projects, deploy_locks, audit_events, users, memberships, api_tokens, sessions, approvals, runners, artifact_blobs, artifact_refs + indexes; `PRAGMA user_version` tracks schema (**v10**: v9 added release rollback columns, v10 added the two artifact tables; **v8**: v7 added `steps.job_id` to the primary key, v8 added `runs.config_snapshot` / `config_hash`; both migrate existing databases in place) |
 | `lib/store.js` | SQLite storage layer (`cicd.db`, WAL); same API as the old JSONL version; first open imports legacy `runs.jsonl` and renames it `runs.jsonl.migrated` |
 | `lib/remote.js` | dsh-remote loopback HTTP client: exec + chunked upload |
 | `lib/deploy.js` | releases / current symlink deploys, multi-host fan-out, canary batches, runtime-preset restart, health check, auto rollback |
@@ -51,7 +55,18 @@
 | `lib/environments.js` | Environment promotion: dev / staging / prod order + protected / approval flags + promotion path |
 | `lib/approval.js` | Approval (block-gate) state machine: request / resolve / isPending / list; prod stops at "pending approval" by default |
 | `lib/secrets.js` | Secret store: DB keeps the ref only, payload in `workDir/.secrets.json` (0600); `refsForInterpolate` injection |
-| `lib/rbac.js` | RBAC (server mode): 3 roles + project scope + short-TTL tokens, audit timeline; payload in `workDir/.rbac.json` (0600) |
+| `lib/rbac.js` | Legacy file-backed RBAC (server mode, v2.0-M5): 3 roles + project scope + short-TTL tokens; payload in `workDir/.rbac.json` (0600). **Superseded by `lib/auth.js` + `lib/policy.js` in v3.0-P0** — it no longer participates in any decision, `/rbac` is kept for reading old tokens only |
+| `lib/auth.js` | v3.0-P0 identity: local accounts (scrypt, pure JS — no native build), DB-backed sessions (HttpOnly cookie) and API tokens (`cicd_<id>_<secret>`, sha256 only, TTL + revoke), project-scoped memberships. **Bootstrap**: while the `users` table is empty every request is `owner`, so a fresh install is never locked out |
+| `lib/policy.js` | v3.0-P0 authorisation: `can(actor, action, resource) → {allow, reason, policyId}`, 17 actions × 4 roles (viewer / operator / admin / owner), **default deny**, never throws |
+| `lib/audit.js` | v3.0-P0 audit: append-only `audit_events` with a sha256 hash chain (`prev_hash` + canonical record); `verify()` walks the chain and reports the first broken row (`kind: prev_hash | hash`) |
+| `lib/locks.js` | v3.0-P0 deploy locks: `deploy_locks` table (survives restarts), TTL + heartbeat, `release` requires matching runId/owner (no unconditional release), `forceRelease` is audited |
+| `lib/runners.js` | v3.0-P0 runner registry: DB-backed, online is derived (3 × heartbeat), revoke is persistent and immediate (a revoked runner never resurrects on re-register) |
+| `lib/expr.js` | v3.0-P1 expression evaluator: hand-written lexer + recursive-descent parser, **no `eval` / `new Function`** (a `pipe.yml` is whatever a pull request says it is — a real JS evaluator would hand arbitrary code execution on the build host to anyone who can submit one). T0/T1/T2 root whitelists and a fixed function list |
+| `lib/model.js` | v3.0-P1 model normalisation: v1 stages become `<stage>-main` jobs (each `deploy` step becomes its own `kind:'deploy'` job), v2 `stages[].jobs[]` expands as written, `matrix` expands to `job[key=value,...]` (64 instances / 3 dimensions max), `resolveJobGraph()` accepts job id / matrix base name / stage id in `needs` and rewrites them to real ids |
+| `lib/jobs.js` | v3.0-P1 DAG scheduler: `scheduleJobs({jobs, concurrency, signal, runJob, onSkip})` runs ready jobs through a pool, propagates failure **and** skip downstream (skipped upstream is not "green"), and honours `allow_failure` |
+| `lib/toolchain.js` | v3.0-P2 toolchains: `parseSpec` / `pickVersion` / providers (Adoptium, Maven, Gradle, Node, Go; PHP has no portable build), `mkdir` cross-process lock + in-process inflight reuse, checksum by algorithm (Maven publishes sha512, Node publishes sha256), `envFor()` whitelist, `assertVersions()`. **A `pipe.yml` may only say `vendor+version`** — a URL there would let anyone who can submit a PR execute an arbitrary binary on the build host |
+| `lib/actions.js` | v3.0-P2 `uses:` actions: seven built-ins, each declaring the capability it needs; unknown action / unknown `with` key / missing capability are all hard failures. There is deliberately no way to reference an external action |
+| `lib/cache.js` | v3.0-P2 build cache: `<workDir>/cache/entries/<sha256(project,key)>/{meta.json,files/}`, exact key then `restore_keys` prefix match, atomic staging + rename. `paths` must be relative to the project or start with `~/` — an absolute path is rejected (otherwise `paths: ["/etc"]` packs the whole host) |
 | `bin/runner.mjs` | Single-file remote runner CLI: pull protocol + journal idempotency + self-signed TLS (optional undici) |
 
 ### Configuration
@@ -242,11 +257,11 @@ Three new tools (`cicd_cancel` / `cicd_dora` / `cicd_triggers`) and four routes 
 
 ### Tools
 
-`cicd_projects` / `cicd_project_meta` / `cicd_project_create` / `cicd_validate` / `cicd_pipe_save` / `cicd_plan` / `cicd_run` (`dryRun`, `stage`, `confirm`, `runner`) / `cicd_status` / `cicd_logs` / `cicd_releases` (filter by `host`) / `cicd_rollback` (optional `host`) / `cicd_targets` (runtime/app/onHostFailure/keep/restartCommand + per-host active) / `cicd_cancel` (`runId`) / `cicd_dora` (`project`, `days`) / `cicd_triggers` (`project`, returns the triggers summary, webhook URL and scheduler snapshot) / `cicd_runners` (lists registered runners: labels, capacity, online state, active task count) / `cicd_approve` (`runId`, `decision`, `resolvedBy`) / `cicd_secrets` (`project`, `scope`, `name`, `value`) / `cicd_environments` (`project`) / `cicd_rbac` (`user`, `role`, `projects`, `ttlSec`, `token`, `action`).
+`cicd_projects` / `cicd_project_meta` / `cicd_project_create` / `cicd_validate` / `cicd_pipe_save` / `cicd_plan` / `cicd_run` (`dryRun`, `stage`, `confirm`, `runner`, `approvalId`) / `cicd_status` / `cicd_logs` / `cicd_releases` (filter by `host`) / `cicd_rollback` (optional `host`) / `cicd_targets` (runtime/app/onHostFailure/keep/restartCommand + per-host active) / `cicd_cancel` (`runId`) / `cicd_dora` (`project`, `days`) / `cicd_triggers` (`project`, returns the triggers summary, webhook URL and scheduler snapshot) / `cicd_runners` (list + `action=revoke`; labels, capacity, online state, revoked state, active task count) / `cicd_approve` (`approvalId` or `runId`, `decision`, `reason`, `resolvedBy`) / `cicd_secrets` (`project`, `scope`, `name`, `value`) / `cicd_environments` (`project`) / `cicd_rbac` (`user`, `role`, `projects`, `ttlSec`, `token`, `action` — legacy) / **`cicd_auth`** (`action=me|login|logout`) / **`cicd_users`** (`action=list|create|get|set-password|set-role|remove-role`) / **`cicd_tokens`** (`action=list|create|revoke`) / **`cicd_audit`** (`action=list|verify`) / **`cicd_locks`** (`action=list|release`).
 
 ### HTTP routes (GET + resource, plus 1 prefix and 1 upgrade)
 
-`/api/plugins/cicd/{projects,project-meta,project-create,validate,pipe-save,plan,run,runs,log,releases,rollback,targets,operations,notify-test,cancel,dora,triggers,runner-register,runner-poll,runner-result,runner-log,runners,approve,approvals,secrets,environments,rbac}` — 28 exact routes; `run` takes an optional `runner` param to pick the build host; the five `runner-*` routes are the remote-runner pull protocol (register carries the join token, poll doubles as heartbeat, result is idempotent, log pushes line by line) and **do not check same-origin** (cross-machine calls), authenticated by the join token; `runners` requires same-origin. Two special entries: the prefix route `/hooks/<project>` (inbound webhook, token-authenticated, no same-origin check) and the upgrade `/log-ws?runId=` (live logs).
+`/api/plugins/cicd/{projects,project-meta,project-create,validate,pipe-save,plan,run,runs,log,releases,rollback,targets,operations,notify-test,cancel,dora,triggers,runner-register,runner-poll,runner-result,runner-log,runners,approve,approvals,secrets,environments,rbac,auth,users,tokens,audit,locks,toolchain}` — 33 exact routes; `run` takes an optional `runner` param to pick the build host and an optional `approvalId` to consume an approved request; the five `runner-*` routes are the remote-runner pull protocol (register carries the join token, poll doubles as heartbeat, result is idempotent, log pushes line by line) and **do not check same-origin** (cross-machine calls), authenticated by the join token; `runners` requires same-origin. Two special entries: the prefix route `/hooks/<project>` (inbound webhook, token-authenticated, no same-origin check) and the upgrade `/log-ws?runId=` (live logs).
 
 ### Remote runner (v2.0-M2)
 
@@ -296,7 +311,7 @@ targets:
 - **Approval gate (block gate)**: an `approvalRequired` target stops at "pending approval" in `executeRun` and raises `APPROVAL_REQUIRED` (HTTP 409). The panel / `cicd_approve` "Approve" (`decision=approve`) re-runs `executeRun`; on approval → `approval-resolved` audit → the `confirm=prod` guard still applies (double confirmation). Reject → `approval-rejected`.
 - **secrets**: the `cicd_secrets` tool / `/secrets` route sets and lists secrets; the DB stores refs only, payloads land in `workDir/.secrets.json` (0600, atomic write); `${{SECRET_NAME}}` interpolation in `pipe.yml` is auto-injected via `refsForInterpolate`, never written in plaintext to logs or the DB.
 - **Promotion path**: the `cicd_environments` tool / `/environments` route lists environments + `promotionPath` (dev → staging → prod).
-- **Artifact cache**: not implemented this round (`lib/cache.js` deferred); the existing `artifacts` table already records each run's artifacts, and the `keep` cleanup reuses `cleanupReleases` from deploy.js.
+- **Build cache**: `uses: cache` restores before the build and saves in a job-end finaliser (at the point the step runs, `dist/` is still empty — the same reason GitHub has post steps). Exact key first, then `restore_keys` prefix. `paths` must be project-relative or start with `~/`; absolute paths are rejected. The `artifacts` table still records each run's artifacts, and `keep` cleanup reuses `cleanupReleases` from deploy.js. A content-addressed artifact store (immutable digests, dedupe, promotion between environments) is P5, not this.
 
 ### RBAC (v2.0-M5, server mode)
 
@@ -313,7 +328,116 @@ Server mode enables 3-role RBAC (`lib/rbac.js`; single-machine mode has no roles
 - **Audit**: every token issue / revoke / write operation lands in the audit timeline (last 500); `action=audit` exports all (chronological).
 - **Revoke**: `action=revoke&user=alice` immediately invalidates that user's tokens.
 
-### Security boundaries
+### Identity, policy, locks & audit (v3.0-P0)
+
+The v2 line had write routes guarded by nothing but "same-origin + a header + `confirm=1`", an in-process `Map` for deploy locks, an audit timeline capped at 500 entries with no integrity check, and an approval gate that forgot everything on restart. v3.0-P0 closes those four holes without touching the DSL.
+
+**Identities (`lib/auth.js`).** Three credential kinds, checked in this order: API token → session cookie → bootstrap.
+
+- **Accounts are local**: `POST /users?action=create` (or `cicd_users`) with `email` + `password`; hashes are scrypt (`N=2^15, r=8, p=1`, pure JS — no native build, no argon2 dependency). Passwords under 8 chars are rejected.
+- **Sessions**: `/auth?action=login` returns an HttpOnly `dsh_cicd_session` cookie (`SameSite=Strict`) with a 12 h TTL; `/auth?action=logout` clears it. The DB keeps a sha256 digest only.
+- **API tokens**: `/tokens?action=create&userId=…&ttlSec=…` returns `cicd_<id>_<secret>` **once** — only the digest is stored. Send it as `Authorization: Bearer …` or `x-dsh-cicd-token: …`. Expired → `TOKEN_EXPIRED`, revoked → `TOKEN_REVOKED`.
+- **Bootstrap**: while the `users` table is empty every request is treated as `owner`/`authMethod=bootstrap`, so a fresh install is never locked out. Create the first account with `role=owner` — `admin` is not allowed to manage members, so it cannot promote itself afterwards. The moment one user exists, anonymous access stops (`AUTH_REQUIRED`).
+
+**Authorisation (`lib/policy.js`).** Every write route funnels through `can(actor, action, resource)`, which returns `{allow, reason, policyId}` and **defaults to deny**: unknown action, missing actor, disabled actor, token scope violation, missing membership, or an insufficient role all deny. 17 actions × 4 roles:
+
+| Role | Can |
+|---|---|
+| `viewer` | read |
+| `operator` | + run / cancel / retry / deploy-nonprod / rollback-nonprod / approve |
+| `admin` | + edit-config / manage-secret / reveal-secret / deploy-prod / rollback-prod / manage-runner / manage-project / audit-read |
+| `owner` | + manage-members / manage-env |
+
+`prod` (or `protected: true`) additionally requires `admin` for deploy/rollback/env actions, even inside a granted project. Roles are granted per project; nothing is inherited implicitly.
+
+**Deploy locks (`lib/locks.js`).** Locks live in the `deploy_locks` table, so "one deploy per target" now survives a restart. Each lock carries a TTL (default 1800 s) and is heartbeat-refreshed for a third of it while the run is alive, so a crashed host frees the target without manual intervention. `release()` requires the matching runId or owner — an unconditional release would let one run delete another's lock. `forceRelease` is admin-only and audited.
+
+**Audit (`lib/audit.js`).** `audit_events` is append-only, each row carrying `prev_hash` and `hash = sha256(prev_hash + canonical(record))`. `cicd_audit verify` (`/audit?action=verify`) walks the chain and reports the first broken row (`kind: prev_hash` when the link is broken, `kind: hash` when a field was edited in place). Both allow and deny decisions are recorded — a denied write is exactly the signal you want when reviewing an incident.
+
+**Approvals.** Requests are rows, not memory: `approvals` stores the target, the requester, an expiry (default 4 h) and the **artifact digest** the approval is for. Three rules make it safe: the approver cannot be the requester (`SELF_APPROVAL_FORBIDDEN`), the approval is consumed exactly once (`APPROVAL_CONSUMED` on the second use), and the digest must match (`APPROVAL_DIGEST_MISMATCH`). The digest is computed from the deployment's inputs (`project + target + commit + pipeline + stage`) because the artifact does not exist yet when approval is requested; the same commit recomputes the same digest, a different commit does not. Expired requests are reaped lazily: `failed(approval_timeout)` on the run plus `approval.timeout` in the audit.
+
+**Runners.** Registration is a DB row, `online` is derived from `last_seen_at` (offline after 3 × heartbeat), and **revoke is persistent and immediate** — a revoked runner cannot claim tasks, and its late results are dropped.
+
+**UI (P0-6/P0-7).** The panel gained hash routing, so views are addressable and survive a refresh:
+
+```
+#/projects/:project[/runs/:runId | /releases | /approvals | /pipeline | /new | /runners | /secrets | /rbac | /audit][?target=&step=&line=]
+```
+
+Hash (not `history.pushState`) because the panel is mounted inside the host page: rewriting the host path makes the host 404 on refresh, while a fragment keeps the host's route intact and lets the panel restore its own view. The 13 equally-weighted toolbar buttons became a left nav (pipeline / config / admin), the toolbar keeps only project, target, build host, plan, dry run, run, refresh; a breadcrumb shows `project › view › run` with a copy-link button; `?line=1204` highlights and scrolls to that log line.
+
+### DSL v2 execution core (v3.0-P1)
+
+v1 was "one stage = one sequential list of steps": a stage could not fan out, `needs` did not exist, and every step ran one after another even when nothing forced the order. v3.0-P1 adds `stages[].jobs[]` and executes it as a DAG. **v1 files are untouched** — the normaliser turns each v1 stage into a single `<stage>-main` job, so the old behaviour falls out of the new engine instead of being a second code path kept alive by hand.
+
+```yaml
+version: 2
+stages:
+  - id: test
+    jobs:
+      - id: unit
+        matrix: { java: ["17", "21"] }
+        steps:
+          - run: mvn -B verify
+      - id: lint
+        steps:
+          - run: mvn -B spotless:check
+  - id: ship
+    jobs:
+      - id: gate
+        needs: [unit, lint]        # matrix base name expands to both instances
+        steps:
+          - run: echo release
+      - id: deploy
+        needs: [gate]
+        steps:
+          - deploy: { target: prod }
+```
+
+- **Job graph (`lib/model.js`).** A `stage` keeps exactly two jobs: it groups jobs in the UI, and it is the default dependency ("a job without `needs` waits for every job of the previous stage"). The moment any job writes `needs`, ordering belongs to the DAG. `needs` accepts a real job id, a matrix base name (`unit` → every instance), or a stage id / `stage:<id>`; `resolveJobGraph()` rewrites all three to real ids so downstream code never sees a base name. Cycles → `PIPE_CYCLE` with the path (`job 依赖出现环：a → b → a`), unknown ids → `PIPE_UNKNOWN_JOB` with the candidate list.
+- **Matrix.** `matrix: {java: [17, 21]}` becomes `unit[java=17]` / `unit[java=21]` (keys sorted, so instance ids are stable). Hard caps: 64 instances, 3 dimensions, `exclude` for exact-match removal — a 5×4×4 matrix is rejected at parse time (`PIPE_MATRIX_TOO_LARGE`) with the actual count in the message, because the alternative is discovering it after 80 agents light up.
+- **Scheduler (`lib/jobs.js`).** Ready jobs go through a pool (`jobs.concurrency`, default 4, clamped 1–32). Failure propagates **and so does skip**: a job whose upstream was skipped is skipped, not "green" — GitHub semantics, and the reason `blocksDownstream` treats `skipped` as blocking. `allow_failure: true` stops the propagation for that job.
+- **Expressions (`lib/expr.js`).** `when:`, `if:` and `${{ … }}` are evaluated by a hand-written lexer + recursive-descent parser. It deliberately does **not** use `eval` / `new Function`: a `pipe.yml` is whatever a pull request says it is, and a real JS evaluator would hand arbitrary command execution on the build host to anyone who can submit one. `evaluate('process.exit(0)')` returns `PIPE_EXPR`.
+- **Evaluation tiers.** T0 (`event` / `branch` / `tag` / `paths` / `ref`) → T1 (adds `vars` / `matrix` / `needs` / `env` / `project` / `target` / `stage`; this is where the job graph is decided) → T2 (adds `secrets` / `steps` / `outputs`; the only tier that runs while a command is being spawned). Referencing `secrets` in a `when:` is a T1 error with the reason spelled out: *T1 results go into run records and logs, which is exactly where a secret must not end up*. `validateExpressions()` runs the same whitelists at parse time, so an illegal expression fails before a single command runs.
+- **Config snapshot.** Every run stores the raw `pipe.yml` (`runs.config_snapshot`) plus its sha256 (`config_hash`). Re-runs and retries read the snapshot, not the working tree — otherwise "what exactly did last night's failed run execute" has no answer once someone edits the file.
+- **Log shards.** The merged timeline stays (it is what you want when reasoning about ordering), and each job additionally gets `logs/<runId>/<job>.log`. `cicd_logs` / `/log?jobId=` read a shard; brackets and commas in matrix instance ids are replaced with `_` in the filename because `[ ] = ,` are not valid on Windows. The panel's log toolbar gets a "only this job" picker, shown only when there is more than one job (a one-option dropdown is pure noise), and the job layer is rendered between stage and step — otherwise "which of these ran in parallel" is invisible.
+
+**Client.** `timelineRows(stages, jobs)` inserts job rows; a step whose `jobId` matches no job lands in an explicit "（未分组）" block rather than disappearing. `runJobsOf()` prefers the job graph from `/run` (status, duration, needs) and falls back to the shard list from `/log` (id only, status left blank — unknown is rendered as unknown, never as success). Switching runs clears the selected job shard, because a `jobId` from run A does not exist in run B and the host could only answer 404.
+
+### Toolchains & actions (v3.0-P2)
+
+```yaml
+version: 2
+toolchain:
+  java: temurin-17      # vendor + version. Never a URL.
+  maven: "3.9.6"
+stages:
+  - id: build
+    jobs:
+      - id: compile
+        steps:
+          - uses: checkout
+            with: { fetch_depth: 1 }
+          - uses: cache
+            with:
+              key: m2-${{ vars.JAVA }}
+              paths: [ "~/.m2/repository" ]
+          - run: mvn -B -DskipTests package
+          - uses: collect
+            with: { paths: [ "target/*.jar" ], name: app }
+```
+
+- **Declarative, not imperative.** `toolchain:` says *what version must exist*, never *where to get it*. The installer resolves (lock file first, then the provider), downloads, verifies, extracts into its own store (`<workDir>/toolchains/store/<lang>/<version>/<platform>`), and only then injects. The host is never modified: no shell rc edits, no global symlinks, no `export`.
+- **Whitelisted env (`envFor`).** The child process gets a fresh env built from a passthrough whitelist, with `PATH` prefixed and `JAVA_HOME` / `PYTHONHOME` / `GOROOT` explicitly set or removed. The host's `JAVA_HOME` and `NODE_OPTIONS` must not silently change a build — that is the whole disease this replaces. `GOTOOLCHAIN=local` stops Go from downloading a toolchain of its own and quietly defeating the lock.
+- **Checksums by algorithm.** Maven publishes `.sha512`, Node publishes `SHASUMS256.txt`, Adoptium publishes sha256. Verifying only sha256 would have forced us to drop Maven verification, so `parseChecksum()` accepts `sha512:` / `sha256:` / `sha1:` prefixes and bare hex (by length).
+- **Locks and offline.** `pipe.lock` is keyed by `lang@spec@platform` and can carry several platforms in one entry, so the same `pipe.yml` builds on a Windows host and a Linux runner. `frozen: true` + a missing entry fails immediately *without asking any index*, which is what makes an air-gapped build reproducible. `offline: true` means "no network", not "no files": a `file:///opt/mirror/...` URL still works, because an internal mirror is exactly what offline builds are for.
+- **Version assertion.** After installing, `assertVersions()` runs `java -version` / `mvn -v` / `node --version` / `go version` in the injected env and matches the declared version. "Installed 17 but ran 21" is the hardest class of bug to attribute later, so it fails at the start of the run, not in the artifacts.
+- **No external actions.** `uses:` accepts exactly seven names: `checkout`, `toolchain`, `cache`, `collect`, `deploy`, `verify`, `notify`. An unknown name is `ACTION_NOT_FOUND`, an unknown `with` key is `ACTION_INPUT_INVALID`, and a missing capability is `ACTION_UNAVAILABLE`. None of them are skipped: a silently skipped action makes a pipeline look green while having done nothing, which is the worst failure mode there is. Referencing an action from another repository is deliberately impossible — that turns a CI system into an open remote-execution endpoint, and doing it safely needs pinning, auditing and signing that this package does not have. Custom logic goes in `run:`.
+- **Checkout never switches branches.** The runner builds in the project directory itself, so a `git checkout` would rewrite the user's working copy and their next `git status` would show changes they never made. `uses: checkout` fetches and initialises submodules, and if `ref` is declared it *verifies* HEAD matches — mismatch is a failure that says exactly why.
+- **Cache is restore-then-save.** At the point the step runs, `dist/` is still empty, so saving happens in a finaliser at job end (GitHub's post steps, same reason). Keys are exact first, then `restore_keys` prefix match — an outdated dependency cache beats no cache. `paths` must be relative to the project or start with `~/`: an absolute path is rejected, because `paths: ["/etc"]` would otherwise pack the host into a cache that gets restored into the next project.
+- **Capability injection.** Actions do not know where they run; they declare "I need git / toolchain / deployer" and `createActionRuntime()` hands them the real thing. `deploy` is wrapped as a fake step with only a `deploy` field and handed to the existing `deployStep`, so production confirmation, selector expansion, locks, audit and rollback are not re-implemented (and therefore not missed).
+
+
 
 - No arbitrary YAML parsing: only maps / sequences / inline arrays / scalars; block scalars (`|`, `>`) and flow maps are hard errors.
 - Build commands come only from `pipe.yml` `run` fields, executed in the project directory via shell; `dryRun` only prints the plan.
@@ -332,15 +456,15 @@ Server mode enables 3-role RBAC (`lib/rbac.js`; single-machine mode has no roles
 ### Self-checks
 
 ```bash
-node packages/dsh-cicd/test/smoke.mjs   # 73 checks: parse/plan/store/run/deploy/canary/notify/audit/routes/selectors/guard/locks/migration/wizard/editor/scaffold/cron/triggers/scheduler/webhook/log-ws/cancel/DORA/executor/broker/joinToken/strategy(5+lock)/environments/approvalGate/secrets/RBAC
-node test/mount.mjs                     # full mount gate (this package: 20 tools / 28 routes)
+node packages/dsh-cicd/test/smoke.mjs   # 102 checks: parse/plan/store/run/deploy/canary/notify/audit/routes/selectors/guard/locks/migration/wizard/editor/scaffold/cron/triggers/scheduler/webhook/log-ws/cancel/DORA/executor/broker/joinToken/strategy(5+lock)/environments/approvalGate/secrets/RBAC + v3.0-P0 auth/policy/locks/audit/runners + the 8 acceptance rows of docs/proposals/cicd-v3/08-security-rbac.md §10 + v3.0-P1 expr/model/jobs (v1 normalisation, matrix caps, cycles, pool, skip propagation, cancel, v2 end-to-end, config snapshot, log shards) + v3.0-P2 toolchain (host JDK21 vs declared 17, concurrent jobs on different JDKs, offline+frozen, tampered package, dual-platform lock, cache hit, failure record, Maven/Gradle dual locks) and actions (unknown action/param hard failure, verify retries, checkout refuses to switch branches, cache round-trip + prefix hit + absolute-path rejection, v1 `uses:` end-to-end)
+node test/mount.mjs                     # full mount gate (this package: 26 tools / 33 routes)
 ```
 
 No real SSH: the tests use a fake fetch for remote and a command-recording fake remote for deploy.
 
 ### Cold-start route registration & lazy remote (v0.6.1)
 
-Same disease as dsh-remote: at cold start `webServer` comes up after the plugin's `apply()`, so a synchronous `ctx.get('webServer')` in apply returned nothing → the whole package's routes 404. Since v0.6.1 route registration is hooked on `ctx.inject(['webServer'], …)` (re-registers everything once ready — 28 exact + 1 prefix + 1 upgrade); `remote()` is lazy — when `options.remoteBase` is empty, the first call reads `ctx.get('webServer').port`; if unavailable it returns an uncached client (keeping a retryable `REMOTE_UNAVAILABLE`). The smoke suite has a cold-start regression (0 routes → 28 + 1 upgrade + remote-base assertion).
+Same disease as dsh-remote: at cold start `webServer` comes up after the plugin's `apply()`, so a synchronous `ctx.get('webServer')` in apply returned nothing → the whole package's routes 404. Since v0.6.1 route registration is hooked on `ctx.inject(['webServer'], …)` (re-registers everything once ready — 33 exact + 1 prefix + 1 upgrade); `remote()` is lazy — when `options.remoteBase` is empty, the first call reads `ctx.get('webServer').port`; if unavailable it returns an uncached client (keeping a retryable `REMOTE_UNAVAILABLE`). The smoke suite has a cold-start regression (0 routes → 33 + 1 upgrade + remote-base assertion).
 
 ### Gotchas hit in the wild (v0.2)
 
@@ -380,22 +504,25 @@ Also: a first-deploy health-check failure removes `current` (there is no `previo
 | v2.0-M3 | 五发布策略（serial / parallel / rolling / canary / blue-green）+ 策略锁；`target.strategy` 配置，批次进度可续 |
 | v2.0-M4 | 环境升格（dev < staging < prod + 保护/审批标志）、审批门（prod 停在待审批）、secrets（DB 只存 ref，载荷落 `workDir/.secrets.json` 0600） |
 | v2.0-M5 | 远端服务 RBAC：三角色 viewer / operator / admin + 项目范围 + 短 TTL token，写操作全审计 |
+| **v3.0-P0** | **安全基线**：本地账号 + 会话 + API token（`lib/auth.js`）、`can()` 默认拒绝判定（`lib/policy.js`）、部署锁落库（`lib/locks.js`）、哈希链审计（`lib/audit.js`）、runner 注册表与吊销（`lib/runners.js`）、审批绑产物摘要 + TTL + 禁自批；UI 加 hash 路由、左侧导航、面包屑、深链。**DSL 未改。** |
+| **v3.0-P1** | **执行内核**：DSL v2（`stages[].jobs[]` + `needs` + `matrix`）归一成 job 图（`lib/model.js`），由 `lib/jobs.js` 按拓扑并发执行（默认并发 4，`jobs.concurrency` 可配）、表达式求值器不碰 `eval`（`lib/expr.js`）、T0/T1/T2 三档求值、每个 job 一份分片日志、每次运行落 `pipe.yml` 原文快照 + sha256。**v1 的 pipe.yml 一行都不用改。** |
+| **v3.0-P2** | **工具链与动作**：`toolchain:` 只声明 vendor+版本（**永不接受 URL**），安装器解析 → 下载 → 按算法校验 → 解包进自己的 store，然后只往子进程注入**白名单 env**（宿主的 `JAVA_HOME` / `NODE_OPTIONS` 不许漏进来，宿主本身也一个字节不改）。锁文件 + `frozen` + 离线模式；Maven 的 `toolchains.xml` 与 Gradle 的 `installations.paths` 保证 daemon 用同一棵 JDK。`uses:` 执行七个内置动作（checkout / toolchain / cache / collect / deploy / verify / notify），**不引用任何外部 action**，未知动作或未知 `with` 参数是硬失败而不是静默跳过。 |
 
 ### 自检
 
 ```bash
-node packages/dsh-cicd/test/smoke.mjs   # 73 项
-node test/mount.mjs                     # 全包挂载闸门（本包 20 工具 / 28 路由）
+node packages/dsh-cicd/test/smoke.mjs   # 102 项（含 08-security-rbac.md §10 的八条验收）
+node test/mount.mjs                     # 全包挂载闸门（本包 26 工具 / 33 条 exact 路由）
 ```
 
 ## 组成
 
 | 文件 | 职责 |
 | --- | --- |
-| `index.js` | Host 入口：20 个工具 + 27 条 GET 路由 + 1 条 prefix 路由（webhook）+ 1 条 WebSocket upgrade（实时日志）+ 5 条 runner 路由 + 4 条 V2-M4 路由 + 1 条 RBAC 路由，装配 runtime |
-| `lib/pipe.js` | YAML 子集解析、`${{VAR}}` 插值、`when` 受限表达式、glob、stage DAG 计划、`triggers` 归一化 |
-| `lib/runner.js` | 本地执行器：逐 stage 串行跑步骤，写日志与运行记录；支持外部 `runId`、`AbortSignal` 取消、实时日志 hub |
-| `lib/db.js` | SQLite 打开/DDL/迁移：runs、steps、artifacts、releases、operations、projects 六表 + 索引，`PRAGMA user_version` 记录 schema 版本（当前 v5，v5 补 `steps.runner_id`） |
+| `index.js` | Host 入口：26 个工具 + 33 条 exact 路由 + 1 条 prefix 路由（webhook）+ 1 条 WebSocket upgrade（实时日志），装配 runtime |
+| `lib/pipe.js` | YAML 子集解析器（v1 与 v2）、`${{VAR}}` 插值、受限 `when` 表达式、glob、plan 与 DAG 执行器共用的 `buildStep()` 归一化、`triggers` 归一化 |
+| `lib/runner.js` | 执行器两条路径共用同一套 step 实现：v1 按 stage 顺序走，v2（`stages[].jobs[]`）把 job 图交给 `lib/jobs.js`。写合并日志 + 每个 job 一份分片；secret 脱敏在每个出口之前；支持外部 `runId`、`AbortSignal` 取消、live 日志 hub |
+| `lib/db.js` | SQLite 打开/DDL/迁移：runs、steps、artifacts、releases、operations、projects、deploy_locks、audit_events、users、memberships、api_tokens、sessions、approvals、runners + 索引，`PRAGMA user_version` 记录 schema 版本（当前 **v8**：v7 把 `steps.job_id` 加进主键，v8 给 runs 加 `config_snapshot` / `config_hash`；两者都在原库上就地迁移） |
 | `lib/store.js` | SQLite 存储层（`cicd.db`，WAL），对外 API 与旧 JSONL 版一致；首次打开会把遗留 `runs.jsonl` 导入并改名 `runs.jsonl.migrated` |
 | `lib/remote.js` | dsh-remote 回环 HTTP 客户端：exec + 分块上传 |
 | `lib/deploy.js` | releases/current 软链发布、多主机 fan-out、灰度分批、runtime 预设重启、健康检查、自动回滚 |
@@ -413,7 +540,18 @@ node test/mount.mjs                     # 全包挂载闸门（本包 20 工具 
 | `lib/environments.js` | 环境升格：dev/staging/prod 顺序 + 保护/审批标志 + 晋升路径 |
 | `lib/approval.js` | 审批（block gate）状态机：request/resolve/isPending/list，prod 默认停在「待审批」 |
 | `lib/secrets.js` | Secret 存储：DB 只存 ref，载荷落 `workDir/.secrets.json`（0600），`refsForInterpolate` 注入 |
-| `lib/rbac.js` | RBAC（远端服务模式）：三角色 viewer/operator/admin + 项目范围 + 短 TTL token，审计时间线，载荷落 `workDir/.rbac.json`（0600） |
+| `lib/rbac.js` | 旧文件态 RBAC（远端服务模式，v2.0-M5）：三角色 + 项目范围 + 短 TTL token，载荷落 `workDir/.rbac.json`（0600）。**v3.0-P0 起被 `lib/auth.js` + `lib/policy.js` 取代**：它不再参与任何判定，`/rbac` 只用于查看/吊销遗留 token |
+| `lib/auth.js` | v3.0-P0 身份：本地账号（scrypt，纯 JS 无原生编译）、DB 会话（HttpOnly cookie）与 API token（`cicd_<id>_<secret>`，只存 sha256，带 TTL 与吊销）、项目级成员关系。**引导期**：`users` 表为空时任何请求都是 `owner`，避免装完即锁死 |
+| `lib/policy.js` | v3.0-P0 授权：`can(actor, action, resource) → {allow, reason, policyId}`，17 个动作 × 4 角色（viewer/operator/admin/owner），**默认拒绝**，永不抛异常 |
+| `lib/audit.js` | v3.0-P0 审计：只追加的 `audit_events` + sha256 哈希链（`prev_hash` + 规范化记录）；`verify()` 逐条重算，定位第一处断裂（`kind: prev_hash | hash`） |
+| `lib/locks.js` | v3.0-P0 部署锁：`deploy_locks` 表（重启后仍互斥）、TTL + 心跳；`release` 必须匹配 runId 或 owner（拒绝无条件释放），`forceRelease` 走审计 |
+| `lib/runners.js` | v3.0-P0 runner 注册表：落库、online 为推导值（3 × 心跳）、吊销持久且立即生效（吊销过的 runner 重新注册不会复活） |
+| `lib/expr.js` | v3.0-P1 表达式求值器：手写词法 + 递归下降，**不用 `eval` / `new Function`**（pipe.yml 是谁提 PR 谁能改的文件，真 JS 求值器等于给每个能提交代码的人在构建机上开一个任意执行入口）。T0/T1/T2 根白名单 + 固定函数表 |
+| `lib/model.js` | v3.0-P1 模型归一化：v1 每个 stage → `<stage>-main` job（每个 `deploy` step 拆成独立 `kind:'deploy'` job），v2 `stages[].jobs[]` 原样展开，`matrix` 展开成 `job[key=value,...]`（上限 64 实例 / 3 维），`resolveJobGraph()` 接受 job id / matrix 基名 / stage id 三种 `needs` 写法并回写成真实 id |
+| `lib/jobs.js` | v3.0-P1 DAG 调度器：`scheduleJobs({jobs, concurrency, signal, runJob, onSkip})` 把就绪 job 放进并发池，失败**与跳过**都向下传播（上游被跳过的下游不是绿的），`allow_failure` 可豁免 |
+| `lib/toolchain.js` | v3.0-P2 工具链：`parseSpec` / `pickVersion` / provider（Adoptium、Maven、Gradle、Node、Go；PHP 无官方可移植包）、`mkdir` 跨进程锁 + 进程内 inflight 复用、按算法校验（Maven 只发 sha512、Node 只发 sha256）、`envFor()` 白名单注入、`assertVersions()` 版本断言。**pipe.yml 只允许写 `vendor+版本`** —— 在那里写 URL 会让任何能提 PR 的人在构建机上执行任意二进制 |
+| `lib/actions.js` | v3.0-P2 `uses:` 动作：七个内置，各自声明所需能力；未知动作 / 未知 `with` 键 / 缺能力全部硬失败。刻意不支持引用外部 action |
+| `lib/cache.js` | v3.0-P2 构建缓存：`<workDir>/cache/entries/<sha256(project,key)>/{meta.json,files/}`，先精确 key 再 `restore_keys` 前缀匹配，staging + rename 原子提交。`paths` 必须是项目相对路径或以 `~/` 开头 —— 绝对路径直接拒绝（否则 `paths: ["/etc"]` 能把宿主整个打包） |
 | `bin/runner.mjs` | 单文件远端 runner CLI：拉取式协议 + journal 幂等 + 自签 TLS（可选 undici） |
 
 ## 配置
@@ -604,11 +742,11 @@ DORA 四项指标（`cicd_dora` 工具、`/dora` 路由，默认最近 30 天，
 
 ## 工具
 
-`cicd_projects` / `cicd_project_meta` / `cicd_project_create` / `cicd_validate` / `cicd_pipe_save` / `cicd_plan` / `cicd_run`（`dryRun`、`stage`、`confirm`、`runner`）/ `cicd_status` / `cicd_logs` / `cicd_releases`（可按 `host` 过滤）/ `cicd_rollback`（可选 `host`）/ `cicd_targets`（含 runtime/app/onHostFailure/keep/restartCommand 与每台 active）/ `cicd_cancel`（`runId`）/ `cicd_dora`（`project`、`days`）/ `cicd_triggers`（`project`，返回 triggers 摘要、webhook URL 与调度器快照）/ `cicd_runners`（列出已注册 runner：labels、容量、在线状态、在跑任务数）/ `cicd_approve`（`runId`、`decision`、`resolvedBy`）/ `cicd_secrets`（`project`、`scope`、`name`、`value`）/ `cicd_environments`（`project`）/ `cicd_rbac`（`user`、`role`、`projects`、`ttlSec`、`token`、`action`）。
+`cicd_projects` / `cicd_project_meta` / `cicd_project_create` / `cicd_validate` / `cicd_pipe_save` / `cicd_plan` / `cicd_run`（`dryRun`、`stage`、`confirm`、`runner`、`approvalId`）/ `cicd_status` / `cicd_logs` / `cicd_releases`（可按 `host` 过滤）/ `cicd_rollback`（可选 `host`）/ `cicd_targets`（含 runtime/app/onHostFailure/keep/restartCommand 与每台 active）/ `cicd_cancel`（`runId`）/ `cicd_dora`（`project`、`days`）/ `cicd_triggers`（`project`，返回 triggers 摘要、webhook URL 与调度器快照）/ `cicd_runners`（列表 + `action=revoke`；labels、容量、在线/吊销状态、在跑任务数）/ `cicd_approve`（`approvalId` 或 `runId`、`decision`、`reason`、`resolvedBy`）/ `cicd_secrets`（`project`、`scope`、`name`、`value`）/ `cicd_environments`（`project`）/ `cicd_rbac`（`user`、`role`、`projects`、`ttlSec`、`token`、`action`，遗留）/ **`cicd_auth`**（`action=me|login|logout`）/ **`cicd_users`**（`action=list|create|get|set-password|set-role|remove-role`）/ **`cicd_tokens`**（`action=list|create|revoke`）/ **`cicd_audit`**（`action=list|verify`）/ **`cicd_locks`**（`action=list|release`）。
 
 ## HTTP 路由（GET + resource，另加 1 条 prefix 与 1 条 upgrade）
 
-`/api/plugins/cicd/{projects,project-meta,project-create,validate,pipe-save,plan,run,runs,log,releases,rollback,targets,operations,notify-test,cancel,dora,triggers,runner-register,runner-poll,runner-result,runner-log,runners,approve,approvals,secrets,environments,rbac}` 共 28 条精确路由；`run` 支持可选 `runner` 参数指定构建主机；`runner-*` 五条是远端 runner 拉取式协议的入口（register 带 join token、poll 兼心跳、result 回报幂等、log 逐行推送），**不校验同源**（跨机调用），靠 join token 鉴权；`runners` 要求同源。另外两条特殊入口：prefix 路由 `/hooks/<project>`（入站 webhook，靠 token 鉴权、不校验同源）与 upgrade `/log-ws?runId=`（实时日志）。
+`/api/plugins/cicd/{projects,project-meta,project-create,validate,pipe-save,plan,run,runs,log,releases,rollback,targets,operations,notify-test,cancel,dora,triggers,runner-register,runner-poll,runner-result,runner-log,runners,approve,approvals,secrets,environments,rbac,auth,users,tokens,audit,locks,toolchain}` 共 33 条精确路由；`run` 支持可选 `runner` 参数指定构建主机、可选 `approvalId` 消费一条已批准的审批；`runner-*` 五条是远端 runner 拉取式协议的入口（register 带 join token、poll 兼心跳、result 回报幂等、log 逐行推送），**不校验同源**（跨机调用），靠 join token 鉴权；`runners` 要求同源。另外两条特殊入口：prefix 路由 `/hooks/<project>`（入站 webhook，靠 token 鉴权、不校验同源）与 upgrade `/log-ws?runId=`（实时日志）。
 
 ## 远端 runner（v2.0-M2）
 
@@ -658,7 +796,7 @@ targets:
 - **审批门（block gate）**：`approvalRequired` 的 target 在 `executeRun` 里停在「待审批」，抛 `APPROVAL_REQUIRED`（HTTP 409）；面板/`cicd_approve` 点「通过」（`decision=approve`）后重跑 `executeRun`，审批通过 → `approval-resolved` 审计 → 仍走 `confirm=prod` 护栏（双重确认）。拒绝 → `approval-rejected`。
 - **secrets**：`cicd_secrets` 工具 / `/secrets` 路由设置/列出 secret；DB 只存 ref，载荷落 `workDir/.secrets.json`（0600，原子写）；`pipe.yml` 里 `${{SECRET_NAME}}` 插值时 `refsForInterpolate` 自动注入，不落明文到日志/DB。
 - **晋升路径**：`cicd_environments` 工具 / `/environments` 路由列出环境 + `promotionPath`（dev → staging → prod）。
-- **制品缓存**：本次未实现（`lib/cache.js` 留待后续）；现有 `artifacts` 表已记录每次 run 的产物，`keep` 清理策略复用 deploy.js 的 `cleanupReleases`。
+- **构建缓存**：`uses: cache` 在构建前恢复、在 job 结束的收尾钩子里保存（跑到那一步时 `dist/` 还是空的——GitHub 的 post steps 是同一个理由）。先精确 key，再 `restore_keys` 前缀。`paths` 必须是项目相对路径或以 `~/` 开头，绝对路径直接拒绝。`artifacts` 表仍记录每次 run 的产物，`keep` 清理复用 deploy.js 的 `cleanupReleases`；内容寻址的制品库（不可变摘要、去重、跨环境晋升）是 P5，不是这一轮。
 
 ## RBAC（v2.0-M5，远端服务模式）
 
@@ -675,6 +813,116 @@ server 模式启用三角色 RBAC（`lib/rbac.js`，单机模式仍无角色）�
 - **审计**：所有 token 签发/吊销/写操作落审计时间线（最近 500 条），`action=audit` 导出全部（按时间正序）。
 - **吊销**：`action=revoke&user=alice` 立即失效该用户所有 token。
 
+## 身份、判定、锁与审计（v3.0-P0）
+
+v2 的四条漏洞：写路由只有「同源 + 请求头 + `confirm=1`」、部署锁是进程内 `Map`、审计只留 500 条且无法验真、审批门重启即忘。v3.0-P0 在不改 DSL 的前提下把这四条堵住。
+
+**身份（`lib/auth.js`）**，按 API token → 会话 cookie → 引导期 的顺序判定：
+
+- **账号本地化**：`/users?action=create`（或 `cicd_users`）传 `email` + `password`，口令用 scrypt（`N=2^15, r=8, p=1`，纯 JS，不需要原生编译，也不引入 argon2 依赖）；少于 8 位直接拒。
+- **会话**：`/auth?action=login` 回 HttpOnly `dsh_cicd_session` cookie（`SameSite=Strict`），默认 12 小时；`logout` 清除。库里只存 sha256 摘要。
+- **API token**：`/tokens?action=create&userId=…&ttlSec=…` 一次性返回 `cicd_<id>_<secret>`，之后只存摘要；用 `Authorization: Bearer …` 或 `x-dsh-cicd-token: …` 传。过期 → `TOKEN_EXPIRED`，吊销 → `TOKEN_REVOKED`。
+- **引导期**：`users` 表为空时任何请求都是 `owner`（`authMethod=bootstrap`），避免装完没人能操作。第一个账号必须给 `role=owner`——`admin` 无权管成员，事后无法自我提升。一旦存在用户，匿名访问立即 401（`AUTH_REQUIRED`）。
+
+**授权（`lib/policy.js`）**：所有写路由收敛到 `can(actor, action, resource) → {allow, reason, policyId}`，**默认拒绝**：未知动作、无主体、主体停用、token 越界、无成员关系、角色不足，全部 deny。17 个动作 × 4 角色：
+
+| 角色 | 能做 |
+|---|---|
+| `viewer` | 读 |
+| `operator` | + 触发/取消/重试/部署非 prod/回滚非 prod/审批 |
+| `admin` | + 改配置/管 secret/揭示 secret/部署 prod/回滚 prod/管 runner/管项目/读审计 |
+| `owner` | + 管成员/管环境 |
+
+`prod`（或 `protected: true`）额外要求 `admin` 才能部署/回滚/改环境，即使项目已授权；角色按项目授予，不隐式继承。
+
+**部署锁（`lib/locks.js`）**：锁落在 `deploy_locks` 表，「一个 target 同时只跑一次」重启后依然成立。每条锁带 TTL（默认 1800s）并按 1/3 周期心跳续期，进程崩了也能自动释放，不用手工清。`release()` 必须匹配 runId 或 owner——无条件释放会让 A 误删 B 的锁。`forceRelease` 仅 admin 且写审计。
+
+**审计（`lib/audit.js`）**：`audit_events` 只追加，每行带 `prev_hash` 与 `hash = sha256(prev_hash + 规范化记录)`。`cicd_audit verify`（`/audit?action=verify`）逐条重算，报出第一处断裂（`kind: prev_hash` 是链断，`kind: hash` 是原地改字段）。允许与拒绝都记——被拒的写操作恰恰是排查事故时最想要的信号。
+
+**审批**：请求落库而不是留在内存，`approvals` 存 target、申请人、过期时间（默认 4h）与**产物摘要**。三条规则让它真的安全：审批人不能是申请人（`SELF_APPROVAL_FORBIDDEN`）、一条审批只能消费一次（第二次 `APPROVAL_CONSUMED`）、摘要必须一致（`APPROVAL_DIGEST_MISMATCH`）。摘要在审批时产物还不存在，因此取「决定字节内容的全部输入」（`project + target + commit + pipeline + stage`）：同一提交重算摘要不变，换提交就变。过期由懒扫描回收：运行落 `failed(approval_timeout)`，审计落 `approval.timeout`。
+
+**Runner**：注册是 DB 行，`online` 由 `last_seen_at` 推导（3 × 心跳判死），**吊销持久且立即生效**——被吊销的 runner 领不到任务，迟到的结果一律丢弃。
+
+**UI（P0-6/P0-7）**：面板引入 hash 路由，视图可寻址、刷新不丢：
+
+```
+#/projects/:project[/runs/:runId | /releases | /approvals | /pipeline | /new | /runners | /secrets | /rbac | /audit][?target=&step=&line=]
+```
+
+用 hash 而不是 `history.pushState`：面板挂在宿主页面里，改写宿主路径会让宿主刷新 404；片段只动 `#` 之后，宿主路由不受影响，面板自己还原视图。13 个同权重工具条按钮改成左侧导航（流水线 / 配置 / 管理），工具条只留项目、目标、构建主机、计划、干跑、运行、刷新；面包屑显示 `项目 › 视图 › 运行` 并带「复制链接」；`?line=1204` 会高亮并滚动到该行日志。
+
+## DSL v2 执行内核（v3.0-P1）
+
+v1 是「一个 stage = 一串按顺序执行的 step」：stage 内部无法并行、没有 `needs`、即便没有任何依赖也必须排队。v3.0-P1 引入 `stages[].jobs[]` 并按 DAG 执行。**v1 的 pipe.yml 一行都不用改**——归一化器把每个 v1 stage 变成一个 `<stage>-main` job，于是老行为是新引擎的一个特例，而不是需要手工维护的第二条代码路径。
+
+```yaml
+version: 2
+stages:
+  - id: test
+    jobs:
+      - id: unit
+        matrix: { java: ["17", "21"] }
+        steps:
+          - run: mvn -B verify
+      - id: lint
+        steps:
+          - run: mvn -B spotless:check
+  - id: ship
+    jobs:
+      - id: gate
+        needs: [unit, lint]        # matrix 基名会展开成两个实例
+        steps:
+          - run: echo release
+      - id: deploy
+        needs: [gate]
+        steps:
+          - deploy: { target: prod }
+```
+
+- **job 图（`lib/model.js`）**：`stage` 只保留两件事——在 UI 里分组、以及「没写 `needs` 的 job 默认等上一个 stage 的所有 job」。一旦有 job 显式写了 `needs`，顺序完全由 DAG 决定。`needs` 接受三种写法：真实 job id、matrix 基名（`unit` → 全部实例）、stage id 或 `stage:<id>`；`resolveJobGraph()` 全部回写成真实 id，下游代码再也不会看到基名。成环报 `PIPE_CYCLE` 并带路径（`job 依赖出现环：a → b → a`），找不到报 `PIPE_UNKNOWN_JOB` 并带候选列表。
+- **matrix**：`matrix: {java: [17, 21]}` 展开成 `unit[java=17]` / `unit[java=21]`（键排序，实例 id 稳定）。硬上限 64 实例、3 维，`exclude` 做精确剔除——5×4×4 会在解析期就报 `PIPE_MATRIX_TOO_LARGE` 并在消息里给出实际数量，而不是 80 个 agent 亮起来之后才发现。
+- **调度器（`lib/jobs.js`）**：就绪 job 进并发池（`jobs.concurrency`，默认 4，clamp 1–32）。失败**和跳过**都向下传播：上游被跳过的下游也是 skipped，不是绿的——这是 GitHub 的语义，也是 `blocksDownstream` 把 `skipped` 算作阻塞的原因。`allow_failure: true` 让该 job 不传播。
+- **表达式（`lib/expr.js`）**：`when:`、`if:`、`${{ … }}` 由手写词法 + 递归下降解析求值，**刻意不用 `eval` / `new Function`**：pipe.yml 是谁提 PR 谁能改的文件，真 JS 求值器等于给每个能提交代码的人在构建机上开一个任意执行入口。`evaluate('process.exit(0)')` 现在返回 `PIPE_EXPR`。
+- **三档求值**：T0（`event` / `branch` / `tag` / `paths` / `ref`）→ T1（加 `vars` / `matrix` / `needs` / `env` / `project` / `target` / `stage`，job 图在这一档决定）→ T2（加 `secrets` / `steps` / `outputs`，唯一在真正 spawn 命令时求值的档）。在 `when:` 里引用 `secrets` 是 T1 错误，且错误消息直说原因：*T1 的求值结果会进 run 记录与日志，那正是密钥不能落的地方*。`validateExpressions()` 在解析期跑同一套白名单，非法表达式一条命令都不跑就失败。
+- **配置快照**：每次运行把 pipe.yml 原文（`runs.config_snapshot`）与 sha256（`config_hash`）落库。重跑与重试读快照，不重读工作区——否则有人一改文件，「昨晚那次到底跑的是什么」就永远说不清。
+- **日志分片**：合并时间线保留（判断先后顺序时你要的就是它），另外每个 job 单独一份 `logs/<runId>/<job>.log`。`cicd_logs` / `/log?jobId=` 读分片；matrix 实例名里的 `[ ] = ,` 在文件名里换成 `_`（这几个字符在 Windows 上是非法的）。面板日志区加「只看某个 job」下拉，且只在 job 多于一个时出现（只有一个选项的下拉纯属噪音）；stage 与 step 之间渲染 job 行——否则「哪几步是并行的」根本看不出来。
+
+**客户端**：`timelineRows(stages, jobs)` 插入 job 行；`jobId` 匹配不到任何 job 的 step 落进显式的「（未分组）」块，而不是消失。`runJobsOf()` 优先用 `/run` 返回的 job 图（有状态、耗时、依赖），退回 `/log` 的分片清单（只有 id，状态留空——未知就渲染成未知，绝不当成成功）。切换运行会清空已选的 job 分片，因为 A 的 `jobId` 在 B 里不存在，Host 只能回 404。
+
+## 工具链与动作（v3.0-P2）
+
+```yaml
+version: 2
+toolchain:
+  java: temurin-17      # 厂商 + 版本号，永远不写 URL
+  maven: "3.9.6"
+stages:
+  - id: build
+    jobs:
+      - id: compile
+        steps:
+          - uses: checkout
+            with: { fetch_depth: 1 }
+          - uses: cache
+            with:
+              key: m2-${{ vars.JAVA }}
+              paths: [ "~/.m2/repository" ]
+          - run: mvn -B -DskipTests package
+          - uses: collect
+            with: { paths: [ "target/*.jar" ], name: app }
+```
+
+- **声明式，不是命令式。** `toolchain:` 只说「必须存在哪个版本」，从不说「去哪儿拿」。安装器自己解析（先锁文件，再 provider）、下载、校验、解到自己的 store（`<workDir>/toolchains/store/<lang>/<version>/<platform>`），最后才注入。宿主一个字节都不改：不写 shell rc、不建全局链接、不 export。
+- **白名单 env（`envFor`）。** 子进程拿到的是一份按白名单重建的环境，`PATH` 前置，`JAVA_HOME` / `PYTHONHOME` / `GOROOT` 显式覆盖或删除。宿主自己的 `JAVA_HOME`、`NODE_OPTIONS` 不许偷偷改变构建结果——这才是真正要治的病。`GOTOOLCHAIN=local` 阻止 Go 自己再下一个工具链、绕过锁。
+- **校验按算法。** Maven 只发 `.sha512`，Node 只发 `SHASUMS256.txt`，Adoptium 发 sha256。只认 sha256 就等于放弃 Maven 校验，所以 `parseChecksum()` 同时接受 `sha512:` / `sha256:` / `sha1:` 前缀与裸 hex（按长度判定）。
+- **锁与离线。** `pipe.lock` 以 `lang@spec@platform` 为键，一条 entry 可以同时记多个平台，于是同一份 `pipe.yml` 在 Windows 宿主和 Linux runner 上都能构建。`frozen: true` 且锁里没有条目时立即失败、**不问任何索引**，这才是可重复的内网构建。`offline: true` 的含义是「不许上外网」而不是「不许读文件」：`file:///opt/mirror/...` 照样能用，内网镜像正是离线构建存在的理由。
+- **版本断言。** 装完之后在注入的 env 里跑 `java -version` / `mvn -v` / `node --version` / `go version`，与声明版本比对。装了 17 却跑出 21 是最难在事后归因的一类问题，所以它在运行开始时失败，而不是在产物里失败。
+- **不引用外部动作。** `uses:` 只认七个名字：`checkout`、`toolchain`、`cache`、`collect`、`deploy`、`verify`、`notify`。未知动作 `ACTION_NOT_FOUND`，未知 `with` 键 `ACTION_INPUT_INVALID`，缺能力 `ACTION_UNAVAILABLE`，一律硬失败：静默跳过会让流水线看起来绿了、实际什么都没做，那是最坏的失败方式。引用别的仓库里的 action 是刻意做不到的——那会把 CI 变成对外开放的远程执行入口，要安全地做需要 pin + 审计 + 签名一整套，本包没有。自定义逻辑请写 `run:`。
+- **checkout 不切分支。** runner 直接在项目目录里构建，替你 `git checkout` 会改掉你自己的工作副本，下一次 `git status` 里会出现你根本没做过的改动。`uses: checkout` 只 fetch 和初始化子模块；声明了 `ref` 就**校验** HEAD 是不是它，不一致直接失败并说明原因。
+- **缓存是「先恢复、收尾再存」。** 跑到这一步时 `dist/` 还是空的，所以保存登记成 job 结束时的收尾钩子（GitHub 的 post steps 同一个理由）。key 先精确匹配，再按 `restore_keys` 前缀匹配——一份过时的依赖缓存也比没有强。`paths` 必须是项目相对路径或以 `~/` 开头：绝对路径直接拒绝，否则 `paths: ["/etc"]` 会把宿主整个打包进一份缓存，然后被恢复进下一个项目。
+- **能力注入。** 动作不知道自己跑在哪儿，它只声明「我要 git / 工具链 / 部署器」，由 `createActionRuntime()` 递上真实现。`deploy` 被包装成一个只有 `deploy` 字段的假 step 交给既有的 `deployStep`，于是生产确认、选择器展开、锁、审计、回滚都没有被重写一遍——也就不会漏掉其中某一条。
+
+
 ## 安全边界
 
 - 不解析任意 YAML：只认 map/sequence/内联数组/标量，块标量（`|`、`>`）与 flow map 直接报错。
@@ -688,21 +936,37 @@ server 模式启用三角色 RBAC（`lib/rbac.js`，单机模式仍无角色）�
 - `bin/runner.mjs` 的 `--insecure` 仅限内网调试，生产建议 `--ca <file>` 指定 CA。
 - secrets 载荷落 `workDir/.secrets.json`（0600），DB 只存 ref；`refsForInterpolate` 注入后不落明文到日志/DB。
 - 审批门（block gate）：prod 默认停在「待审批」，`/approve` 路由解除阻塞后仍走 `confirm=prod` 护栏（双重确认）；审批记录落 `store.operations`（`action='approval-request/approval-resolved/approval-rejected'`）。
-- RBAC token 落 `workDir/.rbac.json`（0600），DB 只存 sha256 摘要；token 短 TTL（默认 3600s），过期自动拒；写操作全审计（最近 500 条），`action=audit` 导出全部。
+- RBAC token 落 `workDir/.rbac.json`（0600），DB 只存 sha256 摘要；token 短 TTL（默认 3600s），过期自动拒；写操作全审计（最近 500 条），`action=audit` 导出全部。**v3.0-P0 起这套文件态 RBAC 不再参与判定**，改由 `lib/auth.js`（身份）+ `lib/policy.js`（判定）接管，`/rbac` 仅用于查看/吊销遗留 token。
+- v3.0-P0 身份：口令 scrypt（纯 JS，`maxmem` 按参数算，避免 Node 默认 32MiB 上限直接抛）；DB 只存口令哈希与 token/session 的 sha256 摘要；会话 cookie `HttpOnly; SameSite=Strict`。
+- v3.0-P0 判定：所有写路由先同源、再要求 `x-dsh-cicd` 头与 `confirm`，再过身份，最后 `can()`；任一环节拒绝都写审计（`auth.deny:*` / `policy.deny`），**默认拒绝**，未知动作一律不放行。
+- v3.0-P0 锁：`deploy_locks` 落库，TTL + 心跳，`release` 必须匹配 runId/owner；`forceRelease` 仅 admin 且审计。
+- v3.0-P0 审计：哈希链，`/audit?action=verify` 可定位第一处断裂；允许与拒绝都记。
+- v3.0-P0 审批：绑产物摘要（project+target+commit+pipeline+stage 派生）、有 TTL、禁自批、一次性消费；过期运行落 `failed(approval_timeout)`。
+- v3.0-P0 runner：注册落库，`online` 由心跳推导（3× 判死），吊销持久且立即生效，迟到结果丢弃。
+- v3.0-P0 日志脱敏：secret 明文在写文件 / `onLog` / live hub 三个出口**之前**统一替换成 `***`，值长度 < 4 的不替换（短值替换只会毁掉可读性）。
+- v3.0-P1 表达式：`when` / `if` / `${{ }}` 走手写解析器，**不碰 `eval` / `new Function`**；根标识符按 T0/T1/T2 白名单放行，函数只有固定 11 个（`startsWith` / `endsWith` / `contains` / `matches` / `changed` / `exists` / `always` / `success` / `failure` / `cancelled` / `skipped`），`process` / `require` / `globalThis` / 立即调用表达式全部 `PIPE_EXPR`。
+- v3.0-P1 `secrets` 只在 T2 可见：T1（建图阶段）读到 `secrets` 直接报错，因为 T1 的结果会进 run 记录与日志。
+- v3.0-P1 matrix 上限 64 实例 / 3 维，超限在解析期拒绝；否则一次误写就能把构建机打满。
+- v3.0-P2 工具链：`toolchain:` 只接受 `vendor+版本`，**含 `:` `/` `\\` 一律拒绝**——pipe.yml 是 PR 可改的文件，在这里放开 URL 等于允许任何有提交权限的人让构建机下载并执行任意二进制。内网镜像走框架级配置（`file:///opt/mirror/...`），不经过仓库文件。
+- v3.0-P2 注入：子进程 env 只取白名单，不 spread `process.env`；`PATH` 前置并按需覆盖 `JAVA_HOME` / `PYTHONHOME` / `GOROOT`，`GOTOOLCHAIN=local`。宿主装了什么完全不影响构建结果，宿主本身也一个字节不改。
+- v3.0-P2 校验：按算法重算（`sha512` / `sha256` / `sha1`），校验不过**先删坏包再抛**，不写 store；解包走 `.tmp-<pid>-<rand>` → `.ok` 标记 → `rename` 原子提交，半成品永远不会被当成可用工具链。
+- v3.0-P2 动作：`uses:` 只认七个内置名字，未知动作 / 未知 `with` 键 / 缺能力**全部硬失败**。不引用外部 action——那会把 CI 变成对外开放的远程执行入口。
+- v3.0-P2 缓存：`paths` 只允许相对项目目录或以 `~/` 开头，**绝对路径直接拒绝**（否则 `paths: ["/etc"]` 能把宿主整个打包）；恢复时再校验解析结果仍在根内，防 `..` 逃逸；不存符号链接。
+- v3.0-P2 checkout 不切分支：runner 直接在项目目录构建，替你 `git checkout` 会改掉你自己的工作副本。声明了 `ref` 就只校验 HEAD 是否一致，不一致直接失败并说明原因。
 - 日志读取有 `maxLogBytes` 截断；`runId` 做了字符白名单校验。
 
 ## 自检
 
 ```bash
-node packages/dsh-cicd/test/smoke.mjs   # 73 项：解析/计划/存储/执行/发布/灰度/通知/审计/路由/选择器/护栏/锁/迁移/向导/编辑器/脚手架/cron/triggers/scheduler/webhook/log-ws/cancel/DORA/executor/broker/joinToken/strategy(5 策略+策略锁)/environments/approvalGate/secrets/RBAC
-node test/mount.mjs                     # 全包挂载闸门（本包 20 工具 / 28 路由）
+node packages/dsh-cicd/test/smoke.mjs   # 102 项：解析/计划/存储/执行/发布/灰度/通知/审计/路由/选择器/护栏/锁/迁移/向导/编辑器/脚手架/cron/triggers/scheduler/webhook/log-ws/cancel/DORA/executor/broker/joinToken/strategy(5 策略+策略锁)/environments/approvalGate/secrets/RBAC + v3.0-P0 的 auth/policy/locks/audit/runners + docs/proposals/cicd-v3/08-security-rbac.md §10 的八条验收 + v3.0-P1 的 expr/model/jobs（v1 归一化回归、matrix 上限、成环、并发池、跳过传播、取消、v2 端到端、配置快照、日志分片） + v3.0-P2 的工具链（宿主只有 JDK21 却声明 17、并发 job 各自不同 JDK、离线+frozen、被篡改的包、双平台锁、缓存命中、失败记录、Maven/Gradle 双锁）与动作（未知动作/未知参数硬失败、verify 重试、checkout 拒绝切分支、缓存往返+前缀命中+绝对路径拒绝、v1 的 uses: 端到端）
+node test/mount.mjs                     # 全包挂载闸门（本包 26 工具 / 33 条 exact 路由）
 ```
 
 不连真实 SSH：remote 用假 fetch，deploy 用记录命令的假 remote。
 
 ## 冷启动路由注册与惰性 remote（v0.6.1）
 
-与 dsh-remote 同病：冷启动时 `webServer` 晚于插件 `apply()`，v0.6.0 起在 apply 里同步 `ctx.get('webServer')` 拿不到服务 → 整包路由 404。v0.6.1 起路由注册挂到 `ctx.inject(['webServer'], …)`（就绪后补注册全部路由，v2.0-M5 起是 28 条精确路由 + 1 条 prefix + 1 条 upgrade）；`remote()` 改惰性解析——`options.remoteBase` 为空时首次调用从 `ctx.get('webServer').port` 取，取不到返回未缓存客户端（保持可重试的 `REMOTE_UNAVAILABLE`）。smoke 有冷启动回归（0 路由 → 28 条精确路由 + 1 条 prefix + 1 条 upgrade + remote base 断言）。
+与 dsh-remote 同病：冷启动时 `webServer` 晚于插件 `apply()`，v0.6.0 起在 apply 里同步 `ctx.get('webServer')` 拿不到服务 → 整包路由 404。v0.6.1 起路由注册挂到 `ctx.inject(['webServer'], …)`（就绪后补注册全部路由，v3.0-P0 起是 33 条精确路由 + 1 条 prefix + 1 条 upgrade）；`remote()` 改惰性解析——`options.remoteBase` 为空时首次调用从 `ctx.get('webServer').port` 取，取不到返回未缓存客户端（保持可重试的 `REMOTE_UNAVAILABLE`）。smoke 有冷启动回归（0 路由 → 33 条精确路由 + 1 条 prefix + 1 条 upgrade + remote base 断言）。
 
 ## 实战踩到的坑（v0.2）
 

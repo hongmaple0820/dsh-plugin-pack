@@ -1,0 +1,55 @@
+﻿# PHP 示例：PHP 8.3 + Composer，构建后整包部署（native）
+version: 2
+name: shop-web
+description: 门店前台（Laravel）
+
+on:
+  push: { branches: [main], paths: ["app/**", "composer.json", "composer.lock"] }
+  pull_request: { branches: [main] }
+  manual: true
+
+variables:
+  APP: shop-web
+
+environments:
+  staging: { autoDeployBranches: [main] }
+  prod: { protected: true, requireApproval: true, branchRule: main }
+
+stages:
+  - id: build
+    jobs:
+      - id: composer
+        kind: build
+        # Linux 上 PHP 走容器（官方无免 root 二进制），Windows 宿主用 zip 安装
+        image: php:8.3-cli
+        steps:
+          - uses: checkout
+          - name: 安装依赖
+            run: composer install --no-dev --prefer-dist --no-interaction --no-progress
+          - name: 静态检查
+            run: |
+              php -l app/index.php
+              ./vendor/bin/phpunit --testsuite unit
+            allow_failure: false
+        artifacts:
+          paths: ["app/**", "vendor/**", "composer.json", "composer.lock"]
+          exclude: ["app/storage/logs/**"]
+          name: shop-web
+          retention: default
+        cache:
+          - key: "composer-${{ hashFiles('**/composer.lock') }}"
+            paths: ["~/.composer/cache"]
+
+  - id: deploy
+    needs: [build]
+    jobs:
+      - id: staging
+        kind: deploy
+        environment: staging
+        target: staging
+        artifact: "shop-web"
+        strategy: serial
+        needs: [composer]
+        verify:
+          smoke: ["https://staging.example.com/up"]
+          window: 60s

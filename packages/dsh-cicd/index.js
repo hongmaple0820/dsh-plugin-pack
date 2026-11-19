@@ -1,14 +1,23 @@
 /**
  * Host half of @local/dsh-cicd — a local-first CI/CD for DSH.
  *
- * 16 tools, 19 GET-only HTTP routes, 2 prefix routes (inbound webhook + runner poll), 2 POST
- * upgrade handlers (runner register/heartbeat/result via dsh-remote), 1 WebSocket upgrade
- * (realtime logs). Builds run locally (child_process) or on registered remote runners
+ * 26 tools, 33 exact GET/JSON HTTP routes, 1 prefix route (inbound webhook), 1 WebSocket
+ * upgrade (realtime logs). Builds run locally (child_process) or on registered remote runners
  * (bin/runner.mjs pull protocol + journal idempotency); releases reuse the dsh-remote plugin
  * over loopback HTTP, so this package owns no SSH code and no credentials.
+ *
+ * v3.0-P0：所有写路由都过 `authorize()`（身份 → `can()` → 审计三件事），
+ * 部署锁落 SQLite（重启后仍互斥），审计是哈希链（`/audit/verify` 可自证）。
+ * v3.0-P1：DSL v2 调度内核 —— `stages[].jobs[]` + `needs` + `matrix` 归一成 job 图，
+ * `lib/jobs.js` 按拓扑并发执行（默认并发 4），每个 job 一份分片日志，
+ * run 落 pipe.yml 原文快照与 sha256（历史运行永远能解释自己）。
+ * v3.0-P2：工具链（`toolchain:` 只写 vendor+版本，安装器按锁文件下载 + 校验 + 注入白名单 env，
+ * 不改宿主）与 `uses:` 动作（checkout/toolchain/cache/collect/deploy/verify/notify 七个内置动作，
+ * 不引用任何外部 action —— pipe.yml 是 PR 可改的文件）。
  */
 
 import { createHash, timingSafeEqual } from 'node:crypto'
+import { Readable } from 'node:stream'
 import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, isAbsolute, join, relative } from 'node:path'
@@ -29,9 +38,28 @@ import { createScheduler } from './lib/scheduler.js'
 import { summarizeDora } from './lib/dora.js'
 import { createTaskBroker, createRemoteExecutor, joinTokenMatches } from './lib/executors.js'
 import { createSecretStore } from './lib/secrets.js'
+import { createArtifactStore, normalizeDigest, digestPath, parseRange, artifactError } from './lib/artifacts.js'
 import { createApprovalGate } from './lib/approval.js'
 import { normalizeEnvironments, promotionPath, isProtected, requiresApproval } from './lib/environments.js'
 import { createRbac } from './lib/rbac.js'
+import { createAuth, SESSION_COOKIE, ROLES, readSessionId } from './lib/auth.js'
+import { createAudit } from './lib/audit.js'
+import { createDeployLocks } from './lib/locks.js'
+import { createRunnerRegistry } from './lib/runners.js'
+import { can, ACTIONS, policyMatrix, isKnownAction } from './lib/policy.js'
+import * as expr from './lib/expr.js'
+import * as model from './lib/model.js'
+import * as jobs from './lib/jobs.js'
+import {
+  createToolchain, envFor, assertVersions, inferFromFiles, writeDualLocks,
+  LANGS as TOOLCHAIN_LANGS, TOOLCHAIN_ERRORS,
+} from './lib/toolchain.js'
+import { createCacheStore, CACHE_ERRORS } from './lib/cache.js'
+import { deployTransaction, usesTransaction, planBatches, readManifest, DEPLOY_ERRORS } from './lib/deploy-engine.js'
+import { createNativeActuator, NATIVE_COMMANDS, ACTUATOR_ERRORS, renderTemplate } from './lib/actuator/native.js'
+import { createSlotStore, SLOT_ERRORS } from './lib/slots.js'
+import { runAction, ACTIONS as PIPELINE_ACTIONS, ACTION_NAMES, ACTION_ERRORS } from './lib/actions.js'
+import { runGit } from './lib/git.js'
 
 export const name = '@local/dsh-cicd'
 export const inject = ['tools']
@@ -43,8 +71,8 @@ const WRITE_HEADER = 'x-dsh-remote-exec'
 
 const textBlocks = (text) => [{ type: 'text', text }]
 
-function json(value, status = 200) {
-  return Response.json(value, { status })
+function json(value, status = 200, headers = null) {
+  return Response.json(value, { status, headers: headers || undefined })
 }
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]'])
@@ -133,6 +161,17 @@ function normalizeConfig(config = {}, ctx) {
   // pollSec=0 关掉 git push 轮询（只留 cron），allowProd=true 才允许定时/推送运行免 confirm=prod。
   const rawScheduler = baseConfig.scheduler && typeof baseConfig.scheduler === 'object' ? baseConfig.scheduler : {}
   const clampInt = (value, fallback, min, max) => (Number.isInteger(value) ? Math.max(min, Math.min(max, value)) : fallback)
+  // v3.0-P0：身份与部署锁的可选配置。默认值刻意保守——引导期允许匿名（否则第一次装完谁也进不去），
+  // 部署锁 TTL 30 分钟（足够一次全量部署，又不会让崩溃进程永久占锁）。
+  const rawAuth = baseConfig.auth && typeof baseConfig.auth === 'object' ? baseConfig.auth : {}
+  const rawDeploy = baseConfig.deploy && typeof baseConfig.deploy === 'object' ? baseConfig.deploy : {}
+  const rawApproval = baseConfig.approval && typeof baseConfig.approval === 'object' ? baseConfig.approval : {}
+  const rawRunners = baseConfig.runners && typeof baseConfig.runners === 'object' ? baseConfig.runners : {}
+  const rawJobs = baseConfig.jobs && typeof baseConfig.jobs === 'object' ? baseConfig.jobs : {}
+  const rawArtifacts = baseConfig.artifacts && typeof baseConfig.artifacts === 'object' ? baseConfig.artifacts : {}
+  // v3.0-P2：工具链托管。机器级只允许配「放哪儿、能不能联网、信任什么源」，
+  // **不放版本**——同一份 pipe.yml 在装了 JDK21 的机器和装了 JDK17 的机器上必须跑出同样的结果。
+  const rawToolchain = baseConfig.toolchain && typeof baseConfig.toolchain === 'object' ? baseConfig.toolchain : {}
   return {
     projects: projects.map((project) => ({
       id: String(project.id),
@@ -152,6 +191,40 @@ function normalizeConfig(config = {}, ctx) {
       tickSec: clampInt(rawScheduler.tickSec, 20, 1, 3600),
       pollSec: clampInt(rawScheduler.pollSec, 60, 0, 3600),
       allowProd: rawScheduler.allowProd === true,
+    },
+    auth: {
+      sessionTtlSec: clampInt(rawAuth.sessionTtlSec, 12 * 60 * 60, 60, 30 * 24 * 60 * 60),
+      bootstrapAllowAnonymous: rawAuth.bootstrapAllowAnonymous !== false,
+    },
+    deploy: {
+      lockTtlSec: clampInt(rawDeploy.lockTtlSec, 30 * 60, 30, 24 * 60 * 60),
+    },
+    approval: {
+      ttlSec: clampInt(rawApproval.ttlSec, 4 * 60 * 60, 60, 7 * 24 * 60 * 60),
+    },
+    runners: {
+      joinToken: typeof rawRunners.joinToken === 'string' ? rawRunners.joinToken : '',
+      heartbeatSec: clampInt(rawRunners.heartbeatSec, 30, 5, 3600),
+    },
+    // v3.0-P5：制品 CAS 的根目录。默认挂在 workDir 下，跟着同一份备份走。
+    artifacts: {
+      dir: typeof rawArtifacts.dir === 'string' && rawArtifacts.dir ? rawArtifacts.dir : '',
+      maxBytes: clampInt(rawArtifacts.maxBytes, 2 * 1024 * 1024 * 1024, 0, Number.MAX_SAFE_INTEGER),
+    },
+    // v3.0-P1：v2 图的并发度。默认 4 —— 一个 stage 里 4 个 lint/test job 并行够用，
+    // 又不会在 2 核构建机上把命令执行器压死（每个 job 可能还在跑自己的子进程）。
+    jobs: {
+      concurrency: clampInt(rawJobs.concurrency, 4, 1, 32),
+    },
+    toolchain: {
+      enabled: rawToolchain.enabled !== false,
+      storeDir: typeof rawToolchain.storeDir === 'string' && rawToolchain.storeDir.trim() ? rawToolchain.storeDir.trim() : '',
+      offline: rawToolchain.offline === true,
+      // frozen 默认关：本地开发第一次跑没有锁文件也得能用；远端 runner 由部署方在配置里打开。
+      frozen: rawToolchain.frozen === true,
+      verifyChecksum: rawToolchain.verifyChecksum !== false,
+      // 断言每个语言真的跑在声明的版本上。关掉它的唯一理由是「这颗树是交叉编译产物、跑不起来」。
+      verify: rawToolchain.verify !== false,
     },
   }
 }
@@ -176,7 +249,13 @@ function readPipe(project) {
     error.code = 'PIPE_NOT_FOUND'
     throw error
   }
-  return parsePipe(readFileSync(project.pipe, 'utf8'), { path: project.pipe })
+  const source = readFileSync(project.pipe, 'utf8')
+  const pipe = parsePipe(source, { path: project.pipe })
+  // v3.0-P1：配置快照。原始 YAML 与 sha256 挂在解析结果上，运行时由 runner 写进 runs 表。
+  // 存原文而不是存解析后的对象：解析器将来加字段/改默认值时，历史运行仍能用当时那份配置解释。
+  pipe.source = source
+  pipe.hash = createHash('sha256').update(source).digest('hex')
+  return pipe
 }
 
 function resolveTarget(pipe, options, name) {
@@ -249,6 +328,19 @@ function publicReleaseId(release) {
   return release.run_id || release.id || ''
 }
 
+/**
+ * 「计划产物摘要」——审批闸门要绑的那串字节，在构建之前就必须能算出来。
+ *
+ * 为什么不直接 sha256 产物文件：审批请求发生在 run 开始之前（人批了才让它跑），
+ * 那时产物还没被构建出来。所以摘要取的是**决定字节内容的全部输入**：
+ * 项目 + target + 提交 + 流水线名 + stage 过滤。同一个提交重复部署 → 摘要不变 → 同一条审批可复用；
+ * 换了提交或换了 target → 摘要变化 → 旧审批不能放行（`APPROVAL_DIGEST_MISMATCH`）。
+ */
+function deployDigest({ projectId = '', target = '', commit = '', pipelineName = '', stage = '' } = {}) {
+  const material = JSON.stringify({ project: projectId, target, commit, pipeline: pipelineName, stage: stage || '' })
+  return `sha256:${createHash('sha256').update(material).digest('hex')}`
+}
+
 function releaseSummary(release) {
   return {
     id: publicReleaseId(release),
@@ -318,10 +410,97 @@ function createRuntime(ctx, config) {
     },
   })
   // V2-M4：审批门（block gate）+ secrets 存储（DB 只存 ref，载荷落 workDir/.secrets.json）
-  const approvalGate = createApprovalGate()
+  const approvalGate = createApprovalGate({ db: store.db, ttlSec: options.approval?.ttlSec })
   const secrets = createSecretStore({ dir: options.workDir })
+  // v3.0-P5：制品 CAS。字节落磁盘（<workDir>/artifacts），元数据落 SQLite。
+  // 两个方向的引用都要能问出来：GC 问「这个 digest 还有 release/指针指着吗」，
+  // 页面问「这个项目最近传了什么」。
+  const artifactMeta = {
+    put(row) {
+      try {
+        store.db.prepare('INSERT OR REPLACE INTO artifact_blobs (digest, bytes, project_id, run_id, job_id, source_path, media_type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+          String(row.digest || ''), Number(row.bytes || 0), String(row.projectId || ''), String(row.runId || ''),
+          String(row.jobId || ''), String(row.sourcePath || ''), String(row.mediaType || ''), new Date().toISOString(),
+        )
+      } catch { /* 索引失败不影响字节正确性 */ }
+    },
+    remove(digest) {
+      try { store.db.prepare('DELETE FROM artifact_blobs WHERE digest = ?').run(String(digest || '')) } catch { /* best effort */ }
+    },
+  }
+  const artifactStore = createArtifactStore({
+    dir: options.artifacts.dir || join(options.workDir, 'artifacts'),
+    meta: artifactMeta,
+    // 被 release 引用的 digest 永远不删：回滚要拿得住它，删了就等于删掉了回滚能力。
+    pinned: [() => {
+      const rows = store.db.prepare("SELECT artifact_digest FROM releases WHERE artifact_digest <> ''").all()
+      return rows.map((row) => row.artifact_digest).filter((digest) => digest && digest.startsWith('sha256:'))
+    }],
+  })
   // V2-M5：RBAC（server 模式）——三角色 viewer/operator/admin + token TTL + 写操作审计
   const rbac = createRbac({ dir: options.workDir })
+  // v3.0-P0：身份、授权、审计、部署锁。四者都挂在同一个 DB 句柄上，
+  // 保证「谁在什么时候对什么资源做了什么」和「锁」都是持久且可验证的。
+  const auth = createAuth({ db: store.db, sessionTtlSec: options.auth?.sessionTtlSec, bootstrapAllowAnonymous: options.auth?.bootstrapAllowAnonymous !== false })
+  const audit = createAudit({ db: store.db })
+  const locks = createDeployLocks({ db: store.db, ttlSec: options.deploy?.lockTtlSec })
+  // v3.0-P0：远端构建机注册表落库（吊销持久生效，心跳超时按 3× 周期判死）。
+  const runners = createRunnerRegistry({ db: store.db, heartbeatSec: options.runners?.heartbeatSec })
+  // v3.0-P2：工具链托管（JDK/Node/Python/Maven…）。store 在 workDir 下，所以同一台机器上
+  // 所有项目共享一份下载与解包结果；锁文件放项目的 pipe.lock，跟着仓库走。
+  const toolchainRoot = options.toolchain?.storeDir || join(options.workDir, 'toolchains')
+  const toolchainStore = join(toolchainRoot, 'store')
+  // v3.0-P2：构建缓存（`uses: cache`）。和工具链一样落在 workDir 下：
+  // 宿主的 ~/.npm 之类不碰，删掉 workDir 就等于清空全部缓存。
+  const cacheStore = createCacheStore({ dir: join(options.workDir, 'cache', 'entries') })
+
+  /**
+   * 把过期未决的审批收成终态（v3.0-P0，验收项②）。
+   *
+   * 为什么必须有它：审批门抛 `APPROVAL_REQUIRED` 时会给这次运行写一条 `waiting_approval`
+   * 记录，如果没人批也没人拒，这条记录就会永远停在「等审批」上——面板上看起来像卡住了，
+   * 而实际上已经不可能再放行（审批行早已 `expires_at <= now`）。所以到期必须把它收成
+   * `failed(approval_timeout)`：状态机允许的终结态，且审计里能查到是谁申请、什么时候过期。
+   *
+   * 调用点刻意选在「读审批列表」和 `approvals()` 上（懒扫描），而不是常驻定时器：
+   * 没有面板在看的时候，扫不扫这几十行没有任何行为差异，但少一个 timer 就少一处泄漏。
+   */
+  function reapExpiredApprovals() {
+    const expired = approvalGate.resolveExpired()
+    if (expired.length === 0) return expired
+    for (const approval of expired) {
+      // 运行记录只在「还停在 waiting_approval」时才改：如果人已经批了并真跑起来，
+      // 后续状态由 runPipeline 覆盖，这里不该倒着写回去。
+      try {
+        const run = approval.runId ? store.run(approval.runId) : null
+        if (run && String(run.status) === 'waiting_approval') {
+          store.appendRun({
+            id: run.id,
+            project_id: run.project_id,
+            pipeline_name: run.pipeline_name,
+            trigger: run.trigger,
+            branch: run.branch,
+            commit_sha: run.commit_sha,
+            target: run.target,
+            status: 'failed',
+            error: 'approval_timeout',
+            dry_run: run.dry_run,
+            started_at: run.started_at,
+            finished_at: new Date().toISOString(),
+          })
+        }
+      } catch { /* 运行记录收尾失败不影响审批行已经过期这件事 */ }
+      try { store.appendOperation({ action: 'approval-timeout', project: approval.project, target: approval.target, runId: approval.runId, status: 'expired', detail: JSON.stringify(approval) }) } catch { /* best effort */ }
+      try {
+        audit.record({
+          action: 'approval.timeout', actorId: '', authMethod: 'system', tokenId: '',
+          resourceType: 'approval', resourceId: approval.id, projectId: approval.project,
+          result: 'error', reason: 'approval_timeout', sourceIp: '', requestId: '',
+        })
+      } catch { /* best effort */ }
+    }
+    return expired
+  }
 
   function remote() {
     if (remoteClient) return remoteClient
@@ -366,7 +545,8 @@ function createRuntime(ctx, config) {
   }
 
   // ---- v0.5：env/group/tag 选择器展开 + 生产护栏 + 部署锁 --------------------------------
-  const deployLocks = new Map()
+  // v3.0-P0：`deployLocks` 从进程内 Map 换成 SQLite 表（lib/locks.js）。原来的 Map 在
+  // 进程重启或多副本下完全失效，是「两个人同时点部署 prod 都成功」的直接原因。
   const CATALOG_TTL_MS = 5000
   let catalogCache = null
   let catalogAt = 0
@@ -450,10 +630,214 @@ function createRuntime(ctx, config) {
     return error
   }
 
-  function lockError(targetName) {
-    const error = new Error(`target ${targetName} 已经有一次发布在执行，等它结束后再试`)
+  function lockError(targetName, holder = null) {
+    const since = holder?.acquiredAt ? `（持有者 ${holder.owner || holder.runId || '?'}，开始于 ${holder.acquiredAt}）` : ''
+    const error = new Error(`target ${targetName} 已经有一次发布在执行${since}，等它结束后再试`)
     error.code = 'DEPLOY_IN_PROGRESS'
+    error.holder = holder || null
     return error
+  }
+
+  /**
+   * 把 pipe.yml 里的 `toolchain:` 变成「真的装了、真的断言过、只对这个子进程生效」的环境。
+   *
+   * 三个决定：
+   * ① 声明优先级 pipe.yml > 项目里的声明文件（.nvmrc 等）。主机级永不参与——同一份 pipe.yml
+   *    在装了 JDK21 的机器和装了 JDK17 的机器上必须跑出同样的结果。
+   * ② 没声明任何工具链时返回 null，runner 保持原来的 `{...process.env}` 行为：
+   *    绝大多数既有项目不写 toolchain，不该因为这次升级突然看不到宿主的 PATH 之外的东西。
+   * ③ 断言不过就抛，绝不放行。装了 17 却跑出 21 的构建产物是最难查的一类问题
+   *    （编译过了、测试过了、上线才发现主版本号不对）。
+   */
+  async function prepareToolchain({ pipe, project, runId, log }) {
+    const declared = pipe?.toolchain && typeof pipe.toolchain === 'object' ? pipe.toolchain : {}
+    const infer = declared.infer_from_files !== false
+    const specs = {}
+    for (const lang of TOOLCHAIN_LANGS) {
+      if (typeof declared[lang] === 'string' && declared[lang].trim()) specs[lang] = declared[lang].trim()
+    }
+    if (infer) {
+      // 声明文件只在 pipe.yml 没写这个语言时才生效：pipe.yml 优先，这是「显式压过隐式」。
+      const inferred = inferFromFiles(project.path)
+      for (const [lang, version] of Object.entries(inferred)) {
+        if (!specs[lang] && version) specs[lang] = version
+      }
+    }
+    if (Object.keys(specs).length === 0) return null
+    if (!options.toolchain?.enabled) {
+      log?.({ stageId: '', index: -1 }, `已在配置里关掉工具链托管，跳过 ${Object.keys(specs).join('、')}`)
+      return null
+    }
+
+    const instance = createToolchain({
+      storeDir: toolchainStore,
+      lockFile: join(project.path, 'pipe.lock'),
+      offline: options.toolchain.offline,
+      frozen: options.toolchain.frozen,
+      verifyChecksum: options.toolchain.verifyChecksum,
+    })
+    const installed = await instance.ensure(specs)
+    for (const item of installed) {
+      // 「装好了」和「真的能用」是两件事：解包成功但 bin 不可执行、或 PATH 被宿主版本抢先，
+      // 都会让构建跑在错误的解释器上。
+      log?.({ stageId: '', index: -1 }, `${item.lang} ${item.version}${item.cached ? '（缓存命中）' : ''} → ${item.root || item.dir}`)
+    }
+    if (options.toolchain.verify) {
+      const problems = assertVersions(installed)
+      if (problems.length > 0) {
+        const error = new Error(`工具链版本断言失败：${problems.map((item) => item.message).join('；')}`)
+        error.code = TOOLCHAIN_ERRORS.VERSION_MISMATCH
+        throw error
+      }
+    }
+
+    // 缓存与临时目录全部落在 workDir 下：宿主的 ~/.m2 不碰，两个 job 也不会互相踩。
+    const runDirs = {
+      m2: join(options.workDir, 'cache', 'm2'),
+      gradle: join(options.workDir, 'cache', 'gradle'),
+      npm: join(options.workDir, 'cache', 'npm'),
+      pip: join(options.workDir, 'cache', 'pip'),
+      composer: join(options.workDir, 'cache', 'composer'),
+      goBuild: join(options.workDir, 'cache', 'go-build'),
+      goMod: join(options.workDir, 'cache', 'go-mod'),
+    }
+    for (const dir of Object.values(runDirs)) {
+      try { mkdirSync(dir, { recursive: true }) } catch { /* 建不出来由子进程自己报错 */ }
+    }
+    const java = installed.find((item) => item.lang === 'java')
+    if (java) {
+      // Maven 的 `-t` 与 Gradle 的 installations.paths 都指向同一棵树，双保险锁死编译器 JDK。
+      const runDir = join(options.workDir, 'toolchains', 'run', runId)
+      try {
+        const locks = writeDualLocks({ runDir, java, vendor: /^([a-z]+)-/.exec(specs.java || '')?.[1] || '' })
+        if (locks.toolchainsXml) log?.({ stageId: '', index: -1 }, `已生成 ${locks.toolchainsXml}`)
+      } catch (error) {
+        log?.({ stageId: '', index: -1 }, `生成 toolchains.xml 失败：${error.message}`)
+      }
+    }
+    const describe = installed.map((item) => `${item.lang}=${item.version}`).join(', ')
+    return {
+      describe,
+      installed,
+      envFor: (extraEnv) => envFor(installed, { runDirs, base: process.env, extraEnv: extraEnv || {} }),
+    }
+  }
+
+  /**
+   * v3.0-P2：`uses:` 动作的能力供给。
+   *
+   * 动作本身（lib/actions.js）不知道自己跑在哪儿——它只声明「我要 git / 要工具链 / 要部署器」，
+   * 由这里把真实实现递进去。这样 lib/actions.js 能在纯单测里跑，不需要起 HTTP 服务。
+   *
+   * 注意 `deploy` 是刻意包装成「一个只有 deploy 的假 step」再交给 deployStep 的：
+   * 部署的护栏（生产确认、选择器展开、锁、审计、回滚）全部在 deployStep 里，
+   * 这里重写一遍必然漏掉其中某一条。
+   */
+  function createActionRuntime({ project, runId, pipe, log }) {
+    return {
+      project: { id: project.id, path: project.path, branch: project.branch || '', commit: project.commit || '' },
+
+      /**
+       * git 适配：lib/git.js 的 runGit 失败时返回空串（它靠「有没有输出」判断成败），
+       * 但动作需要知道「失败」与「没输出」的区别，所以这里统一成 {ok, stdout, stderr}。
+       */
+      async git(args) {
+        const started = Date.now()
+        try {
+          // required:true 才有异常可抓；默认形态把失败吞成空串，
+          // 而「git 挂了」和「git 没输出」在动作里是两种结局。
+          const stdout = runGit(project.path, args, { required: true, timeoutMs: 120000 })
+          return { ok: true, stdout, stderr: '', durationMs: Date.now() - started }
+        } catch (error) {
+          // execFileSync 的 stdio 只留了 stdout，stderr 被 ignore 掉了，
+          // 所以失败原因只能从 error.message 里取（它已含退出码与命令行）。
+          const detail = String(error?.stdout || '').trim()
+          return {
+            ok: false,
+            stdout: detail,
+            stderr: String(error?.message || error),
+            durationMs: Date.now() - started,
+          }
+        }
+      },
+
+      /** 工具链：复用与 pipe.yml 顶层同一套安装器，只是作用域变成「从这一步起」。 */
+      async toolchain(specs) {
+        const instance = createToolchain({
+          storeDir: toolchainStore,
+          lockFile: join(project.path, 'pipe.lock'),
+          offline: options.toolchain.offline,
+          frozen: options.toolchain.frozen,
+          verifyChecksum: options.toolchain.verifyChecksum,
+        })
+        const installed = await instance.ensure(specs)
+        if (options.toolchain.verify) {
+          const problems = assertVersions(installed)
+          if (problems.length > 0) {
+            const error = new Error(`工具链版本断言失败：${problems.map((item) => item.message).join('；')}`)
+            error.code = TOOLCHAIN_ERRORS.VERSION_MISMATCH
+            throw error
+          }
+        }
+        return installed
+      },
+
+      cache: {
+        restore: ({ key, paths, restoreKeys }) => cacheStore.restore({ projectId: project.id, projectPath: project.path, key, paths, restoreKeys }),
+        save: ({ key, paths }) => cacheStore.save({ projectId: project.id, projectPath: project.path, key, paths }),
+      },
+
+      /**
+       * 收制品。`name` / `retention` 目前只落在 operations 里：
+       * artifacts 表还是 v1 的三列（path/bytes/sha256），改名要动 schema，
+       * 而 P5 的制品库会整表重建——现在先保证「用户写的 name 不会凭空消失」。
+       */
+      async collect({ paths, name, retention }) {
+        const files = matchArtifacts(paths, walkFiles(project.path))
+        let bytes = 0
+        for (const rel of files) {
+          const saved = recordArtifact(runId, join(project.path, rel))
+          if (saved) bytes += saved.bytes
+        }
+        try {
+          store.appendOperation({
+            action: 'collect',
+            project: project.id,
+            run_id: runId,
+            status: files.length > 0 ? 'success' : 'failed',
+            detail: { name, retention, paths, files: files.length, bytes },
+          })
+        } catch { /* 审计行失败不影响收集结果 */ }
+        return { files, bytes, name }
+      },
+
+      /** 部署：包成只有 deploy 的假 step，交给真正的 deployStep（护栏一条都不重复实现）。 */
+      async deploy({ target, artifacts, keep, strategy }) {
+        const step = {
+          kind: 'deploy',
+          index: 0,
+          name: `部署 ${target}`,
+          deploy: { target, artifacts: artifacts || [], keep: keep || 0, strategy },
+        }
+        const result = await deployStep({ project, step, runId, commit: project.commit || '', log })
+        return { status: result?.status || 'success', ...result }
+      },
+
+      notify: async ({ channel, message, level }) => {
+        const delivered = await notifyEvent('run.action', {
+          at: new Date().toISOString(),
+          project: project.id,
+          runId,
+          channel: channel || 'default',
+          level: level || 'info',
+          message: message || '',
+          pipeline: pipe?.name || '',
+        })
+        return { delivered: Array.isArray(delivered) ? delivered.filter((item) => item && item.ok).length : 0 }
+      },
+
+      fetch: (...args) => globalThis.fetch(...args),
+    }
   }
 
   async function notifyEvent(event, payload) {
@@ -490,6 +874,16 @@ function createRuntime(ctx, config) {
       throw Object.assign(new Error(`stage 的 deploy.artifacts 没有匹配到任何文件（target ${targetName}）`), { code: 'ARTIFACT_NOT_FOUND' })
     }
     const digest = recordArtifact(runId, artifactPath)
+    // v3.0-P3：声明了 instances 的 target 走四阶段事务（stage → activate → verify → commit/abort）。
+    // 这是「先全部解包好、再统一切流」与「一台机器 N 个端口各一个进程」唯一诚实的实现路径：
+    // 老的 deploy.js 逐台 ln -sfn + restart，第 2 台失败时第 1 台已经在新版本上服务了。
+    // 没声明 instances 的 target 仍走原路径 —— 它们的回滚现场就是「一个软链」，不需要事务。
+    if (usesTransaction(deployTarget)) {
+      return await deployStepTransaction({
+        project, step, runId, commit, log, targetName, target: deployTarget, artifactPath, digest,
+        envOf: (hostName) => expanded.meta.get(hostName)?.env || '',
+      })
+    }
     // v2.0-M3：有 strategy 字段时走策略引擎（serial/parallel/rolling/canary/blue-green）
     const useStrategy = Boolean(deployTarget.strategy?.type)
     const result = useStrategy
@@ -575,6 +969,11 @@ function createRuntime(ctx, config) {
         manifest_path: host.releaseDir,
         revisions_offset: 0,
         previous: host.previous || publicReleaseId(previous) || '',
+        artifact_digest: digest?.digest || (digest?.sha256 ? `sha256:${digest.sha256}` : ''),
+        mode: deployTarget.mode || 'native',
+        strategy: deployTarget.strategy?.type || '',
+        instances: host.instances || [],
+        operator: '',
       })
     }
     store.appendOperation({
@@ -608,6 +1007,105 @@ function createRuntime(ctx, config) {
     return { status: 'success', deploy: result }
   }
 
+  /**
+   * 事务式部署（v3.0-P3）：把 deploy-engine 的四阶段结果翻译成与老路径同形的返回值，
+   * 这样 deployStep 的调用方（runner 的 deploy step、uses: deploy 动作、UI）一行都不用改。
+   * 每台成功的主机仍然各写一条 release 行，id 仍是 `<runId>@<host>` ——
+   * 一个 release 落在一台主机的多个实例上时，实例清单进 instances 列，而不是拆成多行。
+   */
+  async function deployStepTransaction({ project, step, runId, commit, log, targetName, target, artifactPath, digest, envOf }) {
+    const operator = step.operator || ''
+    const result = await deployTransaction({
+      remote: remote(),
+      project,
+      target,
+      targetName,
+      artifactPath,
+      artifactDigest: digest?.digest || (digest?.sha256 ? `sha256:${digest.sha256}` : ''),
+      releaseId: runId,
+      keep: step.deploy?.keep || target.keep || 5,
+      commit,
+      runId,
+      operator,
+      onLog: (line) => { try { log?.(line) } catch { /* log observers must not break a deploy */ } },
+      onCanaryHold: ({ waitSec, first, remaining }) => {
+        try {
+          store.appendOperation({
+            action: 'canary-hold', project: project.id, target: targetName, run_id: runId, release_id: runId,
+            status: 'waiting', detail: { waitSec, first, remaining },
+          })
+        } catch { /* audit is best effort */ }
+      },
+      onStrategyProgress: ({ type, batch, totalBatches, hosts, completed }) => {
+        try {
+          store.appendOperation({
+            action: 'strategy-progress', project: project.id, target: targetName, run_id: runId, release_id: runId,
+            status: 'progress', detail: { type, batch, totalBatches, hosts, completed },
+          })
+        } catch { /* audit is best effort */ }
+      },
+    })
+
+    // 只有真的激活成功的主机才写 active release 行。补偿过的机器写一条 superseded，
+    // 否则面板会显示「这次发布成功了 3 台」，而其中 2 台其实已经被撤回旧版本。
+    for (const host of result.hosts) {
+      if (host.skipped) continue
+      const previous = markPreviousSuperseded(targetName, host.host)
+      store.appendRelease({
+        id: `${runId}@${host.host}`,
+        project_id: project.id,
+        target: targetName,
+        host: host.host,
+        env: typeof envOf === 'function' ? (envOf(host.host) || '') : '',
+        run_id: runId,
+        commit,
+        artifact_sha256: digest?.sha256 || '',
+        artifact_digest: result.artifactDigest || digest?.digest || '',
+        mode: target.mode || 'native',
+        strategy: result.strategy?.type || '',
+        instances: host.instances || [],
+        operator,
+        created_at: host.activated_at || new Date().toISOString(),
+        activated_at: host.activated_at || '',
+        deactivated_at: host.compensated ? new Date().toISOString() : '',
+        status: host.ok ? 'active' : (host.compensated ? 'superseded' : 'failed'),
+        manifest_path: host.releaseDir,
+        revisions_offset: 0,
+        previous: host.previous || publicReleaseId(previous) || '',
+      })
+    }
+
+    store.appendOperation({
+      action: 'deploy', project: project.id, target: targetName, run_id: runId, release_id: result.releaseId,
+      status: result.ok ? 'success' : 'failed',
+      detail: {
+        target: targetName, releaseId: result.releaseId, ok: result.ok, strategy: result.strategy,
+        batches: result.strategy?.batches || [], hosts: result.hosts, instances: result.instances,
+      },
+    })
+    for (const host of result.hosts) {
+      store.appendOperation({
+        action: host.ok ? 'deploy' : 'deploy-failed',
+        project: project.id, target: targetName, host: host.host, run_id: runId,
+        release_id: `${runId}@${host.host}`,
+        status: host.ok ? 'success' : 'failed',
+        detail: {
+          batch: host.batch || 1, phase: host.phase || '', layer: host.layer || '',
+          health: host.health || '', previous: host.previous || '', error: host.error || '',
+          skipped: Boolean(host.skipped), compensated: Boolean(host.compensated),
+        },
+      })
+    }
+
+    if (!result.ok) {
+      const error = new Error(`部署失败：${result.error || '有主机未完成发布'}`)
+      error.code = 'HOST_FAILED'
+      error.hosts = result.hosts
+      throw error
+    }
+    return { status: 'success', deploy: result }
+  }
+
   function resolveTargetForStep(project, step) {
     const pipe = readPipe(project)
     const { targetName, target } = resolveTarget(pipe, options, step.deploy?.target || '')
@@ -627,6 +1125,8 @@ function createRuntime(ctx, config) {
     skipFetch = false,
     onStarted = null,
     runnerId = '',
+    actor = null,
+    approvalId = '',
   }) {
     const baseProject = pickProject(options, projectId)
     const pipe = readPipe(baseProject)
@@ -648,34 +1148,128 @@ function createRuntime(ctx, config) {
     // 先展开选择器：生产护栏与部署锁都以「真实会部署到哪些主机」为准。
     const resolution = await tryExpandTarget(resolvedTarget, resolvedSpec)
     if (!dryRun && resolution.prodHosts.length > 0 && !confirmProd) throw prodGuardError(resolution.prodHosts)
-    if (!dryRun) {
-      if (deployLocks.has(resolvedTarget)) throw lockError(resolvedTarget)
-      deployLocks.set(resolvedTarget, { at: new Date().toISOString(), runId })
-    }
-    // V2-M4：审批门（block gate）——prod 环境默认 manual: true，部署停在「待审批」，
-    // 面板点「通过」（/approve 路由）才继续；审批通过后仍走 confirm=prod 护栏（双重确认）。
     const runIdValue = dryRun ? '' : (runId || makeRunId())
-    if (!dryRun && resolvedSpec.approvalRequired && confirmProd && !approvalGate.isPending(runIdValue)) {
-      // 只有显式 confirm=prod 的路径（手动 UI 运行）才走审批门；
-      // scheduler（cron/push 轮询）的 allowProd 不触发审批，避免无 UI 时卡死。
-      const approval = approvalGate.request({
-        runId: runIdValue,
-        project: project.id,
+    // v3.0-P0：部署锁落库。过期锁会被抢占，`release()` 只放自己的锁。
+    let heldLock = null
+    /** 心跳句柄必须在外层作用域：finally 里要 clearInterval，而 try 的块作用域外不可见。 */
+    let heartbeatHandle = null
+    /** 同理：finally 要主动删掉 activeRuns 里的登记，dryRun 下它是 null。 */
+    let active = null
+    if (!dryRun) {
+      const attempt = locks.acquire({
         target: resolvedTarget,
-        requestedBy: trigger,
-        detail: `deploy to ${resolvedTarget} (${resolution.hosts.length} hosts, prod=${resolution.prodHosts.length > 0})`,
+        projectId: project.id,
+        runId: runIdValue,
+        owner: actor?.id || 'local',
       })
-      try { store.appendOperation({ action: 'approval-request', project: project.id, target: resolvedTarget, runId: runIdValue, status: 'pending', detail: JSON.stringify(approval) }) } catch { /* best effort */ }
-      const error = new Error(`部署到 ${resolvedTarget} 需要审批（runId=${runIdValue}），请在面板点「通过」`)
-      error.code = 'APPROVAL_REQUIRED'
-      error.approvalId = approval.id
-      error.runId = runIdValue
-      throw error
+      if (!attempt.ok) {
+        try {
+          audit.record({
+            action: 'deploy.lock_denied', actorId: actor?.id || '', authMethod: actor?.authMethod || '',
+            tokenId: actor?.tokenId || '', resourceType: 'target', resourceId: resolvedTarget,
+            projectId: project.id, result: 'deny', reason: `locked_by:${attempt.holder?.runId || attempt.holder?.owner || ''}`,
+            sourceIp: actor?.sourceIp || '', requestId: actor?.requestId || '',
+          })
+        } catch { /* 审计写失败不能掩盖真正的锁冲突 */ }
+        throw lockError(resolvedTarget, attempt.holder)
+      }
+      heldLock = attempt.lock
+    }
+    // 从这里到函数结束必须在同一个 try/finally 里：锁已经拿到手了，
+    // 而审批门（APPROVAL_REQUIRED）和 runner 判活（RUNNER_REVOKED）都会在
+    // 「跑到 try 之前」抛错。如果 finally 从更靠下的位置才开始，这两条路径
+    // 会把锁泄漏到 TTL 到期（默认 30 分钟）——期间 target 像被鬼占着，
+    // 面板上没人能部署，也没人知道为什么。
+    try {
+    // v3.0-P0：审批门（block gate）。prod 环境默认 approvalRequired，
+    // 闸门绑 target + artifact digest，而不是绑 run；审批通过后由 consume() 一次性消费。
+    // 「要不要审批」= target 显式 approvalRequired / 名字叫 prod（见 lib/pipe.js:369）。
+    // 注意不要把「展开出 prod 主机」也算进来：那是生产护栏（confirm=prod）的职责，
+    // 两者混在一起会让所有多环境 target 都停在待审批，而本地单用户模式没人能批（自批被禁）→ 部署死锁。
+    const needsApproval = resolvedSpec.approvalRequired
+    // 引导期（库里还没有任何用户）没有第二个人可以批，批准自己又被禁止，
+    // 所以此时不设闸门，只留痕说明「这次没有经过审批人」。
+    const bootstrapActor = actor?.authMethod === 'bootstrap'
+    if (!dryRun && needsApproval && confirmProd && bootstrapActor) {
+      try {
+        audit.record({
+          action: 'approval.bootstrap_skip', actorId: actor?.id || '', authMethod: 'bootstrap', tokenId: '',
+          resourceType: 'target', resourceId: resolvedTarget, projectId: project.id, result: 'allow',
+          reason: 'no_user_configured', sourceIp: actor?.sourceIp || '', requestId: actor?.requestId || '',
+        })
+      } catch { /* best effort */ }
+    }
+    if (!dryRun && needsApproval && confirmProd && !bootstrapActor) {
+      // 审批要保护的是「这批字节」，所以 digest 必须在放行前算出来。
+      // 它由 project/target/commit/pipeline/stage 派生：换提交或换 target 都会变，旧审批自然失效。
+      const digest = deployDigest({
+        projectId: project.id,
+        target: resolvedTarget,
+        commit: project.commit,
+        pipelineName: pipe.name,
+        stage,
+      })
+      // 已有 approved 且未消费的审批 → 直接消费放行（重跑路径）。
+      const ready = approvalGate.consume({ id: approvalId || '', digest })
+      // 调用方显式带了一条审批 id，却消费不掉：这说明「这条审批不能用」，
+      // 而不是「还没申请审批」。此时如果继续去 request() 一条新的 pending，
+      // 等于把 APPROVAL_CONSUMED / APPROVAL_DIGEST_MISMATCH 静默降级成
+      // 「请再批一次」——验收项 ④（同一审批不能用于第二个 digest）就永远测不出来，
+      // 运维也会以为审批系统在放行已作废的凭据。所以这里原样抛出真正的原因。
+      if (!ready.ok && approvalId && ready.code && ready.code !== 'APPROVAL_REQUIRED') {
+        const error = new Error(`审批 ${approvalId} 不能用于这次部署：${ready.message || ready.code}`)
+        error.code = ready.code
+        error.approvalId = approvalId
+        error.runId = runIdValue
+        throw error
+      }
+      if (!ready.ok) {
+        const approval = approvalGate.request({
+          runId: runIdValue,
+          project: project.id,
+          target: resolvedTarget,
+          artifactDigest: digest,
+          requestedBy: actor?.id || trigger,
+          detail: `deploy to ${resolvedTarget} (${resolution.hosts.length} hosts, prod=${resolution.prodHosts.length > 0})`,
+        })
+        try { store.appendOperation({ action: 'approval-request', project: project.id, target: resolvedTarget, runId: runIdValue, status: 'pending', detail: JSON.stringify(approval) }) } catch { /* best effort */ }
+        // 审批期间也要在运行列表里看得见：写一条 waiting_approval 的运行记录，
+        // 到期由 reapExpiredApprovals() 收成 failed(approval_timeout)。
+        // 不写这条记录的话，面板上「点过运行」和「什么都没发生」长得一模一样。
+        try {
+          store.appendRun({
+            id: runIdValue,
+            project_id: project.id,
+            pipeline_name: pipe.name,
+            trigger: project.trigger,
+            branch: project.branch,
+            commit_sha: project.commit,
+            target: resolvedTarget,
+            status: 'waiting_approval',
+            dry_run: 0,
+            started_at: new Date().toISOString(),
+          })
+        } catch { /* 运行记录写失败不改变审批语义 */ }
+        try {
+          audit.record({
+            action: 'approval.request', actorId: actor?.id || '', authMethod: actor?.authMethod || '', tokenId: actor?.tokenId || '',
+            resourceType: 'target', resourceId: resolvedTarget, projectId: project.id, result: 'allow',
+            reason: `approval:${approval.id}`, sourceIp: actor?.sourceIp || '', requestId: actor?.requestId || '',
+          })
+        } catch { /* 审计失败不改变响应 */ }
+        const error = new Error(`部署到 ${resolvedTarget} 需要审批（${approval.id}），请在面板点「通过」；${Math.round(approvalGate.ttlSec / 60)} 分钟内未处理将自动失效`)
+        error.code = 'APPROVAL_REQUIRED'
+        error.approvalId = approval.id
+        error.runId = runIdValue
+        error.expiresAt = approval.expiresAt
+        throw error
+      }
+      try { store.appendOperation({ action: 'approval-consumed', project: project.id, target: resolvedTarget, runId: runIdValue, status: 'consumed', detail: JSON.stringify(ready.approval) }) } catch { /* best effort */ }
     }
     // 审批已通过（/approve 路由 resolve 后重跑）：isPending 为 false 且 get 返回 approved 记录 → 跳过 resolve，直接执行。
     // pending 记录不会走到这里（上面已 throw），所以无需额外 resolve。
     const controller = dryRun ? null : new AbortController()
-    const active = dryRun ? null : {
+    active = dryRun ? null : {
       runId: runIdValue,
       projectId: project.id,
       target: resolvedTarget,
@@ -703,19 +1297,29 @@ function createRuntime(ctx, config) {
       } catch { /* observer errors must not prevent the run */ }
     }
     // V2-M2：执行面可迁移——runnerId 非空时走远端 broker，缺省本地 spawn。
+    // v3.0-P0：判活改读 DB 注册表（吊销/心跳超时都算不可用），不再信任内存 Map。
     let executor = null
     if (runnerId && !dryRun) {
-      const info = broker.describe(runnerId)
-      if (!info || info.status === 'offline') {
-        const error = new Error(`远端 runner ${runnerId} 未注册或已离线`)
-        error.code = 'RUNNER_NOT_FOUND'
+      const verdict = runners.isRunnable(runnerId)
+      if (!verdict.ok) {
+        const error = new Error(verdict.message)
+        error.code = verdict.code === 'RUNNER_REVOKED' ? 'RUNNER_REVOKED' : 'RUNNER_NOT_FOUND'
         throw error
       }
       executor = createRemoteExecutor({ broker, runnerId })
     }
-    try {
+    {
       // V2-M4：secrets 注入——interpolate 的 vars 里合并 secrets 值（仅运行时，不落明文到日志/DB）。
       const extraVars = secrets.refsForInterpolate(project.id, {})
+      // v3.0-P0：同一次运行取一份「明文值表」交给 runner 做日志脱敏——命令回显也不会漏。
+      const secretValues = typeof secrets.valuesFor === 'function' ? secrets.valuesFor(project.id) : []
+      // v3.0-P0：长流水线要在跑的过程中给锁续期，否则 TTL 到了会被别的部署抢占。
+      const heartbeatHandleLocal = heldLock ? setInterval(() => {
+        try { locks.heartbeat({ target: resolvedTarget, runId: runIdValue }) } catch { /* 续期失败让 TTL 兜底 */ }
+      }, Math.max(30_000, Math.floor((options.deploy.lockTtlSec * 1000) / 3))) : null
+      heartbeatHandle = heartbeatHandleLocal
+      if (heartbeatHandle?.unref) heartbeatHandle.unref()
+      try { audit.record({ action: 'deploy.start', actorId: actor?.id || '', authMethod: actor?.authMethod || '', tokenId: actor?.tokenId || '', resourceType: 'target', resourceId: resolvedTarget, projectId: project.id, result: 'allow', reason: `hosts:${resolution.hosts.length}`, sourceIp: actor?.sourceIp || '', requestId: actor?.requestId || '' }) } catch { /* 审计失败不阻断部署 */ }
       const run = await runPipeline({
         pipe,
         project,
@@ -729,6 +1333,14 @@ function createRuntime(ctx, config) {
         signal: controller?.signal || null,
         executor,
         extraVars,
+        secrets: secretValues,
+        concurrency: options.jobs?.concurrency,
+        // dryRun 不装工具链：干跑的意义就是「不碰机器、不等下载」，装一遍 JDK 会让它变成真跑。
+        toolchainSetup: dryRun ? null : (context) => prepareToolchain({ pipe, project, runId: context.runId, log: context.log }),
+        // 动作运行时：干跑不给它，于是 `uses:` 步骤在干跑里显示 skipped 并说明原因。
+        // 传工厂而不是实例：动作打印的每一行都必须经过 runner 的 log(where, line)，
+        // 否则「哪个 job 的哪一步说了什么」就丢了，分片日志里也找不到。
+        actions: dryRun ? null : (lineLog) => createActionRuntime({ project, runId: runIdValue, pipe, log: lineLog }),
         executeDeploy: dryRun ? null : (context) => deployStep({ project, step: context.step, runId: context.runId, commit: project.commit || '', log: context.log }),
       })
       if (!dryRun && run.runId) {
@@ -743,6 +1355,19 @@ function createRuntime(ctx, config) {
       const deploySteps = run.stages.flatMap((stageInfo) => stageInfo.steps).filter((step) => step.deploy)
       const canary = deploySteps.find((step) => step.deploy?.canary)?.deploy.canary || { first: 0, waitSec: 0, batches: [] }
       const hostRows = deploySteps.flatMap((step) => (Array.isArray(step.hosts) ? step.hosts : []))
+      // v3.0-P0：部署结果也进哈希链——失败与成功对称留痕，`cicd_audit verify` 能证明没被改过。
+      if (!dryRun) {
+        try {
+          audit.record({
+            action: run.status === 'failed' ? 'deploy.fail' : 'deploy.success',
+            actorId: actor?.id || '', authMethod: actor?.authMethod || '', tokenId: actor?.tokenId || '',
+            resourceType: 'target', resourceId: resolvedTarget, projectId: project.id,
+            result: run.status === 'failed' ? 'error' : 'allow',
+            reason: `run:${run.runId}`,
+            sourceIp: actor?.sourceIp || '', requestId: actor?.requestId || '',
+          })
+        } catch { /* 审计失败不改变部署结果 */ }
+      }
       if (!dryRun && run.runId) {
         await notifyEvent(`run.${run.status === 'failed' ? 'failed' : 'success'}`, {
           at: new Date().toISOString(),
@@ -780,6 +1405,7 @@ function createRuntime(ctx, config) {
           durationMs: item.durationMs || 0,
           steps: item.steps.map((step) => ({
             index: step.index ?? 0,
+            jobId: step.jobId || '',
             name: step.name || '',
             kind: step.kind || 'run',
             status: step.status || '',
@@ -796,10 +1422,20 @@ function createRuntime(ctx, config) {
             })),
           })),
         })),
+        // v3.0-P1：v2 的 pipe 才有 job 图；v1 返回 null，UI 据此决定是否显示 job 视图。
+        jobs: run.jobs || null,
+        // 工具链准备失败发生在任何 stage 之前，`stages` 是空的 —— 此时唯一的解释就在这里。
+        // 不带出来的话，调用方只看得到 status: failed 和一个空数组，等于没有诊断信息。
+        error: run.error || '',
+        code: run.code || '',
         releases: releases.map(releaseSummary),
       }
+    }
     } finally {
-      if (!dryRun) deployLocks.delete(resolvedTarget)
+      if (heartbeatHandle) clearInterval(heartbeatHandle)
+      if (heldLock) {
+        try { locks.release({ target: resolvedTarget, runId: runIdValue }) } catch { /* 释放失败留给 TTL 过期 */ }
+      }
       if (active) activeRuns.delete(runIdValue)
     }
   }
@@ -1008,6 +1644,163 @@ function createRuntime(ctx, config) {
     : null
 
   return {
+    // ---------------------------------------------------------------------------------------
+    // v3.0-P0：身份、审计、部署锁——三个新内核的对外面
+    // ---------------------------------------------------------------------------------------
+    /** 解析请求主体。所有路由（读和写）都从这里拿 actor，禁止各自读 header。 */
+    authBundle(request) {
+      try {
+        return auth.authenticate(request)
+      } catch (error) {
+        return { actor: null, error: { code: error.code || 'AUTH_INVALID', message: error.message || '认证失败' } }
+      }
+    },
+    /** 写审计。调用方一律 try/catch 包住——审计失败不能改变业务结果。 */
+    auditRecord(event) {
+      return audit.record(event)
+    },
+    auth,
+    audit,
+    locks,
+    me(request) {
+      const bundle = this.authBundle(request)
+      if (bundle.error) return { ok: false, code: bundle.error.code, error: bundle.error.message }
+      return {
+        ok: true,
+        actor: bundle.actor,
+        memberships: auth.membershipsOf(bundle.actor.id),
+        hasUsers: auth.hasUsers(),
+        bootstrap: Boolean(bundle.bootstrap),
+        policy: policyMatrix(),
+      }
+    },
+    login({ email = '', password = '', sourceIp = '', userAgent = '' } = {}) {
+      const result = auth.login({ email, password, sourceIp, userAgent })
+      try {
+        audit.record({ action: 'auth.login', actorId: result.user.id, authMethod: 'password', resourceType: 'session', resourceId: result.sessionId, result: 'allow', reason: 'password', sourceIp, requestId: '' })
+      } catch { /* best effort */ }
+      return { ok: true, ...result }
+    },
+    logout({ sessionId = '', request = null } = {}) {
+      const id = sessionId || readSessionId(request)
+      const actor = request ? (this.authBundle(request).actor || null) : null
+      auth.logout(id)
+      try {
+        audit.record({ action: 'auth.logout', actorId: actor?.id || '', authMethod: actor?.authMethod || '', resourceType: 'session', resourceId: id, result: 'allow', reason: '', sourceIp: '', requestId: '' })
+      } catch { /* best effort */ }
+      return { ok: true, sessionId: id }
+    },
+    users({ action = 'list', id = '', email = '', password = '', displayName = '', role = '', project = '', userId = '' } = {}) {
+      if (action === 'create') return { ok: true, user: auth.createUser({ email, password, displayName, role }) }
+      if (action === 'set-password') return { ok: true, user: auth.setPassword({ userId: userId || id, password }) }
+      if (action === 'set-role') return { ok: true, membership: auth.setRole({ userId: userId || id, project, role }) }
+      if (action === 'remove-role') return { ok: true, membership: auth.removeRole({ userId: userId || id, project }) }
+      if (action === 'get') return { ok: true, user: auth.user(userId || id) }
+      return { ok: true, users: auth.listUsers(), roles: ROLES }
+    },
+    tokens({ action = 'list', userId = '', name = '', ttlSec = 0, id = '' } = {}) {
+      if (action === 'create') return { ok: true, token: auth.createToken({ userId, name, ttlSec }) }
+      if (action === 'revoke') return { ok: true, token: auth.revokeToken(id) }
+      return { ok: true, tokens: auth.tokensOf(userId) }
+    },
+    auditList({ limit = 50, actor = '', action = '', project = '', result = '' } = {}) {
+      // audit.list() 返回数组：绝不能用 `...` 摊进对象（那会变成 {"0":{…},"1":{…}}，
+      // 客户端拿到的是一堆数字键而不是事件列表）。
+      const events = audit.list({ limit, actor, action, project, result })
+      return { ok: true, events, total: events.length, stats: audit.stats() }
+    },
+    auditVerify({ limit = 5000 } = {}) {
+      return { ok: true, ...audit.verify({ limit }) }
+    },
+    lockList() {
+      return { ok: true, locks: locks.list() }
+    },
+    lockForceRelease({ target = '', reason = '' } = {}) {
+      const result = locks.forceRelease({ target, reason })
+      try {
+        audit.record({ action: 'deploy.lock_forced', actorId: 'admin', authMethod: 'local', resourceType: 'target', resourceId: target, result: 'allow', reason, sourceIp: '', requestId: '' })
+      } catch { /* best effort */ }
+      return { ok: true, ...result }
+    },
+    /**
+     * 工具链查询 / 安装 / 锁维护（v3.0-P2）。
+     *
+     * `action=resolve` 只算「会装什么」，不下载——面板与 CI 都要能在动手之前先看一眼；
+     * `install` 才真的下载解包；`lock` 把当前解析结果写回 pipe.lock（这是唯一会产生 diff 的动作）。
+     */
+    async toolchain({ action = 'list', project: projectId = '', spec = null, lang = '', version = '', platform = '' } = {}) {
+      const platformName = platform || ''
+      if (action === 'list') {
+        const instance = createToolchain({ storeDir: toolchainStore, offline: true })
+        const items = instance.list()
+        return {
+          ok: true,
+          storeDir: toolchainStore,
+          platform: platformName || instance.platform,
+          totalBytes: items.reduce((sum, item) => sum + (item.bytes || 0), 0),
+          items: platformName ? items.filter((item) => item.platform === platformName) : items,
+        }
+      }
+      if (action === 'gc') {
+        const instance = createToolchain({ storeDir: toolchainStore, offline: true })
+        return { ok: true, ...instance.gc({ keep: [], dropDownloads: true }) }
+      }
+      if (action === 'remove') {
+        if (!lang) throw Object.assign(new Error('remove 需要 lang'), { code: 'COMMAND_INVALID' })
+        const instance = createToolchain({ storeDir: toolchainStore, offline: true })
+        return { ok: true, removed: instance.remove(lang, version) }
+      }
+      // 下面三个都针对某个项目的 pipe.yml（或显式传入的 spec）
+      const project = projectId ? pickProject(options, projectId) : (options.projects[0] || null)
+      if (!project && !spec) throw Object.assign(new Error('需要 project 或 spec'), { code: 'PROJECT_NOT_FOUND' })
+      let specs = spec && typeof spec === 'object' ? { ...spec } : {}
+      if (!spec && project) {
+        const pipe = readPipe(project)
+        for (const [name, value] of Object.entries(pipe.toolchain || {})) {
+          if (name !== 'infer_from_files' && value) specs[name] = value
+        }
+      }
+      if (Object.keys(specs).length === 0) return { ok: true, resolved: [], installed: [], note: '这个项目没有声明任何工具链（pipe.yml 的 toolchain:，或 .nvmrc/.python-version/go.mod）' }
+      const instance = createToolchain({
+        storeDir: toolchainStore,
+        lockFile: project ? join(project.path, 'pipe.lock') : '',
+        offline: options.toolchain.offline || action === 'resolve',
+        frozen: action === 'install' ? options.toolchain.frozen : false,
+        verifyChecksum: options.toolchain.verifyChecksum,
+        platforms: platformName || null,
+      })
+      if (action === 'resolve') {
+        const resolved = await instance.resolve(specs)
+        return {
+          ok: true,
+          platform: instance.platform,
+          lockFile: instance.lockFile,
+          resolved: resolved.map((item) => ({
+            lang: item.lang, spec: item.spec, resolved: item.resolved, fromLock: Boolean(item.fromLock),
+            url: item.platforms?.[instance.platform]?.url || '',
+            sha256: item.platforms?.[instance.platform]?.sha256 || '',
+          })),
+        }
+      }
+      if (action === 'lock') {
+        const resolved = await instance.resolve(specs, { writeLock: true })
+        const written = instance.saveLock()
+        return { ok: true, lockFile: written, resolved: resolved.map((item) => `${item.lang}@${item.resolved}`) }
+      }
+      if (action === 'install') {
+        const installed = await instance.ensure(specs)
+        let problems = []
+        if (options.toolchain.verify) problems = assertVersions(installed)
+        return {
+          ok: true,
+          platform: instance.platform,
+          installed: installed.map((item) => ({ lang: item.lang, version: item.version, cached: Boolean(item.cached), root: item.root || item.dir })),
+          bytes: installed.reduce((sum, item) => sum + (item.bytes || 0), 0),
+          problems,
+        }
+      }
+      throw Object.assign(new Error(`未知 action “${action}”（支持 list / resolve / install / lock / gc / remove）`), { code: 'COMMAND_INVALID' })
+    },
     listProjects() {
       return {
         workDir: options.workDir,
@@ -1076,7 +1869,9 @@ function createRuntime(ctx, config) {
     triggers: projectTriggers,
     dora,
     hook: runHook,
-    runners: () => broker.listRunners(),
+    // v3.0-P0：runner 列表以 DB 注册表为准（broker 只负责任务队列/在跑计数），
+    // 这样重启后机器还在、吊销后立刻消失，不会再出现「面板说 online 但其实早没了」。
+    runners: () => runners.list().map((row) => ({ ...row, active: broker.activeFor(row.runnerId) })),
     runnerRegister({ runnerId, labels = '', version = '', capacity = 1, token = '' } = {}) {
       if (!runnerId) {
         const error = new Error('runnerId 不能为空')
@@ -1089,64 +1884,133 @@ function createRuntime(ctx, config) {
         error.code = 'RUNNER_UNAUTHORIZED'
         throw error
       }
-      const info = broker.register(runnerId, { labels, version, capacity })
-      try { store.appendOperation({ action: 'runner-register', project: runnerId, status: 'ok', detail: JSON.stringify(info) }) } catch { /* best effort */ }
-      return { ok: true, runnerId: info.runnerId, labels: info.labels, version: info.version, capacity: info.capacity, lastSeenAt: info.lastSeenAt, status: info.status, serverTime: new Date().toISOString() }
+      // 先落库（吊销过的会在这里抛 RUNNER_REVOKED），再登记到 broker 的任务队列。
+      const info = runners.register(runnerId, { labels, version, capacity })
+      broker.register(runnerId, { labels, version, capacity })
+      try { store.appendOperation({ action: 'runner-register', project: runnerId, status: 'ok', detail: JSON.stringify({ labels: info.labels, version: info.version }) }) } catch { /* best effort */ }
+      try { audit.record({ action: 'runner.register', actorId: '', authMethod: 'runner-token', resourceType: 'runner', resourceId: runnerId, result: 'allow', reason: `labels:${info.labels.join(',')}` }) } catch { /* 审计失败不阻断注册 */ }
+      return { ok: true, runnerId: info.runnerId, labels: info.labels, version: info.version, capacity: info.capacity, lastSeenAt: info.lastSeenAt, status: info.status, heartbeatSec: info.heartbeatSec, offlineAfterSec: info.offlineAfterSec, serverTime: new Date().toISOString() }
     },
     runnerHeartbeat({ runnerId } = {}) {
-      broker.heartbeat(runnerId)
-      return { ok: true, runnerId }
+      const info = runners.heartbeat(runnerId)
+      return { ok: true, runnerId, lastSeenAt: info?.lastSeenAt || '' }
     },
     runnerPoll({ runnerId } = {}) {
-      if (runnerId) broker.heartbeat(runnerId) // poll 兼心跳：runner 活着就续 lastSeenAt
+      // poll 兼心跳：runner 活着就续 last_seen_at。吊销/不存在的机器直接拒绝，不给任务。
+      if (runnerId) {
+        const verdict = runners.isRunnable(runnerId)
+        if (!verdict.ok) {
+          const error = new Error(verdict.message)
+          error.code = verdict.code
+          throw error
+        }
+        try { runners.heartbeat(runnerId) } catch { /* 刚被吊销，下面再判一次 */ }
+      }
       const task = broker.taskForRunner(runnerId)
       if (!task) return { ok: true, task: null }
       return { ok: true, task: task.spec }
     },
-    runnerResult({ taskId, status = '', exitCode = -1, error = '' } = {}) {
+    runnerResult({ runnerId = '', taskId, status = '', exitCode = -1, error = '' } = {}) {
+      // 吊销的 runner 回报的结果一律丢弃：它可能已经不该碰这个任务了。
+      if (runnerId) {
+        const verdict = runners.isRunnable(runnerId)
+        if (!verdict.ok) {
+          const err = new Error(verdict.message)
+          err.code = verdict.code
+          throw err
+        }
+      }
       broker.resolve(taskId, { status, exitCode, error })
       return { ok: true, taskId }
     },
-    runnerLog({ taskId, line = '' } = {}) {
+    runnerLog({ runnerId = '', taskId, line = '' } = {}) {
+      if (runnerId) {
+        const verdict = runners.isRunnable(runnerId)
+        if (!verdict.ok) {
+          const err = new Error(verdict.message)
+          err.code = verdict.code
+          throw err
+        }
+      }
       broker.reportLog(taskId, line)
       return { ok: true, taskId }
     },
     runnerDeregister({ runnerId } = {}) {
+      try { runners.revoke(runnerId, { by: 'self', reason: 'deregister' }) } catch { /* 不存在时按幂等处理 */ }
       broker.markOffline(runnerId)
+      broker.cancelAll(runnerId)
       try { store.appendOperation({ action: 'runner-deregister', project: runnerId, status: 'ok', detail: '' }) } catch { /* best effort */ }
+      try { audit.record({ action: 'runner.deregister', actorId: '', authMethod: 'runner-token', resourceType: 'runner', resourceId: runnerId, result: 'allow', reason: 'self-deregister' }) } catch { /* best effort */ }
       return { ok: true, runnerId }
     },
-    // V2-M4：审批门 + secrets + environments
-    approve({ runId, approved, resolvedBy = '' } = {}) {
-      if (!runId) {
-        const error = new Error('runId 不能为空')
-        error.code = 'RUN_NOT_FOUND'
+    /** 管理员吊销：立即生效（不能等心跳超时），并取消它正在跑的任务。 */
+    runnerRevoke({ runnerId, by = '', reason = '' } = {}) {
+      const info = runners.revoke(runnerId, { by, reason })
+      broker.markOffline(runnerId)
+      broker.cancelAll(runnerId)
+      try { audit.record({ action: 'runner.revoke', actorId: by, authMethod: 'session', resourceType: 'runner', resourceId: runnerId, result: 'allow', reason: reason || 'manual' }) } catch { /* best effort */ }
+      return { ok: true, runnerId, revoked: true, revokedAt: info.revokedAt, revokedBy: info.revokedBy }
+    },
+    // V2-M4 → v3.0-P0：审批门（落库版）。approvalId 优先，其次按 runId 找最新一条。
+    approve({ runId = '', approvalId = '', id = '', approved, resolvedBy = '', reason = '', actor = null } = {}) {
+      const target = approvalId || id || ''
+      if (!target && !runId) {
+        const error = new Error('approve 需要 approvalId 或 runId')
+        error.code = 'APPROVAL_NOT_FOUND'
         throw error
       }
-      const approval = approvalGate.get(runId)
-      if (!approval) {
-        const error = new Error(`审批 ${runId} 不存在或已处理`)
-        error.code = 'RUN_NOT_FOUND'
+      const result = approvalGate.resolve({
+        id: target,
+        runId: target ? '' : runId,
+        approved,
+        // 决议人身份必须与申请时记录的 `requestedBy` 用同一套 ID（审批门存的是 actor.id），
+        // 否则「张三申请、张三批准」在库里是两条不同的字符串，自批校验永远命中不了。
+        // 有已认证主体时以它为准：resolvedBy 只是展示用标签，不能拿来绕过校验。
+        resolvedBy: actor?.id || resolvedBy || '',
+        reason,
+      })
+      if (!result.ok) {
+        const error = new Error(result.message || '审批失败')
+        error.code = result.code || 'APPROVAL_NOT_FOUND'
+        error.approval = result.approval || null
+        // 自批/已消费/已过期都属于「有人动了不该动的审批」，必须留痕。
+        try {
+          audit.record({
+            action: `approval.${approved ? 'approve' : 'reject'}.deny`, actorId: actor?.id || '', authMethod: actor?.authMethod || '',
+            tokenId: actor?.tokenId || '', resourceType: 'approval', resourceId: target || runId,
+            projectId: result.approval?.project || '', result: 'deny', reason: result.code || '',
+            sourceIp: actor?.sourceIp || '', requestId: actor?.requestId || '',
+          })
+        } catch { /* best effort */ }
         throw error
       }
-      const result = approvalGate.resolve({ runId, approved, resolvedBy, detail: '' })
+      const record = result.approval
       try {
         store.appendOperation({
           action: approved ? 'approval-resolved' : 'approval-rejected',
-          project: result.project,
-          target: result.target,
-          runId,
-          status: result.status,
-          detail: JSON.stringify({ resolvedBy, resolvedAt: result.resolvedAt }),
+          project: record.project,
+          target: record.target,
+          runId: record.runId,
+          status: record.status,
+          detail: JSON.stringify({ approvalId: record.id, resolvedBy: record.decidedBy, resolvedAt: record.decidedAt }),
         })
       } catch { /* best effort */ }
-      return { ok: true, runId, status: result.status, approved, resolvedBy, resolvedAt: result.resolvedAt }
+      try {
+        audit.record({
+          action: approved ? 'approval.approved' : 'approval.rejected', actorId: actor?.id || '', authMethod: actor?.authMethod || '',
+          tokenId: actor?.tokenId || '', resourceType: 'approval', resourceId: record.id, projectId: record.project,
+          result: 'allow', reason: `requestedBy:${record.requestedBy}`, sourceIp: actor?.sourceIp || '', requestId: actor?.requestId || '',
+        })
+      } catch { /* best effort */ }
+      return { ok: true, approvalId: record.id, runId: record.runId, status: record.status, approved, resolvedBy: record.decidedBy, resolvedAt: record.decidedAt }
     },
-    approvals({ project = '', status = '' } = {}) {
-      return approvalGate.list({ project, status })
+    approvals({ project = '', status = '', limit = 50 } = {}) {
+      reapExpiredApprovals()
+      const rows = approvalGate.list({ project, status, limit })
+      return { approvals: rows, stats: approvalGate.stats(), ttlSec: approvalGate.ttlSec }
     },
     secrets(args = {}) {
-      const { project = '', scope = 'global', name = '', value = '' } = args
+      const { project = '', scope = 'global', name = '', value = '', reveal = false } = args
       if (name) {
         if (!value) {
           const error = new Error('设置 secret 需要 value')
@@ -1156,7 +2020,61 @@ function createRuntime(ctx, config) {
         const ref = secrets.set(project, scope, name, value)
         return { ref, project, scope, name }
       }
-      return { project, scope, secrets: secrets.list(project, scope) }
+      const rows = secrets.list(project, scope)
+      // reveal 只在显式要求时把值带出来（调用方必须已过 REVEAL_SECRET 判定并写审计）。
+      if (!reveal) return { project, scope, secrets: rows }
+      const withValues = rows.map((row) => ({ ...row, value: secrets.get(row.project, row.scope, row.name) }))
+      return { project, scope, secrets: withValues, revealed: true }
+    },
+    // 路由层读字节只走这一个入口：它同时给出 status/size/range，避免调用方自己拼 header。
+    artifactStream(digest, rangeHeader = '') {
+      return artifactStore.readRange(digest, rangeHeader)
+    },
+    // ---- v3.0-P5：制品 CAS ----------------------------------------------------------------
+    // 上传只接受「本地文件系统里的路径」。这不是偷懒：CI 的产物本来就在构建机上，
+    // 让人从 HTTP 直接推字节等于把构建机开成对外写入口——鉴权面一下从「本地同源」
+    // 变成「公网可写」，收益却只是省了一次 scp。
+    async artifacts(args = {}) {
+      const { action = 'list' } = args
+      const project = args.project ? pickProject(options, args.project) : null
+      if (action === 'stats') return { ok: true, stats: artifactStore.stats() }
+      if (action === 'verify') {
+        const result = await artifactStore.verify(normalizeDigest(args.digest || ''))
+        if (!result.ok) throw artifactError('ARTIFACT_CORRUPTED', `制品 ${result.digest} 校验失败：磁盘上的字节不再是 ${result.digest}`, { digest: result.digest })
+        return { ok: true, ...result }
+      }
+      if (action === 'upload') {
+        const source = String(args.path || '')
+        if (!source) throw artifactError('COMMAND_INVALID', '上传需要 path（构建机上的文件路径）')
+        if (isDirectoryPath(source)) throw artifactError('COMMAND_INVALID', `${source} 是目录。CAS 只收单个文件，请先在管道里打包（tar/zip）`)
+        const size = (() => { try { return statSync(source).size } catch { return 0 } })()
+        if (options.artifacts.maxBytes && size > options.artifacts.maxBytes) {
+          throw artifactError('ARTIFACT_TOO_LARGE', `制品 ${size} 字节，超过上限 ${options.artifacts.maxBytes}`)
+        }
+        const result = await artifactStore.putFile(source, {
+          expectDigest: args.digest || '',
+          meta: { projectId: project?.id || args.projectId || '', runId: args.runId || '', jobId: args.jobId || '', sourcePath: source, mediaType: args.mediaType || '' },
+        })
+        return { ok: true, ...result }
+      }
+      if (action === 'tag') {
+        const record = artifactStore.putRef(args.owner || project?.id || '', args.name || '', args.digest || '', { projectId: project?.id || '' })
+        try {
+          store.db.prepare('INSERT OR REPLACE INTO artifact_refs (owner, name, digest, previous, project_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(
+            String(record.owner || ''), String(record.name || ''), record.digest, String(record.previous || ''), String(project?.id || ''), record.updatedAt,
+          )
+        } catch { /* 指针文件是事实来源，表只是索引 */ }
+        return { ok: true, ref: record }
+      }
+      if (action === 'gc') {
+        const result = artifactStore.gc({ dryRun: args.dryRun !== false, minAgeMs: 0 })
+        return { ok: true, ...result }
+      }
+      // list：项目维度优先（带上传时间/来源），否则给全仓统计。
+      const rows = project
+        ? store.db.prepare('SELECT digest, bytes, run_id, job_id, source_path, media_type, created_at FROM artifact_blobs WHERE project_id = ? ORDER BY created_at DESC LIMIT ?').all(project.id, Number(args.limit || 50))
+        : store.db.prepare('SELECT digest, bytes, project_id, run_id, source_path, created_at FROM artifact_blobs ORDER BY created_at DESC LIMIT ?').all(Number(args.limit || 50))
+      return { ok: true, project: project?.id || '', artifacts: rows, refs: artifactStore.listRefs(project?.id || ''), stats: artifactStore.stats() }
     },
     environments(projectId = '') {
       const project = pickProject(options, projectId)
@@ -1200,20 +2118,32 @@ function createRuntime(ctx, config) {
     status({ project: projectId, limit = 20 } = {}) {
       return { runs: store.runs({ project: projectId, limit }).map(runSummary), running: activeRunList(projectId) }
     },
-    logs({ runId, tail = 200 } = {}) {
+    logs({ runId, tail = 200, jobId = '' } = {}) {
       if (!runId) throw Object.assign(new Error('runId 不能为空'), { code: 'RUN_NOT_FOUND' })
       const run = store.run(runId)
       if (!run) throw Object.assign(new Error(`运行 ${runId} 不存在`), { code: 'RUN_NOT_FOUND' })
-      const raw = store.readLog(runId, { tail })
+      // v3.0-P1：带 jobId 时读分片日志（并行 job 在主日志里是交错的）；
+      // 不带时仍是原来的整条时间线，老调用方行为不变。
+      const wanted = String(jobId || '').trim()
+      const raw = wanted ? store.readJobLog(runId, wanted, { tail }) : store.readLog(runId, { tail })
+      if (wanted && !raw) {
+        const known = store.jobLogs(runId).map((item) => item.jobId)
+        throw Object.assign(
+          new Error(`job ${wanted} 没有日志（本次运行的 job：${known.join('、') || '无'}）`),
+          { code: 'RUN_NOT_FOUND' },
+        )
+      }
       const clipped = clampLog(raw, options.maxLogBytes)
       const totalLines = raw ? raw.split('\n').length : 0
       const running = activeRuns.get(runId) || null
       return {
         runId,
+        jobId: wanted,
         status: run.status,
         active: Boolean(running),
         canceling: Boolean(running?.canceling),
-        logPath: store.logPath(runId),
+        logPath: wanted ? store.jobLogPath(runId, wanted) : store.logPath(runId),
+        jobs: store.jobLogs(runId),
         totalLines,
         tail,
         truncated: clipped.truncated,
@@ -1253,6 +2183,8 @@ function createRuntime(ctx, config) {
       })
       for (const item of result.hosts.filter((entry) => entry.ok)) {
         markPreviousSuperseded(found.targetName, item.host)
+        const deployed = store.release(`${item.releaseId}@${item.host}`)
+        const artifactDigest = deployed?.artifactDigest || deployed?.artifact_digest || ''
         store.appendRelease({
           id: `${item.releaseId}@${item.host}`,
           project_id: found.project.id,
@@ -1261,7 +2193,12 @@ function createRuntime(ctx, config) {
           env: resolution.meta.get(item.host)?.env || '',
           run_id: '',
           commit: found.project.commit || '',
-          artifact_sha256: '',
+          artifact_sha256: artifactDigest.startsWith('sha256:') ? artifactDigest.slice(7) : '',
+          artifact_digest: artifactDigest,
+          mode: deployed?.mode || found.target.mode || 'native',
+          strategy: deployed?.strategy || '',
+          instances: item.instances || deployed?.instances || [],
+          operator: deployed?.operator || '',
           created_at: item.activated_at,
           activated_at: item.activated_at,
           deactivated_at: '',
@@ -1900,6 +2837,7 @@ function registerTools(ctx, runtime) {
         confirm: { type: 'boolean', description: '确认执行（默认 true；显式 false 会被拒绝）' },
         confirmProd: { type: 'boolean', description: '目标展开后含 env=prod 的主机时才需要；为 true 表示已确认生产发布' },
         runner: { type: 'string', description: '远端 runner id（V2-M2 执行面）；省略或 local 则本机执行' },
+        approvalId: { type: 'string', description: '已批准的审批 id（v3.0-P0）；带上它会一次性消费该审批放行部署' },
       },
     },
     output: { schema: RUN_SCHEMA, render: renderRun },
@@ -1912,6 +2850,7 @@ function registerTools(ctx, runtime) {
         dryRun: Boolean(args.dryRun),
         confirmProd: Boolean(args.confirmProd),
         runnerId: args.runner || '',
+        approvalId: args.approvalId || '',
       })
     },
   })
@@ -1929,13 +2868,13 @@ function registerTools(ctx, runtime) {
 
   register({
     name: 'cicd_logs',
-    description: '读取一次运行的构建日志（可只返回末尾 N 行）；日志文件在 workDir/logs/<runId>.log。',
-    parameters: { type: 'object', properties: { runId: { type: 'string' }, tail: { type: 'number', description: '只返回末尾多少行（默认 200）' } }, required: ['runId'] },
+    description: '读取一次运行的构建日志（可只返回末尾 N 行）；日志文件在 workDir/logs/<runId>.log。传 jobId 可只读某个 job 的日志（并行 job 在主日志里是交错的）。',
+    parameters: { type: 'object', properties: { runId: { type: 'string' }, jobId: { type: 'string', description: '只看某个 job 的日志（v2 的 matrix 实例名如 unit[java=17]）' }, tail: { type: 'number', description: '只返回末尾多少行（默认 200）' } }, required: ['runId'] },
     output: {
-      schema: { type: 'object', properties: { runId: { type: 'string' }, status: { type: 'string' }, logPath: { type: 'string' }, totalLines: { type: 'number' }, tail: { type: 'number' }, truncated: { type: 'boolean' }, text: { type: 'string' } } },
+      schema: { type: 'object', properties: { runId: { type: 'string' }, jobId: { type: 'string' }, status: { type: 'string' }, logPath: { type: 'string' }, jobs: { type: 'array', items: { type: 'object', properties: { jobId: { type: 'string' }, bytes: { type: 'number' }, updatedAt: { type: 'string' } } } }, totalLines: { type: 'number' }, tail: { type: 'number' }, truncated: { type: 'boolean' }, text: { type: 'string' } } },
       render: renderLogs,
     },
-    async execute(args) { return runtime.logs({ runId: args.runId, tail: args.tail || 200 }) },
+    async execute(args) { return runtime.logs({ runId: args.runId, tail: args.tail || 200, jobId: args.jobId || '' }) },
   })
 
   register({
@@ -1988,8 +2927,15 @@ function registerTools(ctx, runtime) {
   // ---- V2-M1：取消 / DORA / 触发配置 --------------------------------------------------------
   register({
     name: 'cicd_runners',
-    description: '列出已注册的远端构建主机（runner）：id、标签、容量、在线状态、在跑任务数。V2-M2 执行面。',
-    parameters: { type: 'object', properties: {} },
+    description: '列出/吊销远端构建主机（runner）。不传 action 时列出：id、标签、容量、在线状态、在跑任务数。传 action=revoke + runnerId 则立即吊销（持久生效，正在跑的任务会被取消）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['', 'list', 'revoke'], description: 'list（默认）或 revoke' },
+        runnerId: { type: 'string', description: 'action=revoke 时要吊销的 runner id' },
+        reason: { type: 'string', description: '吊销原因（写进审计）' },
+      },
+    },
     output: {
       schema: {
         type: 'object',
@@ -2002,12 +2948,17 @@ function registerTools(ctx, runtime) {
                 runnerId: { type: 'string' }, labels: { type: 'array', items: { type: 'string' } },
                 version: { type: 'string' }, capacity: { type: 'number' },
                 lastSeenAt: { type: 'string' }, status: { type: 'string' }, active: { type: 'boolean' },
+                revoked: { type: 'boolean' }, stale: { type: 'boolean' },
+                registeredAt: { type: 'string' }, revokedAt: { type: 'string' }, revokedBy: { type: 'string' },
+                heartbeatSec: { type: 'number' }, offlineAfterSec: { type: 'number' },
               },
             },
           },
+          runnerId: { type: 'string' }, revoked: { type: 'boolean' }, revokedAt: { type: 'string' }, revokedBy: { type: 'string' },
         },
       },
       render(_args, value) {
+        if (value && value.revoked) return textBlocks(`已吊销 runner ${value.runnerId}（${value.revokedAt || ''}，操作者 ${value.revokedBy || '未知'}）。它现在无法领任务、无法回报结果。`)
         const runners = Array.isArray(value.runners) ? value.runners : []
         if (runners.length === 0) return textBlocks('（还没有注册的远端 runner；本机执行面始终是 local）')
         const lines = ['远端构建主机：']
@@ -2018,7 +2969,12 @@ function registerTools(ctx, runtime) {
         return textBlocks(lines.join('\n'))
       },
     },
-    async execute() { return { runners: runtime.runners() } },
+    async execute(args = {}) {
+      const action = String(args.action || 'list')
+      if (action === 'revoke') return runtime.runnerRevoke({ runnerId: args.runnerId || '', by: 'tool', reason: args.reason || '' })
+      if (action && action !== 'list') throw Object.assign(new Error(`未知 action "${action}"（支持 list / revoke）`), { code: 'COMMAND_INVALID' })
+      return { runners: runtime.runners() }
+    },
   })
 
   register({
@@ -2131,9 +3087,11 @@ function registerTools(ctx, runtime) {
       properties: {
         runId: { type: 'string', description: '运行 id（executeRun 返回的 runId）' },
         decision: { type: 'string', enum: ['approve', 'reject'], description: '审批决定' },
+        approvalId: { type: 'string', description: '审批 id（v3.0-P0，优先于 runId）' },
+        reason: { type: 'string', description: '审批意见（可选，会写进审计）' },
         resolvedBy: { type: 'string', description: '审批人（默认 ui）' },
       },
-      required: ['runId'],
+      required: [],
     },
     output: {
       schema: {
@@ -2149,9 +3107,13 @@ function registerTools(ctx, runtime) {
       },
     },
     async execute(args = {}) {
+      // v3.0-P0：审批单有独立 id（appr-…），runId 只是它挂着的运行。
+      // 优先用 approvalId，兼容旧调用只给 runId 的写法。
       return runtime.approve({
-        runId: args.runId,
+        runId: args.runId || '',
+        approvalId: args.approvalId || '',
         approved: args.decision !== 'reject',
+        reason: args.reason || '',
         resolvedBy: args.resolvedBy || 'agent',
       })
     },
@@ -2279,6 +3241,328 @@ function registerTools(ctx, runtime) {
       })
     },
   })
+
+  // ---------------------------------------------------------------------------------------
+  // v3.0-P0：身份 / 成员 / token / 审计 / 锁——五个新工具，与 HTTP 路由一一对应。
+  // 工具层不重复判权：权限在 runtime 方法与 authorize() 里；这里只暴露能力。
+  // ---------------------------------------------------------------------------------------
+
+  register({
+    name: 'cicd_auth',
+    description: '查看当前身份（/auth/me）、登录换会话、登出。返回 actor（角色 + 项目成员关系）与完整策略矩阵；引导期（库中无用户）actor 是 bootstrap owner。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['me', 'login', 'logout'], description: 'me=查看当前身份 / login=邮箱密码换会话 / logout=注销会话' },
+        email: { type: 'string', description: 'action=login 时必填' },
+        password: { type: 'string', description: 'action=login 时必填' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          actor: { type: 'object', properties: { id: { type: 'string' }, email: { type: 'string' }, displayName: { type: 'string' }, authMethod: { type: 'string' }, role: { type: 'string' } } },
+          bootstrap: { type: 'boolean' },
+          hasUsers: { type: 'boolean' },
+          sessionId: { type: 'string' },
+          expiresAt: { type: 'string' },
+          policy: { type: 'object' },
+        },
+      },
+      render(_args, value) {
+        if (value.actor) return textBlocks(`身份：${value.actor.email || value.actor.id}（${value.actor.role}，${value.actor.authMethod}）${value.bootstrap ? ' · 引导期（尚无本地账号）' : ''}`)
+        return textBlocks(value.sessionId ? `已登录，会话 ${value.sessionId}，过期 ${value.expiresAt}` : '已登出')
+      },
+    },
+    async execute(args = {}) {
+      const action = args.action || 'me'
+      if (action === 'login') return runtime.login({ email: args.email || '', password: args.password || '' })
+      if (action === 'logout') return runtime.logout({})
+      return runtime.me(null)
+    },
+  })
+
+  register({
+    name: 'cicd_users',
+    description: '管理本地账号与项目成员关系：创建用户、改密码、授予/收回项目角色（viewer/operator/admin/owner）、列用户。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'create', 'get', 'set-password', 'set-role', 'remove-role'] },
+        id: { type: 'string', description: '用户 id（set-password/set-role/remove-role/get 用）' },
+        email: { type: 'string', description: 'action=create 时必填' },
+        password: { type: 'string', description: 'action=create/set-password 时必填' },
+        displayName: { type: 'string' },
+        role: { type: 'string', enum: ['viewer', 'operator', 'admin', 'owner'] },
+        project: { type: 'string', description: '项目 id，默认 "*" 表示全局授权' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          user: { type: 'object', properties: { id: { type: 'string' }, email: { type: 'string' }, displayName: { type: 'string' }, status: { type: 'string' } } },
+          users: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, email: { type: 'string' }, displayName: { type: 'string' }, status: { type: 'string' }, roles: { type: 'array', items: { type: 'object' } } } } },
+        },
+      },
+      render(_args, value) {
+        if (value.users) {
+          const lines = [`用户 ${value.users.length} 个：`]
+          for (const user of value.users) {
+            const roles = (user.roles || []).map((item) => `${item.project}:${item.role}`).join(' ') || '（无角色）'
+            lines.push(`- ${user.email}（${user.id}，${user.status}）${roles}`)
+          }
+          return textBlocks(lines.join('\n'))
+        }
+        return textBlocks(value.user ? `用户 ${value.user.email}（${value.user.id}，${value.user.status}）` : '用户操作完成')
+      },
+    },
+    async execute(args = {}) {
+      return runtime.users({
+        action: args.action || 'list',
+        id: args.id || '', email: args.email || '', password: args.password || '',
+        displayName: args.displayName || '', role: args.role || '', project: args.project || '',
+      })
+    },
+  })
+
+  register({
+    name: 'cicd_tokens',
+    description: '签发/吊销/列出 API token（供 CI 与脚本使用，作用域限定到项目，必须带过期时间）。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'create', 'revoke'], description: '默认 list' },
+        userId: { type: 'string', description: 'token 归属用户 id（create 必填；list 可过滤）' },
+        name: { type: 'string', description: 'token 用途备注' },
+        ttlSec: { type: 'number', description: '有效秒数（默认 30 天）' },
+        id: { type: 'string', description: 'action=revoke 时的 token id' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          token: { type: 'object', properties: { id: { type: 'string' }, secret: { type: 'string' }, name: { type: 'string' }, expiresAt: { type: 'string' } } },
+          tokens: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, name: { type: 'string' }, projectScope: { type: 'string' }, expiresAt: { type: 'string' }, revokedAt: { type: 'string' } } } },
+        },
+      },
+      render(_args, value) {
+        if (value.token?.secret) return textBlocks(`已签发 token ${value.token.id}：${value.token.secret}\n（只显示一次，请立即保存；过期 ${value.token.expiresAt}）`)
+        const tokens = value.tokens || []
+        if (tokens.length === 0) return textBlocks('（没有 token）')
+        return textBlocks(tokens.map((item) => `${item.id}  ${item.name || '-'}  scope=${item.projectScope || '*'}  过期 ${item.expiresAt}${item.revokedAt ? '（已吊销）' : ''}`).join('\n'))
+      },
+    },
+    async execute(args = {}) {
+      return runtime.tokens({ action: args.action || 'list', userId: args.userId || '', name: args.name || '', ttlSec: Number(args.ttlSec || 0), id: args.id || '' })
+    },
+  })
+
+  register({
+    name: 'cicd_audit',
+    description: '查询审计事件（哈希链）并校验链完整性。action=verify 会逐条重算 prev_hash/hash，定位第一处断裂。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'verify'], description: '默认 list' },
+        limit: { type: 'number', description: '返回条数（默认 50，最大 500）' },
+        actor: { type: 'string', description: '按主体 id 过滤' },
+        event: { type: 'string', description: '按动作过滤，如 deploy.start / policy.deny' },
+        project: { type: 'string' },
+        result: { type: 'string', enum: ['allow', 'deny', 'error'] },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          events: { type: 'array', items: { type: 'object', properties: { seq: { type: 'number' }, ts: { type: 'string' }, actorId: { type: 'string' }, action: { type: 'string' }, resourceType: { type: 'string' }, resourceId: { type: 'string' }, projectId: { type: 'string' }, result: { type: 'string' }, reason: { type: 'string' }, hash: { type: 'string' } } } },
+          verified: { type: 'boolean' },
+          count: { type: 'number' },
+          brokenSeq: { type: 'number' },
+          kind: { type: 'string' },
+        },
+      },
+      render(_args, value) {
+        if (typeof value.verified === 'boolean') {
+          if (value.verified) return textBlocks(`审计链完好：${value.count} 条事件全部校验通过`)
+          return textBlocks(`审计链断裂：第 ${value.brokenSeq} 条（${value.kind}）\n期望 ${value.expected}\n实际 ${value.actual}`)
+        }
+        const events = value.events || []
+        if (events.length === 0) return textBlocks('（没有审计事件）')
+        return textBlocks(events.map((item) => `${item.ts} #${item.seq} ${item.result.padEnd(5)} ${item.action} ${item.actorId || '-'} ${item.resourceId || ''}${item.reason ? ` — ${item.reason}` : ''}`).join('\n'))
+      },
+    },
+    async execute(args = {}) {
+      if ((args.action || '') === 'verify') return runtime.auditVerify({ limit: Number(args.limit || 5000) })
+      return runtime.auditList({
+        limit: Number(args.limit || 50),
+        actor: args.actor || '', action: args.event || '', project: args.project || '', result: args.result || '',
+      })
+    },
+  })
+
+  register({
+    name: 'cicd_locks',
+    description: '查看部署锁（落库，重启后仍互斥）或强制释放。锁按 target 唯一，带 TTL 与心跳。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'release'], description: '默认 list' },
+        target: { type: 'string', description: 'action=release 时必填' },
+        reason: { type: 'string', description: '强制释放的原因（会写审计）' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          locks: { type: 'array', items: { type: 'object', properties: { target: { type: 'string' }, projectId: { type: 'string' }, runId: { type: 'string' }, owner: { type: 'string' }, acquiredAt: { type: 'string' }, expiresAt: { type: 'string' }, heartbeatAt: { type: 'string' } } } },
+          released: { type: 'boolean' },
+        },
+      },
+      render(_args, value) {
+        if (value.released !== undefined) return textBlocks(value.released ? '已强制释放锁' : '该 target 没有锁')
+        const rows = value.locks || []
+        if (rows.length === 0) return textBlocks('（没有部署锁）')
+        return textBlocks(rows.map((item) => `${item.target}  run=${item.runId}  owner=${item.owner}  取得 ${item.acquiredAt}  到期 ${item.expiresAt}`).join('\n'))
+      },
+    },
+    async execute(args = {}) {
+      if ((args.action || '') === 'release') return runtime.lockForceRelease({ target: args.target || '', reason: args.reason || 'manual release' })
+      return runtime.lockList()
+    },
+  })
+
+  // v3.0-P5：制品 CAS。上传只收本地路径 —— 见 runtime.artifacts 上的说明。
+  register({
+    name: 'cicd_artifacts',
+    description: '制品 CAS：按 sha256 收字节（幂等去重）、按 digest 取回（支持 Range）、移指针（tag）、回收无引用 blob（默认 dry-run）。上传只接受构建机上的文件路径。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'upload', 'tag', 'verify', 'gc', 'stats'], description: '默认 list' },
+        project: PROJECT_PARAM,
+        path: { type: 'string', description: 'action=upload 时必填：构建机上的文件路径（不接受目录）' },
+        digest: { type: 'string', description: 'sha256:<64 hex>；upload 时作为校验值，tag/verify 时作为目标' },
+        runId: { type: 'string', description: 'optional：把这次上传记到某次运行名下' },
+        jobId: { type: 'string', description: 'optional：并行 job 的分片归属' },
+        mediaType: { type: 'string' },
+        owner: { type: 'string', description: 'action=tag：指针归属（默认项目 id）' },
+        name: { type: 'string', description: 'action=tag：指针名，如 latest / staging' },
+        limit: { type: 'number' },
+        dryRun: { type: 'boolean', description: 'action=gc：默认 true，只列出不删除' },
+      },
+      required: [],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          digest: { type: 'string' },
+          bytes: { type: 'number' },
+          deduped: { type: 'boolean' },
+          actual: { type: 'string' },
+          ref: { type: 'object' },
+          stats: { type: 'object' },
+          removed: { type: 'array', items: { type: 'object' } },
+          kept: { type: 'array', items: { type: 'string' } },
+          reclaimedBytes: { type: 'number' },
+          artifacts: { type: 'array', items: { type: 'object' } },
+          refs: { type: 'array', items: { type: 'object' } },
+        },
+      },
+      render(_args, value) {
+        if (value.digest) return textBlocks(`${value.digest}（${value.bytes ?? 0} 字节${value.deduped ? '，已存在，未重复写入' : ''}）`)
+        if (value.ref) return textBlocks(`${value.ref.owner}/${value.ref.name} → ${value.ref.digest}`)
+        if (value.removed || value.kept) {
+          const lines = [`GC${value.dryRun ? '（dry-run，未删除）' : ''}：可回收 ${(value.removed || []).length} 个，${value.reclaimedBytes || 0} 字节；保留 ${(value.kept || []).length} 个`]
+          for (const item of value.removed || []) lines.push(`- ${item.digest} ${item.bytes} 字节`)
+          return textBlocks(lines.join('\n'))
+        }
+        if (value.artifacts) {
+          const lines = [`制品 ${value.artifacts.length} 个（共 ${value.stats?.count ?? 0} 个 blob，${value.stats?.bytes ?? 0} 字节）`]
+          for (const item of value.artifacts) lines.push(`- ${item.digest} ${item.bytes} 字节 ${item.created_at || ''}`)
+          for (const ref of value.refs || []) lines.push(`- 指针 ${ref.owner}/${ref.name} → ${ref.digest}`)
+          return textBlocks(lines.join('\n'))
+        }
+        return textBlocks(value.stats ? `制品库：${value.stats.count} 个 blob，${value.stats.bytes} 字节，${value.stats.refs} 个指针` : '制品操作完成')
+      },
+    },
+    async execute(args = {}) {
+      return runtime.artifacts({
+        action: args.action || 'list',
+        project: args.project || '', path: args.path || '', digest: args.digest || '',
+        runId: args.runId || '', jobId: args.jobId || '', mediaType: args.mediaType || '',
+        owner: args.owner || '', name: args.name || '', limit: args.limit,
+        dryRun: args.dryRun !== false,
+      })
+    },
+  })
+
+  register({
+    name: 'cicd_toolchain',
+    description: '工具链托管（JDK / Node / Python / Maven / Gradle / Go）：查看已装、解析会装什么、安装、写锁、清理。版本只由 pipe.yml 的 toolchain: 决定，机器上装了什么版本不影响结果。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'resolve', 'install', 'lock', 'gc', 'remove'], description: 'list=已装清单；resolve=只算不下载；install=真的装；lock=写 pipe.lock；gc/remove=清理' },
+        project: { type: 'string', description: '项目 id（resolve/install/lock 必需，除非直接给 spec）' },
+        spec: { type: 'object', description: '直接指定语言版本，如 {"java":"temurin-17"}（覆盖 pipe.yml）' },
+        lang: { type: 'string', description: 'remove/list 过滤用' },
+        version: { type: 'string', description: 'remove 用' },
+        platform: { type: 'string', description: '默认当前平台，如 linux-x64' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          storeDir: { type: 'string' },
+          platform: { type: 'string' },
+          totalBytes: { type: 'number' },
+          items: { type: 'array', items: { type: 'object', properties: { lang: { type: 'string' }, version: { type: 'string' }, platform: { type: 'string' }, bytes: { type: 'number' }, root: { type: 'string' } } } },
+          resolved: { type: 'array', items: { type: 'object', properties: { lang: { type: 'string' }, spec: { type: 'string' }, resolved: { type: 'string' }, fromLock: { type: 'boolean' }, url: { type: 'string' } } } },
+          installed: { type: 'array', items: { type: 'object', properties: { lang: { type: 'string' }, version: { type: 'string' }, cached: { type: 'boolean' }, root: { type: 'string' } } } },
+          problems: { type: 'array', items: { type: 'object' } },
+          lockFile: { type: 'string' },
+        },
+      },
+      render(_args, value) {
+        const items = value.items || []
+        if (items.length > 0) {
+          const mb = (bytes) => `${(Number(bytes || 0) / 1024 / 1024).toFixed(1)}MB`
+          const head = `${value.storeDir}（${value.platform}）`
+          const body = items.map((item) => `${item.lang} ${item.version} ${item.platform} ${mb(item.bytes)} ${item.root}`).join(String.fromCharCode(10))
+          return textBlocks([head, body].join(String.fromCharCode(10)))
+        }
+        const installed = value.installed || []
+        if (installed.length > 0) return textBlocks(installed.map((item) => `${item.lang} ${item.version}${item.cached ? '（缓存命中）' : ''} → ${item.root}`).join(String.fromCharCode(10)))
+        const resolved = value.resolved || []
+        if (resolved.length > 0) return textBlocks(resolved.map((item) => `${item.lang} ${item.spec} → ${item.resolved}${item.fromLock ? '（来自锁文件）' : ''}`).join(String.fromCharCode(10)))
+        return textBlocks(value.note || '（没有工具链信息）')
+      },
+    },
+    async execute(args = {}) {
+      return runtime.toolchain({
+        action: args.action || 'list',
+        project: args.project || '',
+        spec: args.spec && typeof args.spec === 'object' ? args.spec : null,
+        lang: args.lang || '',
+        version: args.version || '',
+        platform: args.platform || '',
+      })
+    },
+  })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2290,7 +3574,14 @@ function errorStatus(error) {
   if (code === 'REMOTE_UNAVAILABLE') return 503
   if (code === 'HEALTH_FAILED') return 502
   if (code === 'PIPE_NOT_FOUND') return 404
-  if (code === 'PROD_CONFIRM_REQUIRED' || code === 'DEPLOY_IN_PROGRESS') return 409
+  if (code === 'PROD_CONFIRM_REQUIRED' || code === 'DEPLOY_IN_PROGRESS' || code === 'DEPLOY_LOCKED') return 409
+  // v3.0-P0：身份与授权。401 = 没身份/身份失效；403 = 有身份但没权限。
+  if (code === 'AUTH_REQUIRED' || code === 'AUTH_INVALID' || code === 'AUTH_DISABLED') return 401
+  if (code === 'SESSION_INVALID' || code === 'SESSION_EXPIRED' || code === 'SESSION_REVOKED') return 401
+  if (code === 'TOKEN_INVALID' || code === 'TOKEN_EXPIRED' || code === 'TOKEN_REVOKED') return 401
+  if (code === 'POLICY_DENY') return 403
+  if (code === 'USER_NOT_FOUND') return 404
+  if (code === 'USER_EXISTS' || code === 'USER_INVALID' || code === 'ROLE_INVALID') return 400
   if (code === 'RUN_NOT_ACTIVE') return 409
   // V2-M1：入站 webhook。token 不符按安全模型用 401；未配置 secret / 不是 push 触发用 403。
   if (code === 'WEBHOOK_UNAUTHORIZED') return 401
@@ -2298,9 +3589,29 @@ function errorStatus(error) {
   if (code === 'WEBHOOK_INVALID') return 400
   // V2-M2：远端 runner join token 校验失败按 401。
   if (code === 'RUNNER_UNAUTHORIZED') return 401
+  // v3.0-P0：runner 注册表——吊销是 403（身份还在但已被剥夺），心跳超时按 409（机器不在线不是权限问题）。
+  if (code === 'RUNNER_REVOKED') return 403
+  if (code === 'RUNNER_OFFLINE') return 409
   // V2-M4：审批门——需要审批但尚未通过。
   if (code === 'APPROVAL_REQUIRED') return 409
-  if (code.startsWith('PIPE_') || code === 'ARTIFACT_NOT_FOUND' || code === 'COMMAND_INVALID') return 400
+  // v3.0-P0：审批实体（落库）后的细分错误码。
+  if (code === 'APPROVAL_NOT_FOUND') return 404
+  if (code === 'SELF_APPROVAL_FORBIDDEN') return 403
+  if (code === 'APPROVAL_CONSUMED' || code === 'APPROVAL_NOT_PENDING' || code === 'APPROVAL_EXPIRED' || code === 'APPROVAL_DIGEST_MISMATCH') return 409
+  // v3.0-P2：工具链。声明写错是客户端问题（400）；校验/版本不符是「这台机器不满足要求」（409）；
+  // 离线且锁缺失同样是 409（状态冲突，重试无用，得先补锁）。
+  if (code === 'TOOLCHAIN_SPEC_INVALID') return 400
+  if (code === 'TOOLCHAIN_NOT_FOUND') return 404
+  if (code === 'TOOLCHAIN_CHECKSUM' || code === 'TOOLCHAIN_VERSION_MISMATCH') return 409
+  if (code === 'TOOLCHAIN_LOCK_MISSING' || code === 'TOOLCHAIN_OFFLINE') return 409
+  if (code === 'TOOLCHAIN_DOWNLOAD') return 502
+  if (code === 'TOOLCHAIN_EXTRACT') return 500
+  // v3.0-P5：制品 CAS。「找不到」是 404，「字节对不上」是 409（有人动了磁盘，重试无用）。
+  if (code === 'ARTIFACT_NOT_FOUND') return 404
+  if (code === 'ARTIFACT_DIGEST_INVALID' || code === 'ARTIFACT_EMPTY' || code === 'ARTIFACT_TOO_LARGE') return 400
+  if (code === 'ARTIFACT_DIGEST_MISMATCH' || code === 'ARTIFACT_CORRUPTED') return 409
+  if (code === 'ARTIFACT_WRITE_FAILED') return 500
+  if (code.startsWith('PIPE_') || code === 'COMMAND_INVALID') return 400
   return 500
 }
 
@@ -2310,28 +3621,136 @@ function errorJson(error) {
 
 const WRITE_CONFIRMS = new Set(['1', 'prod'])
 
-function requireWrite(request, params, { confirms = WRITE_CONFIRMS } = {}) {
-  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求' }, 403)
-  if (!hasCicdHeader(request)) return json({ ok: false, error: '缺少 x-dsh-cicd 头' }, 403)
-  if (!confirms.has(params.get('confirm'))) {
-    return json({ ok: false, error: `写操作需要 confirm=${[...confirms].join(' 或 ')}` }, 400)
+/** 读一个 JSON 请求体；空体或坏 JSON 都当「没给参数」，交给 query 兜底。 */
+async function jsonBodyOf(request) {
+  try {
+    if (typeof request.json !== 'function') return {}
+    const text = await request.clone().text()
+    if (!text.trim()) return {}
+    const data = JSON.parse(text)
+    return data && typeof data === 'object' && !Array.isArray(data) ? data : {}
+  } catch { return {} }
+}
+
+/** 目录判断只用一次 stat，不走 readdir —— 目录可能很大。 */
+function isDirectoryPath(target) {
+  try { return statSync(target).isDirectory() } catch { return false }
+}
+
+/** 从请求里取一个稳定的关联 id，便于把「同一操作的 N 条审计」串起来。 */
+function requestIdOf(request) {
+  const existing = request?.headers?.get?.('x-request-id')
+  if (existing) return String(existing).slice(0, 64)
+  return `req-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`
+}
+
+function sourceIpOf(request) {
+  try {
+    const url = new URL(request.url)
+    return url.hostname || ''
+  } catch { return '' }
+}
+
+/**
+ * v3.0-P0 的唯一写入口：**身份 → 策略 → 审计**三件事必须一起做。
+ *
+ * 与 v2 `requireWrite` 的差别：
+ * - v2 只判「同源 + 自定义头 + confirm」，任何本地页面都能部署 prod，且查不出是谁。
+ * - 这里先 `auth.authenticate()` 解析出主体，再 `can(actor, action, resource)` 判权限，
+ *   **无论允许还是拒绝都写一条审计**（R5：一决策一审计）。
+ * - 保留同源与自定义头检查作为纵深防御（它们挡的是 CSRF/误触，不是身份）。
+ *
+ * 返回 Response 或 null；`decision` 通过返回值第二项交给调用方（目前不需要）。
+ */
+function authorize(request, params, { runtime, action, resource = {}, confirm = true, confirms = WRITE_CONFIRMS } = {}) {
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
+  if (!hasCicdHeader(request)) return json({ ok: false, error: '缺少 x-dsh-cicd 头', code: 'CSRF_HEADER' }, 403)
+  if (confirm && !confirms.has(params.get('confirm'))) {
+    return json({ ok: false, error: `写操作需要 confirm=${[...confirms].join(' 或 ')}`, code: 'CONFIRM_REQUIRED' }, 400)
   }
+  const bundle = runtime.authBundle ? runtime.authBundle(request) : { actor: null, error: { code: 'AUTH_REQUIRED', message: '认证未初始化' } }
+  if (bundle.error || !bundle.actor) {
+    const code = bundle.error?.code || 'AUTH_REQUIRED'
+    try {
+      runtime.auditRecord?.({
+        action: `auth.deny:${action}`, actorId: '', authMethod: '', resourceType: resource.type || '', resourceId: resource.id || '',
+        projectId: resource.projectId || '', result: 'deny', reason: code,
+        sourceIp: sourceIpOf(request), requestId: requestIdOf(request),
+      })
+    } catch { /* 审计失败不改变响应 */ }
+    const status = code === 'AUTH_REQUIRED' ? 401 : 401
+    return json({ ok: false, error: bundle.error?.message || '需要登录', code }, status)
+  }
+  const actor = { ...bundle.actor, sourceIp: sourceIpOf(request), requestId: requestIdOf(request) }
+  const target = { type: resource.type || 'project', id: resource.id || '', projectId: resource.projectId || '', env: resource.env || '', protected: Boolean(resource.protected) }
+  const decision = can(actor, action, target, { role: resource.role })
+  try {
+    runtime.auditRecord?.({
+      action: decision.allow ? `${action}.allow` : 'policy.deny',
+      actorId: actor.id, authMethod: actor.authMethod, tokenId: actor.tokenId || '',
+      resourceType: target.type, resourceId: target.id, projectId: target.projectId,
+      result: decision.allow ? 'allow' : 'deny',
+      reason: decision.allow ? decision.reason : `${decision.reason} (${decision.policyId})`,
+      sourceIp: actor.sourceIp, requestId: actor.requestId,
+    })
+  } catch { /* 审计失败不改变响应 */ }
+  if (!decision.allow) {
+    return json({ ok: false, error: `没有权限执行 ${action}：${decision.reason}`, code: 'POLICY_DENY', action, reason: decision.reason, policyId: decision.policyId }, 403)
+  }
+  request.__cicdActor = actor
   return null
 }
 
+/** 读路由也要求身份（至少 viewer）——否则「谁看了什么」完全不可见。 */
+function authorizeRead(request, params, { runtime, action = ACTIONS.READ, resource = {} } = {}) {
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
+  const bundle = runtime.authBundle ? runtime.authBundle(request) : { actor: null, error: { code: 'AUTH_REQUIRED', message: '认证未初始化' } }
+  if (bundle.error || !bundle.actor) {
+    const code = bundle.error?.code || 'AUTH_REQUIRED'
+    return json({ ok: false, error: bundle.error?.message || '需要登录', code }, 401)
+  }
+  const actor = { ...bundle.actor, sourceIp: sourceIpOf(request), requestId: requestIdOf(request) }
+  const target = { type: resource.type || 'project', id: resource.id || '', projectId: resource.projectId || '', env: '', protected: false }
+  const decision = can(actor, action, target)
+  if (!decision.allow) {
+    try {
+      runtime.auditRecord?.({
+        action: 'policy.deny', actorId: actor.id, authMethod: actor.authMethod, tokenId: actor.tokenId || '',
+        resourceType: target.type, resourceId: target.id, projectId: target.projectId,
+        result: 'deny', reason: `${decision.reason} (${decision.policyId})`,
+        sourceIp: actor.sourceIp, requestId: actor.requestId,
+      })
+    } catch { /* best effort */ }
+    return json({ ok: false, error: `没有权限读取：${decision.reason}`, code: 'POLICY_DENY' }, 403)
+  }
+  request.__cicdActor = actor
+  return null
+}
+
+/** 兼容旧调用点：等价于 authorize 但不带具体动作判定（仅用于低危写操作）。 */
+function requireWrite(request, params, options = {}) {
+  return authorize(request, params, { ...options, action: options.action || ACTIONS.EDIT_CONFIG, confirm: options.confirm !== false })
+}
+
+
 async function projectsResource(request, runtime) {
-  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求' }, 403)
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
   const params = queryOf(request)
   const bad = unsupportedParams(params, new Set())
   if (bad) return json({ ok: false, error: bad }, 400)
+  // v3.0-P0：读也要身份——「谁能看到所有项目」本身就是权限信息。
+  const guard = authorizeRead(request, params, { runtime, resource: { type: 'project', id: '' } })
+  if (guard) return guard
   return json({ ok: true, ...runtime.listProjects() })
 }
 
 async function projectMetaResource(request, runtime) {
-  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求' }, 403)
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
   const params = queryOf(request)
   const bad = unsupportedParams(params, new Set(['project']))
   if (bad) return json({ ok: false, error: bad }, 400)
+  const guard = authorizeRead(request, params, { runtime, resource: { type: 'project', id: params.get('project') || '', projectId: params.get('project') || '' } })
+  if (guard) return guard
   try {
     const data = await runtime.projectMeta({ project: params.get('project') || '' })
     return json({ ok: true, ...data })
@@ -2340,10 +3759,10 @@ async function projectMetaResource(request, runtime) {
 
 async function projectCreateResource(request, runtime) {
   const params = queryOf(request)
-  const guard = requireWrite(request, params)
-  if (guard) return guard
   const bad = unsupportedParams(params, new Set(['kind', 'name', 'path', 'repoUrl', 'branch', 'confirm']))
   if (bad) return json({ ok: false, error: bad }, 400)
+  const guard = authorize(request, params, { runtime, action: ACTIONS.MANAGE_PROJECT, resource: { type: 'project', id: params.get('name') || '' } })
+  if (guard) return guard
   try {
     const data = await runtime.createProject({
       kind: params.get('kind') || 'static',
@@ -2357,29 +3776,32 @@ async function projectCreateResource(request, runtime) {
 }
 
 async function validateResource(request, runtime) {
-  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求' }, 403)
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
   const params = queryOf(request)
   const bad = unsupportedParams(params, new Set(['source', 'project']))
   if (bad) return json({ ok: false, error: bad }, 400)
+  // 校验只是解析文本、不落盘也不执行：同源即可，不要求身份（编辑器边打边校验）。
   const data = runtime.validatePipe({ source: params.get('source') || '', project: params.get('project') || '' })
   return json(data)
 }
 
 async function pipeSaveResource(request, runtime) {
   const params = queryOf(request)
-  const guard = requireWrite(request, params)
-  if (guard) return guard
   const bad = unsupportedParams(params, new Set(['project', 'source', 'confirm']))
   if (bad) return json({ ok: false, error: bad }, 400)
+  const guard = authorize(request, params, { runtime, action: ACTIONS.EDIT_CONFIG, resource: { type: 'project', id: params.get('project') || '', projectId: params.get('project') || '' } })
+  if (guard) return guard
   const data = runtime.savePipe({ project: params.get('project') || '', source: params.get('source') || '' })
   return json(data)
 }
 
 async function planResource(request, runtime) {
-  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求' }, 403)
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
   const params = queryOf(request)
   const bad = unsupportedParams(params, new Set(['project', 'target']))
   if (bad) return json({ ok: false, error: bad }, 400)
+  const guard = authorizeRead(request, params, { runtime, resource: { type: 'project', id: params.get('project') || '', projectId: params.get('project') || '' } })
+  if (guard) return guard
   try {
     const data = await runtime.plan({ project: params.get('project') || '', target: params.get('target') || '' })
     return json({ ok: true, ...data })
@@ -2388,71 +3810,99 @@ async function planResource(request, runtime) {
 
 async function runResource(request, runtime) {
   const params = queryOf(request)
-  const guard = requireWrite(request, params)
-  if (guard) return guard
-  const bad = unsupportedParams(params, new Set(['project', 'target', 'stage', 'dryRun', 'confirm', 'runner']))
+  const bad = unsupportedParams(params, new Set(['project', 'target', 'stage', 'dryRun', 'confirm', 'runner', 'approvalId']))
   if (bad) return json({ ok: false, error: bad }, 400)
+  const targetName = params.get('target') || ''
+  const projectId = params.get('project') || ''
+  const isProd = params.get('confirm') === 'prod'
+  const dryRun = params.get('dryRun') === '1' || params.get('dryRun') === 'true'
+  // dryRun 只是预览：权限降到 read，但仍要求写头 + confirm（预览也会 fetch，不能当纯读放开）。
+  const guard = dryRun
+    ? authorize(request, params, { runtime, action: ACTIONS.READ, resource: { type: 'target', id: targetName, projectId } })
+    : authorize(request, params, {
+      runtime,
+      action: isProd ? ACTIONS.DEPLOY_PROD : ACTIONS.RUN,
+      resource: { type: 'target', id: targetName, projectId, protected: isProd },
+    })
+  if (guard) return guard
   try {
     const data = await runtime.run({
-      projectId: params.get('project') || '',
-      targetName: params.get('target') || '',
+      projectId,
+      targetName,
       stage: params.get('stage') || '',
-      dryRun: params.get('dryRun') === '1' || params.get('dryRun') === 'true',
-      confirmProd: params.get('confirm') === 'prod',
+      dryRun,
+      confirmProd: isProd,
       runnerId: params.get('runner') || '',
+      actor: request.__cicdActor || null,
+      approvalId: params.get('approvalId') || '',
     })
     return json({ ok: true, ...data })
   } catch (error) { return errorJson(error) }
 }
 
 async function runsResource(request, runtime) {
-  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求' }, 403)
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
   const params = queryOf(request)
   const bad = unsupportedParams(params, new Set(['project', 'limit']))
   if (bad) return json({ ok: false, error: bad }, 400)
   const limit = intParam(params, 'limit', { fallback: 20, min: 1, max: 200 })
   if (limit.error) return json({ ok: false, error: limit.error }, 400)
+  const guard = authorizeRead(request, params, { runtime, resource: { type: 'project', id: params.get('project') || '', projectId: params.get('project') || '' } })
+  if (guard) return guard
   try { return json({ ok: true, ...runtime.status({ project: params.get('project') || '', limit: limit.value }) }) } catch (error) { return errorJson(error) }
 }
 
 async function logResource(request, runtime) {
-  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求' }, 403)
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
   const params = queryOf(request)
-  const bad = unsupportedParams(params, new Set(['runId', 'tail']))
+  const bad = unsupportedParams(params, new Set(['runId', 'tail', 'jobId']))
   if (bad) return json({ ok: false, error: bad }, 400)
   const tail = intParam(params, 'tail', { fallback: 200, min: 1, max: 5000 })
   if (tail.error) return json({ ok: false, error: tail.error }, 400)
-  try { return json({ ok: true, ...runtime.logs({ runId: params.get('runId') || '', tail: tail.value }) }) } catch (error) { return errorJson(error) }
+  const guard = authorizeRead(request, params, { runtime, resource: { type: 'run', id: params.get('runId') || '' } })
+  if (guard) return guard
+  try {
+    return json({ ok: true, ...runtime.logs({ runId: params.get('runId') || '', tail: tail.value, jobId: params.get('jobId') || '' }) })
+  } catch (error) { return errorJson(error) }
 }
 
 async function releasesResource(request, runtime) {
-  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求' }, 403)
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
   const params = queryOf(request)
   const bad = unsupportedParams(params, new Set(['target', 'host', 'env', 'limit']))
   if (bad) return json({ ok: false, error: bad }, 400)
   const limit = intParam(params, 'limit', { fallback: 20, min: 1, max: 200 })
   if (limit.error) return json({ ok: false, error: limit.error }, 400)
+  const guard = authorizeRead(request, params, { runtime, resource: { type: 'target', id: params.get('target') || '', env: params.get('env') || '' } })
+  if (guard) return guard
   try { return json({ ok: true, ...runtime.releases({ target: params.get('target') || '', host: params.get('host') || '', env: params.get('env') || '', limit: limit.value }) }) } catch (error) { return errorJson(error) }
 }
 
 async function rollbackResource(request, runtime) {
   const params = queryOf(request)
-  const guard = requireWrite(request, params)
-  if (guard) return guard
   const bad = unsupportedParams(params, new Set(['target', 'releaseId', 'project', 'host', 'confirm']))
   if (bad) return json({ ok: false, error: bad }, 400)
+  const isProd = params.get('confirm') === 'prod'
+  const guard = authorize(request, params, {
+    runtime,
+    action: isProd ? ACTIONS.ROLLBACK_PROD : ACTIONS.ROLLBACK_NONPROD,
+    resource: { type: 'target', id: params.get('target') || '', projectId: params.get('project') || '', protected: isProd },
+  })
+  if (guard) return guard
   try {
-    const data = await runtime.rollback({ target: params.get('target') || '', releaseId: params.get('releaseId') || '', project: params.get('project') || '', host: params.get('host') || '', confirmProd: params.get('confirm') === 'prod' })
+    const data = await runtime.rollback({ target: params.get('target') || '', releaseId: params.get('releaseId') || '', project: params.get('project') || '', host: params.get('host') || '', confirmProd: isProd, actor: request.__cicdActor || null })
     if (!data.ok) return json({ ok: false, error: data.error, code: data.code, ...data }, errorStatus({ code: data.code }))
     return json({ ok: true, ...data })
   } catch (error) { return errorJson(error) }
 }
 
 async function targetsResource(request, runtime) {
-  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求' }, 403)
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
   const params = queryOf(request)
   const bad = unsupportedParams(params, new Set(['project']))
   if (bad) return json({ ok: false, error: bad }, 400)
+  const guard = authorizeRead(request, params, { runtime, resource: { type: 'project', id: params.get('project') || '', projectId: params.get('project') || '' } })
+  if (guard) return guard
   try {
     const data = await runtime.targets({ project: params.get('project') || '' })
     return json({ ok: true, ...data })
@@ -2460,12 +3910,14 @@ async function targetsResource(request, runtime) {
 }
 
 async function operationsResource(request, runtime) {
-  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求' }, 403)
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
   const params = queryOf(request)
   const bad = unsupportedParams(params, new Set(['project', 'runId', 'limit']))
   if (bad) return json({ ok: false, error: bad }, 400)
   const limit = intParam(params, 'limit', { fallback: 50, min: 1, max: 200 })
   if (limit.error) return json({ ok: false, error: limit.error }, 400)
+  const guard = authorizeRead(request, params, { runtime, action: ACTIONS.AUDIT_READ, resource: { type: 'project', id: params.get('project') || '', projectId: params.get('project') || '' } })
+  if (guard) return guard
   try {
     return json({ ok: true, ...runtime.operations({ project: params.get('project') || '', runId: params.get('runId') || '', limit: limit.value }) })
   } catch (error) { return errorJson(error) }
@@ -2473,10 +3925,10 @@ async function operationsResource(request, runtime) {
 
 async function notifyTestResource(request, runtime) {
   const params = queryOf(request)
-  const guard = requireWrite(request, params)
-  if (guard) return guard
   const bad = unsupportedParams(params, new Set(['confirm']))
   if (bad) return json({ ok: false, error: bad }, 400)
+  const guard = authorize(request, params, { runtime, action: ACTIONS.EDIT_CONFIG, resource: { type: 'notify', id: 'test' } })
+  if (guard) return guard
   try {
     return json(await runtime.notifyTest())
   } catch (error) { return errorJson(error) }
@@ -2486,15 +3938,15 @@ async function notifyTestResource(request, runtime) {
 
 async function cancelResource(request, runtime) {
   const params = queryOf(request)
-  const guard = requireWrite(request, params)
-  if (guard) return guard
   const bad = unsupportedParams(params, new Set(['runId', 'confirm']))
   if (bad) return json({ ok: false, error: bad }, 400)
+  const guard = authorize(request, params, { runtime, action: ACTIONS.CANCEL, resource: { type: 'run', id: params.get('runId') || '' } })
+  if (guard) return guard
   try { return json({ ok: true, ...runtime.cancel({ runId: params.get('runId') || '' }) }) } catch (error) { return errorJson(error) }
 }
 
 async function doraResource(request, runtime) {
-  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求' }, 403)
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
   const params = queryOf(request)
   const bad = unsupportedParams(params, new Set(['project', 'days']))
   if (bad) return json({ ok: false, error: bad }, 400)
@@ -2503,14 +3955,18 @@ async function doraResource(request, runtime) {
   if (days !== undefined && (!Number.isInteger(days) || days < 1 || days > 365)) {
     return json({ ok: false, error: 'days 必须是 1-365 的整数' }, 400)
   }
+  const guard = authorizeRead(request, params, { runtime, resource: { type: 'project', id: params.get('project') || '', projectId: params.get('project') || '' } })
+  if (guard) return guard
   try { return json({ ok: true, ...runtime.dora({ project: params.get('project') || '', days }) }) } catch (error) { return errorJson(error) }
 }
 
 async function triggersResource(request, runtime) {
-  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求' }, 403)
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
   const params = queryOf(request)
   const bad = unsupportedParams(params, new Set(['project']))
   if (bad) return json({ ok: false, error: bad }, 400)
+  const guard = authorizeRead(request, params, { runtime, resource: { type: 'project', id: params.get('project') || '', projectId: params.get('project') || '' } })
+  if (guard) return guard
   try { return json({ ok: true, ...runtime.triggers({ project: params.get('project') || '' }) }) } catch (error) { return errorJson(error) }
 }
 
@@ -2622,6 +4078,7 @@ async function runnerResultResource(request, runtime) {
   if (bad) return json({ ok: false, error: bad }, 400)
   try {
     const data = runtime.runnerResult({
+      runnerId: params.get('runnerId') || '',
       taskId: params.get('taskId') || '',
       status: params.get('status') || 'failed',
       exitCode: Number(params.get('exitCode') || '-1'),
@@ -2636,75 +4093,200 @@ async function runnerLogResource(request, runtime) {
   const bad = unsupportedParams(params, new Set(['runnerId', 'taskId', 'line']))
   if (bad) return json({ ok: false, error: bad }, 400)
   try {
-    const data = runtime.runnerLog({ taskId: params.get('taskId') || '', line: params.get('line') || '' })
+    const data = runtime.runnerLog({ runnerId: params.get('runnerId') || '', taskId: params.get('taskId') || '', line: params.get('line') || '' })
     return json({ ok: true, ...data })
   } catch (error) { return errorJson(error) }
 }
 
 async function runnersResource(request, runtime) {
-  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求' }, 403)
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
   const params = queryOf(request)
-  const bad = unsupportedParams(params, new Set())
+  const bad = unsupportedParams(params, new Set(['action', 'runnerId', 'reason', 'confirm']))
   if (bad) return json({ ok: false, error: bad }, 400)
+  const action = params.get('action') || ''
+  // v3.0-P0：吊销是管理动作（不是读），要单独判权并留痕。
+  if (action === 'revoke') {
+    const guard = authorize(request, params, {
+      runtime, action: ACTIONS.MANAGE_RUNNER,
+      resource: { type: 'runner', id: params.get('runnerId') || '', projectId: params.get('project') || '' },
+    })
+    if (guard) return guard
+    try {
+      const actor = request.__cicdActor || null
+      const data = runtime.runnerRevoke({
+        runnerId: params.get('runnerId') || '',
+        by: actor?.email || actor?.id || 'local',
+        reason: params.get('reason') || '',
+      })
+      return json({ ok: true, ...data })
+    } catch (error) { return errorJson(error) }
+  }
+  if (action) return json({ ok: false, error: `未知 action "${action}"（支持 revoke）` }, 400)
+  const guard = authorizeRead(request, params, { runtime, resource: { type: 'runner', id: '' } })
+  if (guard) return guard
   try { return json({ ok: true, runners: runtime.runners() }) } catch (error) { return errorJson(error) }
 }
 
 // V2-M4：审批路由——/approve 通过/拒绝审批，/approvals 列出待审批/已审批记录。
 async function approveResource(request, runtime) {
-  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求' }, 403)
-  if (!hasCicdHeader(request)) return json({ ok: false, error: '缺少 x-dsh-cicd 头' }, 403)
   const params = queryOf(request)
-  const bad = unsupportedParams(params, new Set(['runId', 'decision', 'resolvedBy', 'confirm']))
+  const bad = unsupportedParams(params, new Set(['runId', 'approvalId', 'id', 'decision', 'resolvedBy', 'reason', 'confirm']))
   if (bad) return json({ ok: false, error: bad }, 400)
   const runId = params.get('runId') || ''
-  if (!runId) return json({ ok: false, error: '缺少 runId' }, 400)
+  const approvalId = params.get('approvalId') || params.get('id') || ''
+  if (!runId && !approvalId) return json({ ok: false, error: '缺少 approvalId 或 runId' }, 400)
   const decision = params.get('decision') || 'approve'
   if (!['approve', 'reject'].includes(decision)) return json({ ok: false, error: `decision 只能是 approve 或 reject（收到 "${decision}"）` }, 400)
-  if (!WRITE_CONFIRMS.has(params.get('confirm'))) return json({ ok: false, error: `写操作需要 confirm=${[...WRITE_CONFIRMS].join(' 或 ')}` }, 400)
+  // v3.0-P0：审批是独立权限（R1 四权分立），不能靠 deploy 权限顺带获得。
+  const guard = authorize(request, params, {
+    runtime, action: ACTIONS.APPROVE,
+    resource: { type: 'approval', id: approvalId || runId, projectId: params.get('project') || '' },
+  })
+  if (guard) return guard
   try {
-    const result = runtime.approve({ runId, approved: decision === 'approve', resolvedBy: params.get('resolvedBy') || 'ui' })
+    const actor = request.__cicdActor || null
+    const result = runtime.approve({
+      runId, approvalId, approved: decision === 'approve',
+      resolvedBy: params.get('resolvedBy') || '', reason: params.get('reason') || '', actor,
+    })
     return json({ ok: true, ...result }, 200)
   } catch (error) { return errorJson(error) }
 }
 
 async function approvalsResource(request, runtime) {
-  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求' }, 403)
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
   const params = queryOf(request)
-  const bad = unsupportedParams(params, new Set(['project', 'status']))
+  const bad = unsupportedParams(params, new Set(['project', 'status', 'limit']))
   if (bad) return json({ ok: false, error: bad }, 400)
+  const guard = authorizeRead(request, params, { runtime, resource: { type: 'project', id: params.get('project') || '' } })
+  if (guard) return guard
   try {
     const project = params.get('project') || ''
     const status = params.get('status') || ''
-    return json({ ok: true, approvals: runtime.approvals({ project, status }) })
+    const limit = intParam(params, 'limit', { fallback: 50, min: 1, max: 200 })
+    if (limit.error) return json({ ok: false, error: limit.error }, 400)
+    const data = runtime.approvals({ project, status, limit: limit.value })
+    return json({ ok: true, ...data })
   } catch (error) { return errorJson(error) }
 }
 
 // V2-M4：secrets 路由——/secrets 列出/设置 secret（DB 只存 ref，载荷落 workDir/.secrets.json）。
-async function secretsResource(request, runtime) {
-  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求' }, 403)
+// v3.0-P0：列表用 manage-secret 读；**取值（reveal）单独一个权限**，且必须留审计。
+/**
+ * v3.0-P5 制品路由。
+ *
+ * GET  `/artifacts?digest=…`                          下载（支持单区间 Range，RFC 7233）
+ * GET  `/artifacts?project=…`                          列表 + 统计
+ * POST `/artifacts?action=upload&path=…`               从构建机路径收字节（重算 digest）
+ * POST `/artifacts?action=tag&owner=&name=&digest=`     移指针（不复制字节）
+ * POST `/artifacts?action=verify&digest=`              全量重算（人工巡检）
+ * POST `/artifacts?action=gc[&dryRun=0]`               回收无引用 blob（默认 dry-run）
+ */
+async function artifactsResource(request, runtime) {
   const params = queryOf(request)
-  const bad = unsupportedParams(params, new Set(['project', 'scope', 'name', 'value']))
-  if (bad) return json({ ok: false, error: bad }, 400)
+  const method = String(request.method || 'GET').toUpperCase()
+  const digest = params.get('digest') || ''
+  const project = params.get('project') || ''
+  const readOnly = method === 'GET' && digest && !params.get('action')
+  // 读字节 = read（viewer 起）；列清单/统计 = read；写字节/移指针/GC = admin。
+  const action = readOnly
+    ? ACTIONS.READ
+    : method === 'GET' ? ACTIONS.READ : ACTIONS.MANAGE_PROJECT
+  const resource = { type: 'artifact', id: digest, projectId: project }
+  // 下载不需要 x-dsh-cicd 写头和 confirm：它是 GET，且字节本身就是内容寻址的（拿不到 digest 就下载不了）。
+  const guard = readOnly || method === 'GET'
+    ? authorizeRead(request, params, { runtime, action, resource })
+    : authorize(request, params, { runtime, action, resource })
+  if (guard) return guard
+
+  if (readOnly) {
+    try {
+      const range = request.headers?.get?.('range') || ''
+      const slice = runtime.artifactStream(digest, range)
+      const headers = {
+        'content-type': 'application/octet-stream',
+        'content-length': String(slice.end - slice.start + 1),
+        'accept-ranges': 'bytes',
+        'content-digest': slice.digest,
+        'cache-control': 'public, max-age=31536000, immutable',
+        etag: `"${slice.digest}"`,
+      }
+      if (slice.status === 206) headers['content-range'] = `bytes ${slice.start}-${slice.end}/${slice.bytes}`
+      // 用 Web ReadableStream 交给 host；Host 侧会把 Node 流适配好。
+      return new Response(Readable.toWeb(slice.stream()), { status: slice.status, headers })
+    } catch (error) { return errorJson(error) }
+  }
+
+  const body = await jsonBodyOf(request)
   try {
-    const project = params.get('project') || ''
-    const scope = params.get('scope') || 'global'
-    const name = params.get('name') || ''
-    const value = params.get('value') || ''
+    const result = await runtime.artifacts({
+      action: params.get('action') || body.action || 'list',
+      project,
+      path: body.path || params.get('path') || '',
+      digest: body.digest || digest,
+      runId: body.runId || params.get('runId') || '',
+      jobId: body.jobId || params.get('jobId') || '',
+      mediaType: body.mediaType || params.get('mediaType') || '',
+      owner: body.owner || params.get('owner') || '',
+      name: body.name || params.get('name') || '',
+      limit: params.get('limit') || body.limit,
+      dryRun: params.get('dryRun') === '0' || body.dryRun === false ? false : true,
+    })
+    return json(result)
+  } catch (error) { return errorJson(error) }
+}
+
+async function secretsResource(request, runtime) {
+  const params = queryOf(request)
+  const bad = unsupportedParams(params, new Set(['project', 'scope', 'name', 'value', 'reveal', 'confirm']))
+  if (bad) return json({ ok: false, error: bad }, 400)
+  const project = params.get('project') || ''
+  const scope = params.get('scope') || 'global'
+  const name = params.get('name') || ''
+  const value = params.get('value') || ''
+  const reveal = params.get('reveal') === '1' || params.get('reveal') === 'true'
+  // 三档：列出名字 = 读（viewer）；读值 = REVEAL_SECRET（admin + 审计）；写入 = MANAGE_SECRET。
+  const action = name ? ACTIONS.MANAGE_SECRET : reveal ? ACTIONS.REVEAL_SECRET : ACTIONS.READ
+  // 三档：列名 = 读（viewer，不加 confirm/写头）；读值 = REVEAL_SECRET（admin + confirm + 审计）；写入 = MANAGE_SECRET。
+  const needsConfirm = Boolean(name) || reveal
+  const guard = needsConfirm
+    ? authorize(request, params, {
+      runtime, action, confirm: true,
+      resource: { type: 'secret', id: name ? `${project || scope}/${name}` : '', projectId: project },
+    })
+    : authorizeRead(request, params, {
+      runtime, action: ACTIONS.READ,
+      resource: { type: 'secret', id: '', projectId: project },
+    })
+  if (guard) return guard
+  try {
     if (name) {
       if (!value) return json({ ok: false, error: '设置 secret 需要 value' }, 400)
       const ref = runtime.secrets({ project, scope, name, value })
       return json({ ok: true, ref, project, scope, name })
     }
-    return json({ ok: true, secrets: runtime.secrets({ project, scope }).secrets })
+    const listed = runtime.secrets({ project, scope, reveal })
+    if (reveal) {
+      try {
+        runtime.auditRecord?.({
+          action: 'secret.revealed', actorId: request.__cicdActor?.id || '', authMethod: request.__cicdActor?.authMethod || '',
+          resourceType: 'secret', resourceId: `${project || scope}/*`, projectId: project, result: 'allow', reason: 'reveal=1',
+          sourceIp: sourceIpOf(request), requestId: requestIdOf(request),
+        })
+      } catch { /* best effort */ }
+    }
+    return json({ ok: true, ...listed })
   } catch (error) { return errorJson(error) }
 }
 
 // V2-M4：environments 路由——/environments 列出环境（dev/staging/prod）与晋升路径。
 async function environmentsResource(request, runtime) {
-  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求' }, 403)
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
   const params = queryOf(request)
   const bad = unsupportedParams(params, new Set(['project']))
   if (bad) return json({ ok: false, error: bad }, 400)
+  const guard = authorizeRead(request, params, { runtime, resource: { type: 'project', id: params.get('project') || '' } })
+  if (guard) return guard
   try {
     const project = params.get('project') || ''
     return json({ ok: true, ...runtime.environments(project) })
@@ -2712,11 +4294,18 @@ async function environmentsResource(request, runtime) {
 }
 
 // V2-M5：RBAC 路由——/rbac 签发/校验/吊销 token，列用户与审计时间线。
+// v3.0-P0：这是旧版 RBAC（文件态 token），与新的 /users /tokens /audit 并存但**不参与判定**；
+// 保留是为了不破坏既有客户端，所有判定已收敛到 lib/policy.js 的 can()。
 async function rbacResource(request, runtime) {
-  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求' }, 403)
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
   const params = queryOf(request)
-  const bad = unsupportedParams(params, new Set(['user', 'role', 'projects', 'ttlSec', 'token', 'action']))
+  const bad = unsupportedParams(params, new Set(['user', 'role', 'projects', 'ttlSec', 'token', 'action', 'confirm']))
   if (bad) return json({ ok: false, error: bad }, 400)
+  const action = params.get('action') || ''
+  if (action !== 'verify') {
+    const guard = authorizeRead(request, params, { runtime, action: ACTIONS.AUDIT_READ, resource: { type: 'rbac', id: params.get('user') || '' } })
+    if (guard) return guard
+  }
   try {
     const user = params.get('user') || ''
     const role = params.get('role') || ''
@@ -2724,8 +4313,158 @@ async function rbacResource(request, runtime) {
     const projects = projectsRaw ? projectsRaw.split(',').map((s) => s.trim()).filter(Boolean) : ['*']
     const ttlSec = Number(params.get('ttlSec') || 0)
     const token = params.get('token') || ''
-    const action = params.get('action') || ''
     return json({ ok: true, ...runtime.rbac({ user, role, projects, ttlSec, token, action }) })
+  } catch (error) { return errorJson(error) }
+}
+
+// ---------------------------------------------------------------------------------------------
+// v3.0-P0：身份 / 用户 / token / 审计 / 锁 路由
+// ---------------------------------------------------------------------------------------------
+
+/** `/auth` —— 一次调用承担 me / login / logout 三件事，避免再增三条路由。 */
+async function authResource(request, runtime) {
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
+  const params = queryOf(request)
+  const bad = unsupportedParams(params, new Set(['action', 'email', 'password']))
+  if (bad) return json({ ok: false, error: bad }, 400)
+  const action = params.get('action') || 'me'
+  try {
+    if (action === 'login') {
+      const email = params.get('email') || ''
+      const password = params.get('password') || ''
+      if (!email || !password) return json({ ok: false, error: '需要 email 与 password', code: 'AUTH_INVALID' }, 400)
+      const data = runtime.login({ email, password, sourceIp: sourceIpOf(request), userAgent: request?.headers?.get?.('user-agent') || '' })
+      // 会话 token 通过 Set-Cookie 下发，前端不必自己拼 cookie。
+      return json({ ok: true, ...data }, 200, { 'set-cookie': data.cookie, 'cache-control': 'no-store' })
+    }
+    if (action === 'logout') {
+      const data = runtime.logout({ sessionId: params.get('sessionId') || '', request })
+      return json({ ok: true, ...data }, 200, { 'set-cookie': `${SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict` })
+    }
+    const data = runtime.me(request)
+    if (!data.ok) return json({ ok: false, error: data.error, code: data.code }, data.code === 'AUTH_REQUIRED' ? 401 : 403)
+    return json({ ok: true, ...data })
+  } catch (error) { return errorJson(error) }
+}
+
+/** `/users` —— 成员与角色管理。只有 manage-members（owner）能做写操作。 */
+async function usersResource(request, runtime) {
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
+  const params = queryOf(request)
+  const bad = unsupportedParams(params, new Set(['action', 'id', 'email', 'password', 'displayName', 'role', 'project', 'confirm']))
+  if (bad) return json({ ok: false, error: bad }, 400)
+  const action = params.get('action') || 'list'
+  const write = action !== 'list' && action !== 'get'
+  try {
+    if (write) {
+      const guard = authorize(request, params, {
+        runtime, action: ACTIONS.MANAGE_MEMBERS, resource: { type: 'project', id: params.get('project') || '*', projectId: params.get('project') || '' },
+      })
+      if (guard) return guard
+    } else {
+      const guard = authorizeRead(request, params, { runtime, action: ACTIONS.READ, resource: { type: 'project', id: params.get('project') || '*' } })
+      if (guard) return guard
+    }
+    const data = runtime.users({
+      action,
+      id: params.get('id') || '',
+      email: params.get('email') || '',
+      password: params.get('password') || '',
+      displayName: params.get('displayName') || '',
+      role: params.get('role') || '',
+      project: params.get('project') || '',
+      userId: params.get('userId') || '',
+    })
+    return json({ ok: true, ...data })
+  } catch (error) { return errorJson(error) }
+}
+
+/** `/tokens` —— 每个用户给自己发 API token；签发/吊销需要 manage-secret 级以上。 */
+async function tokensResource(request, runtime) {
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
+  const params = queryOf(request)
+  const bad = unsupportedParams(params, new Set(['action', 'userId', 'name', 'ttlSec', 'id', 'confirm']))
+  if (bad) return json({ ok: false, error: bad }, 400)
+  const action = params.get('action') || 'list'
+  try {
+    if (action === 'create' || action === 'revoke') {
+      const guard = authorize(request, params, { runtime, action: ACTIONS.MANAGE_SECRET, resource: { type: 'token', id: params.get('id') || params.get('userId') || '' } })
+      if (guard) return guard
+    } else {
+      const guard = authorizeRead(request, params, { runtime, action: ACTIONS.READ, resource: { type: 'token', id: params.get('userId') || '' } })
+      if (guard) return guard
+    }
+    const ttlSec = Number(params.get('ttlSec') || 0)
+    const data = runtime.tokens({ action, userId: params.get('userId') || '', name: params.get('name') || '', ttlSec: Number.isFinite(ttlSec) ? ttlSec : 0, id: params.get('id') || '' })
+    return json({ ok: true, ...data })
+  } catch (error) { return errorJson(error) }
+}
+
+/** `/audit` —— 审计查询；`action=verify` 校验哈希链完整性。 */
+async function auditResource(request, runtime) {
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
+  const params = queryOf(request)
+  const bad = unsupportedParams(params, new Set(['action', 'limit', 'actor', 'project', 'result', 'name']))
+  if (bad) return json({ ok: false, error: bad }, 400)
+  try {
+    const guard = authorizeRead(request, params, { runtime, action: ACTIONS.AUDIT_READ, resource: { type: 'audit', id: params.get('project') || '' } })
+    if (guard) return guard
+    const limit = intParam(params, 'limit', { fallback: 50, min: 1, max: 500 })
+    if (limit.error) return json({ ok: false, error: limit.error }, 400)
+    if ((params.get('action') || '') === 'verify') return json(runtime.auditVerify({ limit: Math.max(limit.value, 1000) }))
+    return json(runtime.auditList({
+      limit: limit.value,
+      actor: params.get('actor') || '',
+      action: params.get('name') || '',
+      project: params.get('project') || '',
+      result: params.get('result') || '',
+    }))
+  } catch (error) { return errorJson(error) }
+}
+
+/** `/locks` —— 部署锁可视化与强制释放（prod 卡住时的唯一出口）。 */
+async function locksResource(request, runtime) {
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
+  const params = queryOf(request)
+  const bad = unsupportedParams(params, new Set(['action', 'target', 'reason', 'confirm']))
+  if (bad) return json({ ok: false, error: bad }, 400)
+  try {
+    const guard = authorize(request, params, { runtime, action: ACTIONS.MANAGE_RUNNER, resource: { type: 'target', id: params.get('target') || '' }, confirm: false })
+    if (guard) return guard
+    if ((params.get('action') || 'list') === 'release') {
+      if (!params.get('confirm')) return json({ ok: false, error: '强制释放需要 confirm=1', code: 'CONFIRM_REQUIRED' }, 400)
+      return json(runtime.lockForceRelease({ target: params.get('target') || '', reason: params.get('reason') || '' }))
+    }
+    return json(runtime.lockList())
+  } catch (error) { return errorJson(error) }
+}
+
+/**
+ * `/toolchain`：查询 store、解析、安装、写锁、清理。
+ *
+ * 写动作（install / lock / gc / remove）走 `MANAGE_RUNNER` 级别权限：装一个 JDK 会占几百 MB 磁盘、
+ * 还会真的访问外网，和「改 runner 配置」是同一档权力。只读动作（list / resolve）用 READ。
+ */
+async function toolchainResource(request, runtime) {
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
+  const params = queryOf(request)
+  const bad = unsupportedParams(params, new Set(['action', 'project', 'lang', 'version', 'platform', 'confirm']))
+  if (bad) return json({ ok: false, error: bad }, 400)
+  try {
+    const action = params.get('action') || 'list'
+    const write = action !== 'list' && action !== 'resolve'
+    const project = params.get('project') || ''
+    const guard = write
+      ? authorize(request, params, { runtime, action: ACTIONS.MANAGE_RUNNER, resource: { type: 'project', id: project, projectId: project } })
+      : authorizeRead(request, params, { runtime, action: ACTIONS.READ, resource: { type: 'project', id: project, projectId: project } })
+    if (guard) return guard
+    return json(await runtime.toolchain({
+      action,
+      project,
+      lang: params.get('lang') || '',
+      version: params.get('version') || '',
+      platform: params.get('platform') || '',
+    }))
   } catch (error) { return errorJson(error) }
 }
 
@@ -2763,6 +4502,16 @@ function registerHttpRoutes(ctx, runtime) {
     { kind: 'exact', path: `${ROUTE_PREFIX}/environments`, resource: (request) => environmentsResource(request, runtime) },
     // V2-M5：RBAC（server 模式三角色 + token TTL + 审计导出）
     { kind: 'exact', path: `${ROUTE_PREFIX}/rbac`, resource: (request) => rbacResource(request, runtime) },
+    // v3.0-P0：身份 / 成员 / token / 审计 / 部署锁
+    { kind: 'exact', path: `${ROUTE_PREFIX}/auth`, resource: (request) => authResource(request, runtime) },
+    { kind: 'exact', path: `${ROUTE_PREFIX}/users`, resource: (request) => usersResource(request, runtime) },
+    { kind: 'exact', path: `${ROUTE_PREFIX}/tokens`, resource: (request) => tokensResource(request, runtime) },
+    { kind: 'exact', path: `${ROUTE_PREFIX}/audit`, resource: (request) => auditResource(request, runtime) },
+    { kind: 'exact', path: `${ROUTE_PREFIX}/locks`, resource: (request) => locksResource(request, runtime) },
+    // v3.0-P2：工具链托管（JDK/Node/Python/Maven…）
+    { kind: 'exact', path: `${ROUTE_PREFIX}/toolchain`, resource: (request) => toolchainResource(request, runtime) },
+    // v3.0-P5：制品 CAS（上传 / 下载 / 指针 / GC）
+    { kind: 'exact', path: `${ROUTE_PREFIX}/artifacts`, resource: (request) => artifactsResource(request, runtime) },
     // 入站 webhook 是路径带项目名的前缀路由：/hooks/<project>
     { kind: 'prefix', path: `${ROUTE_PREFIX}/hooks`, resource: (request) => hookResource(request, runtime) },
   ]
@@ -2812,6 +4561,12 @@ export function apply(ctx, config = {}) {
 
 export const internals = {
   createRuntime,
+  // v3.0-P5：制品 CAS 的工具函数，测试与脚本直接复用同一份实现。
+  normalizeDigest,
+  digestPath,
+  parseRange,
+  createArtifactStore,
+  registerHttpRoutes,
   normalizeConfig,
   ROUTE_PREFIX,
   WRITE_HEADER,
@@ -2841,11 +4596,46 @@ export const internals = {
   createSecretStore,
   normalizeEnvironments,
   createRbac,
+  // v3.0-P0：身份 / 策略 / 审计 / 锁
+  createAuth,
+  createAudit,
+  createDeployLocks,
+  can,
+  ACTIONS,
+  policyMatrix,
+  authorize,
+  authorizeRead,
+  SESSION_COOKIE,
+  // v3.0-P1：DSL v2 内核（表达式 / 模型归一化 / DAG 调度）
+  expr,
+  model,
+  jobs,
   resources: {
     projectsResource, projectMetaResource, projectCreateResource, validateResource, pipeSaveResource, planResource,
     runResource, runsResource, logResource, releasesResource, rollbackResource, targetsResource,
     operationsResource, notifyTestResource, cancelResource, doraResource, triggersResource, hookResource,
     runnerRegisterResource, runnerPollResource, runnerResultResource, runnerLogResource, runnersResource,
     approveResource, approvalsResource, secretsResource, environmentsResource, rbacResource,
+    authResource, usersResource, tokensResource, auditResource, locksResource, toolchainResource,
   },
+  // v3.0-P2：工具链（解析 / 安装 / 注入 / 断言）
+  toolchain: { createToolchain, envFor, assertVersions, inferFromFiles, writeDualLocks, TOOLCHAIN_ERRORS, LANGS: TOOLCHAIN_LANGS },
+  // v3.0-P2：uses 动作（内置白名单，无外部 action）与构建缓存
+  actions: { runAction, ACTIONS: PIPELINE_ACTIONS, ACTION_NAMES, ACTION_ERRORS },
+  cache: { createCacheStore, CACHE_ERRORS },
+  // v3.0-P3：部署引擎（四阶段事务 / 槽位 / Actuator / manifest）
+  deploy: {
+    deployTransaction,
+    usesTransaction,
+    planBatches,
+    readManifest,
+    DEPLOY_ERRORS,
+  },
+  actuator: {
+    createNativeActuator,
+    NATIVE_COMMANDS,
+    ACTUATOR_ERRORS,
+    renderTemplate,
+  },
+  slots: { createSlotStore, SLOT_ERRORS },
 }

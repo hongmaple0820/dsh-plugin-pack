@@ -1,0 +1,291 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dsh.local/schemas/cicd/pipe-v2.schema.json",
+  "title": "dsh-cicd pipeline (v2)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "stages"],
+  "properties": {
+    "version": { "const": 2 },
+    "name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$" },
+    "description": { "type": "string", "maxLength": 500 },
+    "on": { "$ref": "#/$defs/triggers" },
+    "variables": { "type": "object", "additionalProperties": { "$ref": "#/$defs/scalar" } },
+    "environments": { "type": "object", "additionalProperties": { "$ref": "#/$defs/environment" } },
+    "templates": { "type": "object", "additionalProperties": { "$ref": "#/$defs/jobTemplate" } },
+    "stages": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/stage" }
+    }
+  },
+  "$defs": {
+    "scalar": { "type": ["string", "number", "boolean"] },
+
+    "duration": {
+      "type": "string",
+      "pattern": "^[0-9]+(ms|s|m|h)?$"
+    },
+
+    "triggers": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "push": { "$ref": "#/$defs/pushTrigger" },
+        "pull_request": { "$ref": "#/$defs/pushTrigger" },
+        "tag": { "type": "array", "items": { "type": "string" } },
+        "schedule": { "type": "string", "description": "cron, UTC，5 段" },
+        "manual": { "type": "boolean", "default": true }
+      }
+    },
+
+    "pushTrigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "branches": { "type": "array", "items": { "type": "string" } },
+        "paths": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protected": { "type": "boolean", "default": false },
+        "requireApproval": { "type": "boolean", "default": false },
+        "approvalTtl": { "$ref": "#/$defs/duration" },
+        "approvers": { "type": "array", "items": { "type": "string" } },
+        "allowedActors": { "type": "array", "items": { "type": "string" } },
+        "branchRule": { "type": "string" },
+        "tagRule": { "type": "string" },
+        "autoDeployBranches": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+
+    "stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "jobs"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$" },
+        "name": { "type": "string" },
+        "needs": { "type": "array", "items": { "type": "string" } },
+        "if": { "type": "string" },
+        "jobs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/job" }
+        }
+      }
+    },
+
+    "jobTemplate": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "可被 YAML 锚点复用的 job 片段；解析期展开"
+    },
+
+    "job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$" },
+        "name": { "type": "string" },
+        "kind": { "enum": ["build", "deploy", "verify", "manual"], "default": "build" },
+        "needs": { "type": "array", "items": { "type": "string" } },
+        "stage": { "type": "string" },
+        "image": { "type": "string" },
+        "runtime": { "enum": ["host", "container"] },
+        "toolchain": { "$ref": "#/$defs/toolchain" },
+        "matrix": { "$ref": "#/$defs/matrix" },
+        "env": { "type": "object", "additionalProperties": { "$ref": "#/$defs/scalar" } },
+        "variables": { "type": "object", "additionalProperties": { "$ref": "#/$defs/scalar" } },
+        "cwd": { "type": "string" },
+        "timeout": { "$ref": "#/$defs/duration", "default": "30m" },
+        "retries": { "type": "integer", "minimum": 0, "maximum": 5, "default": 0 },
+        "allow_failure": { "type": "boolean", "default": false },
+        "when": { "$ref": "#/$defs/condition" },
+        "if": { "type": "string" },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/step" }
+        },
+        "artifacts": { "$ref": "#/$defs/artifacts" },
+        "cache": { "type": "array", "items": { "$ref": "#/$defs/cache" } },
+        "services": { "type": "array", "items": { "$ref": "#/$defs/service" } },
+        "secrets": { "type": "array", "items": { "type": "string" } },
+        "runner": { "$ref": "#/$defs/runnerSelector" },
+        "concurrency": { "$ref": "#/$defs/concurrency" },
+
+        "environment": { "type": "string" },
+        "target": { "type": "string" },
+        "artifact": { "type": "string" },
+        "strategy": { "enum": ["serial", "parallel", "rolling", "canary", "blue-green"] },
+        "mode": { "enum": ["native", "container", "k8s"] },
+        "verify": { "$ref": "#/$defs/verify" },
+        "migrate": { "$ref": "#/$defs/migrate" },
+        "approval": { "$ref": "#/$defs/approval" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "deploy" } }, "required": ["kind"] },
+          "then": { "required": ["environment", "target"] }
+        }
+      ]
+    },
+
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "infer_from_files": { "type": "boolean", "default": true },
+        "java": { "type": "string" },
+        "maven": { "type": "string" },
+        "gradle": { "type": "string" },
+        "node": { "type": "string" },
+        "python": { "type": "string" },
+        "php": { "type": "string" },
+        "go": { "type": "string" }
+      }
+    },
+
+    "matrix": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "values": {
+          "type": "object",
+          "additionalProperties": { "type": "array", "items": { "$ref": "#/$defs/scalar" } }
+        },
+        "exclude": {
+          "type": "array",
+          "items": { "type": "object", "additionalProperties": { "$ref": "#/$defs/scalar" } }
+        }
+      }
+    },
+
+    "condition": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "branch": { "type": "string" },
+        "tag": { "type": "string" },
+        "env": { "type": "string" },
+        "changed": { "type": "string" }
+      }
+    },
+
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "id": { "type": "string" },
+        "run": { "type": "string" },
+        "uses": {
+          "enum": ["checkout", "toolchain", "cache", "collect", "deploy", "verify", "notify"]
+        },
+        "with": { "type": "object", "additionalProperties": true },
+        "env": { "type": "object", "additionalProperties": { "$ref": "#/$defs/scalar" } },
+        "cwd": { "type": "string" },
+        "shell": { "enum": ["bash", "sh", "pwsh", "cmd"], "default": "bash" },
+        "timeout": { "$ref": "#/$defs/duration" },
+        "retries": { "type": "integer", "minimum": 0, "maximum": 5 },
+        "allow_failure": { "type": "boolean", "default": false },
+        "continue_on_error": { "type": "boolean", "default": false },
+        "if": { "type": "string" }
+      },
+      "oneOf": [{ "required": ["run"] }, { "required": ["uses"] }]
+    },
+
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "paths": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "exclude": { "type": "array", "items": { "type": "string" } },
+        "name": { "type": "string" },
+        "retention": { "enum": ["default", "pinned", "ephemeral"], "default": "default" }
+      },
+      "required": ["paths"]
+    },
+
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "key": { "type": "string" },
+        "paths": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "restore_keys": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["key", "paths"]
+    },
+
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "image": { "type": "string" },
+        "env": { "type": "object", "additionalProperties": { "$ref": "#/$defs/scalar" } },
+        "ports": { "type": "array", "items": { "type": "integer" } },
+        "healthcheck": { "type": "object", "additionalProperties": true }
+      },
+      "required": ["name", "image"]
+    },
+
+    "runnerSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "labels": { "type": "array", "items": { "type": "string" } },
+        "capacity": { "type": "integer", "minimum": 1 }
+      }
+    },
+
+    "concurrency": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "group": { "type": "string" },
+        "cancel_in_progress": { "type": "boolean", "default": false }
+      },
+      "required": ["group"]
+    },
+
+    "verify": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "smoke": { "type": "array", "items": { "type": "string" } },
+        "window": { "$ref": "#/$defs/duration", "default": "60s" },
+        "maxErrorRate": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+
+    "migrate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "expand": { "type": "array", "items": { "type": "string" } },
+        "contract": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "reviewers": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "timeout": { "$ref": "#/$defs/duration", "default": "4h" },
+        "on_timeout": { "enum": ["fail", "skip"], "default": "skip" }
+      },
+      "required": ["reviewers"]
+    }
+  }
+}

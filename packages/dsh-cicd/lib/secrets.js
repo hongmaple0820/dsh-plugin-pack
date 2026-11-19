@@ -106,9 +106,28 @@ export function createSecretStore({ dir, file = '' } = {}) {
     return merged
   }
 
+  /**
+   * 该项目所有 secret 的**值**，按长度降序。
+   *
+   * 为什么需要它：`refsForInterpolate` 把明文塞进命令行，一旦命令本身被 shell 回显
+   * （`set -x`、`echo $TOKEN`、构建工具的 debug 日志），明文就进了 logs/<runId>.log。
+   * 日志脱敏要靠这张表做替换，长的先换，避免短值把长值切碎后留下残余。
+   */
+  function valuesFor(project) {
+    const out = []
+    for (const key of Object.keys(all)) {
+      const entry = all[key]
+      if (entry.project !== project) continue
+      const value = String(entry.value ?? '')
+      // 太短的值（如 "1"、"true"）替换会毁掉日志可读性，且几乎不可能是密钥。
+      if (value.length >= 4) out.push(value)
+    }
+    return out.sort((a, b) => b.length - a.length)
+  }
+
   function dispose() {
     /* 文件已持久化，无需额外清理 */
   }
 
-  return { set, get, list, remove, refsForInterpolate, dispose }
+  return { set, get, list, remove, refsForInterpolate, valuesFor, dispose }
 }

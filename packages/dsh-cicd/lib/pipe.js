@@ -21,6 +21,9 @@ export const RUNTIME_VALUES = ['static', 'node', 'python', 'go', 'php', 'docker'
 const RUNTIME_SET = new Set(RUNTIME_VALUES)
 const APP_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._@:/-]*$/
 const HOST_FAILURE_VALUES = new Set(['stop', 'continue'])
+// v3.0-P3：目前只有 native 有诚实的实现。container / k8s 在解析层就认得，
+// 但要等各自的 Actuator 落地才允许真的部署 —— 见 normalizeTarget 里的模式校验。
+export const DEPLOY_MODES = new Set(['native', 'container', 'k8s'])
 
 function quote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`
@@ -329,6 +332,93 @@ function normalizeTarget(targetName, target) {
   if (target.health?.interval !== undefined && !['string', 'number'].includes(typeof target.health.interval)) {
     throw new PipeError(`target ${targetName} 的 health.interval 必须是字符串或数字`)
   }
+  if (target.health?.window !== undefined && !['string', 'number'].includes(typeof target.health.window)) {
+    throw new PipeError(`target ${targetName} 的 health.window 必须是字符串或数字`)
+  }
+  if (target.health?.expect !== undefined && (!Number.isInteger(target.health.expect) || target.health.expect < 100 || target.health.expect > 599)) {
+    throw new PipeError(`target ${targetName} 的 health.expect 必须是 100-599 的 HTTP 状态码`)
+  }
+
+  // v3.0-P3：mode 只决定「用哪个激活器」；不认识的值直接拒绝，而不是悄悄退回 native ——
+  // 用户写 mode: k8s 却拿到 symlink 部署，是那种「看起来成功、生产其实没换」的失败。
+  const mode = target.mode === undefined || target.mode === null || target.mode === ''
+    ? 'native'
+    : String(target.mode).trim().toLowerCase()
+  if (!DEPLOY_MODES.has(mode)) {
+    throw new PipeError(`target ${targetName} 的 mode “${target.mode}” 不支持（可用 ${[...DEPLOY_MODES].join('、')}）`)
+  }
+
+  // v3.0-P3：实例不是「副本数」而是端口 + pid + 日志。count 必须显式给，
+  // 端口基址必须显式给 —— 猜一个 8080 出来，就会与用户机器上别的东西抢端口。
+  let instances = null
+  if (target.instances !== undefined && target.instances !== null && target.instances !== '') {
+    if (typeof target.instances !== 'object' || Array.isArray(target.instances)) {
+      throw new PipeError(`target ${targetName} 的 instances 必须是 map`)
+    }
+    const count = target.instances.count
+    if (!Number.isInteger(count) || count < 1 || count > 512) {
+      throw new PipeError(`target ${targetName} 的 instances.count 必须是 1-512 的整数`)
+    }
+    const portSpec = target.instances.port
+    if (!portSpec || typeof portSpec !== 'object' || Array.isArray(portSpec)) {
+      throw new PipeError(`target ${targetName} 的 instances.port 必须是 map（含 base，可选 step）`)
+    }
+    const base = portSpec.base
+    if (!Number.isInteger(base) || base < 1 || base > 65535) {
+      throw new PipeError(`target ${targetName} 的 instances.port.base 必须是 1-65535 的整数`)
+    }
+    const step = portSpec.step === undefined || portSpec.step === null ? 1 : portSpec.step
+    if (!Number.isInteger(step) || step < 1 || step > 1000) {
+      throw new PipeError(`target ${targetName} 的 instances.port.step 必须是 1-1000 的整数`)
+    }
+    // 越界在这里就报，不留到部署时让第一个实例起在 70000 上。
+    const lastPort = base + step * (count - 1)
+    if (lastPort > 65535) {
+      throw new PipeError(`target ${targetName} 的实例端口会越界（${base} + ${step} × ${count - 1} = ${lastPort} > 65535）`)
+    }
+    if (target.instances.weight !== undefined) {
+      const weight = target.instances.weight
+      if (!Number.isInteger(weight) || weight < 0 || weight > 100) {
+        throw new PipeError(`target ${targetName} 的 instances.weight 必须是 0-100 的整数`)
+      }
+    }
+    const instanceEnv = target.instances.env
+    if (instanceEnv !== undefined && (typeof instanceEnv !== 'object' || Array.isArray(instanceEnv))) {
+      throw new PipeError(`target ${targetName} 的 instances.env 必须是 map`)
+    }
+    const instanceLog = target.instances.log
+    if (instanceLog !== undefined && typeof instanceLog !== 'string') {
+      throw new PipeError(`target ${targetName} 的 instances.log 必须是字符串模板`)
+    }
+    let drain = null
+    if (target.instances.drain !== undefined && target.instances.drain !== null && target.instances.drain !== '') {
+      if (typeof target.instances.drain !== 'object' || Array.isArray(target.instances.drain)) {
+        throw new PipeError(`target ${targetName} 的 instances.drain 必须是 map`)
+      }
+      // 0 是合法值（「不等」/「立刻升级到 KILL」），但 parseDuration 把它当非法时长，
+      // 所以关闭语义单独判，别让一个诚实的 0 变成解析错误。
+      const drainValue = (value, fallback) => {
+        if (value === undefined || value === null || value === '') return fallback
+        if (Number(value) === 0) return 0
+        return parseDuration(value, fallback)
+      }
+      drain = {
+        delay: drainValue(target.instances.drain.delay, 5),
+        timeout: drainValue(target.instances.drain.timeout, 30),
+      }
+    }
+    instances = {
+      count,
+      port: { base, step },
+      weight: target.instances.weight === undefined ? null : target.instances.weight,
+      env: instanceEnv || {},
+      log: instanceLog || '',
+      drain,
+    }
+    if (!target.restart) {
+      throw new PipeError(`target ${targetName} 声明了 instances 就必须给 restart 命令模板（可用 {{.port}} / {{.slot}} / {{.host}} / {{.release}} / {{.app}} / {{.instance}} / {{.index}}）`)
+    }
+  }
 
   let canary = null
   if (target.canary !== undefined && target.canary !== null && target.canary !== '') {
@@ -368,12 +458,29 @@ function normalizeTarget(targetName, target) {
   const protected_ = targetName.toLowerCase() === 'prod' || target.protected === true
   const approvalRequired = targetName.toLowerCase() === 'prod' || target.approvalRequired === true
 
+  // health 归一成固定形状：window 是 P3 新增的 L3 观察窗，expect 允许成功的非 200 状态码。
+  // 原始 target.health 仍保留在 ...target 里，所以老字段一个都没丢。
+  const health = {
+    http: target.health?.http || '',
+    tries: target.health?.tries === undefined ? 5 : target.health.tries,
+    interval: target.health?.interval === undefined ? 2 : parseDuration(target.health.interval, 2),
+    expect: target.health?.expect === undefined ? 0 : target.health.expect,
+    // window: 0 是「不要观察窗」的显式写法，parseDuration 会把它当非法时长抛错，
+    // 所以这一列单独判 0 —— 一个合法的「关闭」值不该被校验器拒绝。
+    window: target.health?.window === undefined || Number(target.health.window) === 0
+      ? 0
+      : parseDuration(target.health.window, 0),
+  }
+
   const restartCommand = target.restart || target.service ? '' : defaultRestartCommand(runtime, app, targetName)
   return {
     ...target,
     hosts,
     runtime,
     app,
+    mode,
+    instances,
+    health,
     onHostFailure,
     keep,
     path,
@@ -393,7 +500,9 @@ export function parsePipe(source, { path = 'pipe.yml' } = {}) {
   if (!root || typeof root !== 'object' || Array.isArray(root)) throw new PipeError('pipe 根节点必须是 map')
 
   const version = root.version ?? 1
-  if (version !== 1) throw new PipeError(`不支持的 pipe 版本 ${version}（目前只支持 version: 1）`)
+  if (version !== 1 && version !== 2) {
+    throw new PipeError(`不支持的 pipe 版本 ${version}（目前支持 version: 1 与 version: 2）`)
+  }
   const name = typeof root.name === 'string' && root.name.trim() ? root.name.trim() : path
   const vars = root.vars ?? {}
   if (vars !== null && (typeof vars !== 'object' || Array.isArray(vars))) throw new PipeError('vars 必须是 map')
@@ -423,14 +532,58 @@ export function parsePipe(source, { path = 'pipe.yml' } = {}) {
       return need.trim()
     })
     if (needs.includes(id)) throw new PipeError(`stage ${id} 的 needs 不能包含自己`)
-    const steps = stage.steps
-    if (!Array.isArray(steps) || steps.length === 0) throw new PipeError(`stage ${id} 的 steps 必须是非空数组`)
-    const normalizedSteps = steps.map((step, stepIndex) => {
+    // v2：stage 可以用 jobs[] 代替 steps[]（jobs 之间按 needs 组 DAG）
+    // v1：仍是 steps[]，一个 stage 一组串行命令
+    const hasJobs = Array.isArray(stage.jobs) && stage.jobs.length > 0
+    const hasSteps = Array.isArray(stage.steps) && stage.steps.length > 0
+    if (hasJobs && hasSteps) throw new PipeError(`stage ${id} 不能同时有 steps 与 jobs`)
+    if (!hasJobs && !hasSteps) throw new PipeError(`stage ${id} 的 steps 或 jobs 必须是非空数组`)
+    if (hasJobs && version !== 2) throw new PipeError(`stage ${id} 用了 jobs[]，需要 version: 2`)
+    const normalizedJobs = hasJobs
+      ? stage.jobs.map((job, jobIndex) => {
+        if (!job || typeof job !== 'object' || Array.isArray(job)) throw new PipeError(`stage ${id} 的第 ${jobIndex + 1} 个 job 必须是 map`)
+        const jobId = typeof job.id === 'string' ? job.id.trim() : ''
+        if (!jobId) throw new PipeError(`stage ${id} 的第 ${jobIndex + 1} 个 job 缺少 id`)
+        if (Array.isArray(job.steps)) {
+          for (let stepIndex = 0; stepIndex < job.steps.length; stepIndex += 1) {
+            const step = job.steps[stepIndex]
+            if (!step || typeof step !== 'object' || Array.isArray(step)) {
+              throw new PipeError(`job ${id}/${jobId} 的第 ${stepIndex + 1} 个 step 必须是 map`)
+            }
+            const hasRun = typeof step.run === 'string' && step.run.trim() !== ''
+            const hasUses = typeof step.uses === 'string' && step.uses.trim() !== ''
+            const hasDeploy = step.deploy !== undefined
+            if (hasRun && hasUses) throw new PipeError(`job ${id}/${jobId} 的第 ${stepIndex + 1} 个 step 不能同时有 run 与 uses`)
+            if (!hasRun && !hasUses && !hasDeploy) throw new PipeError(`job ${id}/${jobId} 的第 ${stepIndex + 1} 个 step 必须有 run、uses 或 deploy`)
+          }
+        }
+        const deploySpec = job.deploy
+        if (deploySpec !== undefined && deploySpec !== null) {
+          if (typeof deploySpec !== 'object' || Array.isArray(deploySpec)) throw new PipeError(`job ${id}/${jobId} 的 deploy 必须是 map`)
+          if (typeof deploySpec.target !== 'string' || !deploySpec.target.trim()) throw new PipeError(`job ${id}/${jobId} 的 deploy 缺少 target`)
+          if (!targetNames.has(deploySpec.target.trim())) throw new PipeError(`job ${id}/${jobId} 的 deploy.target “${deploySpec.target}” 未定义`)
+          if (deploySpec.artifacts !== undefined) asArray(deploySpec.artifacts, `job ${id}/${jobId} 的 deploy.artifacts`)
+        }
+        if (job.matrix !== undefined && job.matrix !== null && (typeof job.matrix !== 'object' || Array.isArray(job.matrix))) {
+          throw new PipeError(`job ${id}/${jobId} 的 matrix 必须是 map`)
+        }
+        return { ...job, id: jobId }
+      })
+      : undefined
+    const normalizedSteps = hasSteps ? stage.steps.map((step, stepIndex) => {
       if (!step || typeof step !== 'object' || Array.isArray(step)) throw new PipeError(`stage ${id} 的第 ${stepIndex + 1} 个 step 必须是 map`)
       const hasRun = typeof step.run === 'string' && step.run.trim() !== ''
+      // v1 也要认 `uses`：动作（checkout / cache / collect …）在 v1 的写法里同样有用，
+      // 只在 v2 支持等于逼所有想用缓存的人先改写整份 pipe.yml，而 v1→v2 的迁移本来就该是渐进的。
+      const hasUses = typeof step.uses === 'string' && step.uses.trim() !== ''
       const hasDeploy = step.deploy !== undefined
-      if (!hasRun && !hasDeploy) throw new PipeError(`stage ${id} 的第 ${stepIndex + 1} 个 step 必须有 run 或 deploy`)
-      if (hasRun && hasDeploy) throw new PipeError(`stage ${id} 的第 ${stepIndex + 1} 个 step 不能同时有 run 与 deploy`)
+      if (!hasRun && !hasUses && !hasDeploy) throw new PipeError(`stage ${id} 的第 ${stepIndex + 1} 个 step 必须有 run、uses 或 deploy`)
+      if ([hasRun, hasUses, hasDeploy].filter(Boolean).length > 1) {
+        throw new PipeError(`stage ${id} 的第 ${stepIndex + 1} 个 step 的 run / uses / deploy 只能有一个`)
+      }
+      if (hasUses && (typeof step.with !== 'undefined' && (typeof step.with !== 'object' || Array.isArray(step.with) || step.with === null))) {
+        throw new PipeError(`stage ${id} 的第 ${stepIndex + 1} 个 step 的 with 必须是 map`)
+      }
       if (hasDeploy) {
         if (!step.deploy || typeof step.deploy !== 'object' || Array.isArray(step.deploy)) throw new PipeError(`stage ${id} 的第 ${stepIndex + 1} 个 deploy 必须是 map`)
         if (typeof step.deploy.target !== 'string' || !step.deploy.target.trim()) throw new PipeError(`stage ${id} 的第 ${stepIndex + 1} 个 deploy 缺少 target`)
@@ -438,15 +591,55 @@ export function parsePipe(source, { path = 'pipe.yml' } = {}) {
         if (step.deploy.artifacts !== undefined) asArray(step.deploy.artifacts, `stage ${id} 第 ${stepIndex + 1} 个 deploy 的 artifacts`)
       }
       return step
-    })
-    normalizedStages.push({ ...stage, id, needs, steps: normalizedSteps })
+    }) : undefined
+    normalizedStages.push({ ...stage, id, needs, steps: normalizedSteps, jobs: normalizedJobs })
   }
   for (const stage of normalizedStages) {
     for (const need of stage.needs) if (!stageIds.has(need)) throw new PipeError(`stage ${stage.id} 的 needs 指向不存在的 stage “${need}”`)
   }
 
   const triggers = normalizeTriggers(root)
-  return { version, name, vars: vars || {}, targets: normalizedTargets, stages: normalizedStages, triggers, path }
+  const toolchain = normalizeToolchain(root.toolchain)
+  return { version, name, vars: vars || {}, targets: normalizedTargets, stages: normalizedStages, triggers, toolchain, path }
+}
+
+// 工具链语言枚举：与 lib/toolchain.js 的 LANGS 必须一致。
+// 这里重复写一遍是为了让 pipe.js 不依赖 toolchain.js（解析层不拉网络/子进程模块）。
+const TOOLCHAIN_LANGS = ['java', 'maven', 'gradle', 'node', 'python', 'php', 'go']
+
+/**
+ * 归一 `toolchain:` 声明。
+ *
+ * 只允许「vendor 枚举 + 版本表达」，**任何看起来像 URL 的值都直接拒绝**：
+ * pipe.yml 是仓库里的文件，谁提 PR 谁就能改；在这里放开 URL，
+ * 等于允许任何有提交权限的人让构建机下载并执行任意二进制。
+ */
+function normalizeToolchain(raw) {
+  if (raw === undefined || raw === null || raw === '') return {}
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw new PipeError('toolchain 必须是 map')
+  const result = {}
+  for (const [lang, value] of Object.entries(raw)) {
+    if (lang === 'infer_from_files') {
+      result.infer_from_files = value !== false && value !== 'false'
+      continue
+    }
+    if (!TOOLCHAIN_LANGS.includes(lang)) {
+      throw new PipeError(`toolchain 不支持 “${lang}”（支持：${TOOLCHAIN_LANGS.join('、')}）`)
+    }
+    if (typeof value !== 'string' && typeof value !== 'number') {
+      throw new PipeError(`toolchain.${lang} 必须是版本字符串`)
+    }
+    const text = String(value).trim()
+    if (!text) throw new PipeError(`toolchain.${lang} 是空的`)
+    if (/[:/\\]/.test(text)) {
+      throw new PipeError(`toolchain.${lang} 只接受 vendor+版本（如 temurin-17、20.11.1），不接受路径或 URL：${text}`)
+    }
+    result[lang] = text
+  }
+  if (result.maven && result.gradle) {
+    throw new PipeError('toolchain 里 maven 与 gradle 只能声明一个（按项目实际用的构建工具选）')
+  }
+  return result
 }
 
 const VAR_PATTERN = /\$\{\{\s*([A-Za-z_]\w*)\s*\}\}/g
@@ -529,6 +722,47 @@ function topological(stages) {
   return result
 }
 
+/**
+ * 把一个原始 step 描述变成可执行的 plan step。
+ *
+ * 抽成模块级导出是为了让 **v2 的 DAG 执行路径复用同一份归一化逻辑**：v2 的 step 来自
+ * `lib/model.js` 的 job（已经过 matrix 展开，还没插值），如果 runner 自己再写一遍
+ * kind/deploy 判定，两处迟早对不上（比如 `uses` 在一个地方算 run、在另一个地方算动作）。
+ */
+export function buildStep(step, { index = 0, jobId = '', vars = {}, target = '', stageManual = false, matrix = null } = {}) {
+  const isDeploy = step.deploy !== undefined && step.deploy !== null
+  const isUses = !isDeploy && typeof step.uses === 'string' && step.uses.trim() !== ''
+  const kind = isDeploy ? 'deploy' : (isUses ? 'uses' : 'run')
+  const deploy = step.deploy || null
+  const deployTarget = deploy?.target ? deploy.target.trim() : target
+  const base = {
+    index,
+    jobId: jobId || '',
+    name: typeof step.name === 'string' && step.name.trim()
+      ? step.name.trim()
+      : (kind === 'deploy' ? `部署 ${deployTarget || ''}` : `第 ${index + 1} 步`),
+    kind,
+    when: typeof step.when === 'string' ? step.when : '',
+    manual: Boolean(step.manual ?? stageManual),
+    timeoutSec: step.timeoutSec !== undefined
+      ? Number(step.timeoutSec) || 0
+      : parseDuration(step.timeout),
+    retries: Number.isInteger(step.retries) && step.retries >= 0 ? step.retries : 0,
+    allowFailure: Boolean(step.allow_failure ?? step.allowFailure),
+    deploy: deploy ? {
+      target: deployTarget,
+      artifacts: asArray(deploy.artifacts, 'deploy.artifacts'),
+      activate: deploy.activate || 'symlink',
+      keep: Number.isInteger(deploy.keep) && deploy.keep > 0 ? deploy.keep : 5,
+    } : null,
+    matrix: matrix || null,
+    source: step,
+  }
+  if (kind === 'deploy') return { ...base, command: `deploy:${deployTarget || ''}` }
+  if (kind === 'uses') return { ...base, command: `uses:${step.uses.trim()}`, uses: step.uses.trim(), with: step.with || null }
+  return { ...base, command: interpolate(step.run, vars) }
+}
+
 export function planPipeline(pipe, { project, target, env = {} } = {}) {
   if (!pipe || !Array.isArray(pipe.stages)) throw new PipeError('planPipeline 需要 parsePipe 的结果')
   const projectId = typeof project === 'string' ? project : project?.id || ''
@@ -553,31 +787,33 @@ export function planPipeline(pipe, { project, target, env = {} } = {}) {
   for (const stage of topological(pipe.stages)) {
     if (stage.needs.some((need) => !included.has(need))) continue
     if (!evaluateWhen(parseStageWhen(stage.when), envContext)) continue
+    const planStep = (step, index, jobId, matrix) => buildStep(step, {
+      index,
+      jobId,
+      vars,
+      target,
+      stageManual: Boolean(stage.manual),
+      matrix,
+    })
+
     const steps = []
-    for (let index = 0; index < stage.steps.length; index += 1) {
-      const step = stage.steps[index]
-      if (!evaluateWhen(parseStageWhen(step.when), envContext)) continue
-      const kind = step.deploy !== undefined ? 'deploy' : 'run'
-      const deploy = step.deploy || null
-      const deployTarget = deploy?.target ? deploy.target.trim() : target
-      steps.push({
-        index,
-        name: typeof step.name === 'string' && step.name.trim() ? step.name.trim() : (kind === 'deploy' ? `部署 ${deployTarget || ''}` : `第 ${index + 1} 步`),
-        command: kind === 'deploy' ? `deploy:${deployTarget || ''}` : interpolate(step.run, vars),
-        kind,
-        when: typeof step.when === 'string' ? step.when : '',
-        manual: Boolean(step.manual ?? stage.manual),
-        timeoutSec: parseDuration(step.timeout),
-        retries: Number.isInteger(step.retries) && step.retries >= 0 ? step.retries : 0,
-        allowFailure: Boolean(step.allow_failure ?? step.allowFailure),
-        deploy: deploy ? {
-          target: deployTarget,
-          artifacts: asArray(deploy.artifacts, 'deploy.artifacts'),
-          activate: deploy.activate || 'symlink',
-          keep: Number.isInteger(deploy.keep) && deploy.keep > 0 ? deploy.keep : 5,
-        } : null,
-        source: step,
-      })
+    if (Array.isArray(stage.jobs) && stage.jobs.length > 0) {
+      // v2：stage.steps 是「该 stage 全部 job 的 step 拍平」，保留 jobId 供调度器分组。
+      // 真正的执行顺序由 model 的 DAG 决定，这里的顺序只用于 plan 展示。
+      for (const job of stage.jobs) {
+        if (job.when && !evaluateWhen(parseStageWhen(job.when), envContext)) continue
+        const jobSteps = Array.isArray(job.steps) ? job.steps : []
+        jobSteps.forEach((step, index) => {
+          if (!evaluateWhen(parseStageWhen(step.when), envContext)) return
+          steps.push(planStep(step, steps.length, job.id))
+        })
+      }
+    } else {
+      for (let index = 0; index < stage.steps.length; index += 1) {
+        const step = stage.steps[index]
+        if (!evaluateWhen(parseStageWhen(step.when), envContext)) continue
+        steps.push(planStep(step, index, ''))
+      }
     }
     result.push({ id: stage.id, needs: stage.needs, manual: Boolean(stage.manual), steps })
     included.add(stage.id)
