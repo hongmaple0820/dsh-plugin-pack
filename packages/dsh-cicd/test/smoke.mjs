@@ -6541,6 +6541,78 @@ check('client.js：依赖数组不引用「本文件更后面才声明的 const�
   assert.deepEqual(offenders, [], '依赖数组引用更后声明的 const，渲染期必抛 ReferenceError：\n' + offenders.join('\n'))
 })
 
+// 按项目/环境隔离（2026-11-21 用户决策）：护栏条目写坏只拒绝「同名环境」的判定。
+// 此前 invalid 非空会让**任何**环境判定整体拒绝 —— 别的项目/别的环境写错一条，全家发不出去。
+checkAsync('P8-S7：护栏写坏只连坐同名环境 —— 别的项目、别的环境照常判定', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cicd-p8-s7-'))
+  const mk = (name, extra) => {
+    const projectDir = join(dir, name)
+    mkdirSync(projectDir, { recursive: true })
+    writeFileSync(join(projectDir, 'pipe.yml'), [
+      'version: 1',
+      'name: ' + name,
+      extra,
+      'targets:',
+      '  staging:',
+      '    hosts: [linux26]',
+      '    path: /srv/' + name,
+      'stages:',
+      '  - id: build',
+      '    steps:',
+      '      - name: build',
+      '        run: echo OK',
+    ].filter(Boolean).join('\n'))
+    return { id: name, name, path: projectDir, pipe: join(projectDir, 'pipe.yml') }
+  }
+  // a：自己的 pipe 把 prod 名单写坏（漏 role: 前缀）→ invalid 只该连坐 a 的 prod。
+  const projectA = mk('a', 'environments:\n  prod:\n    allowedActors: [admin]')
+  // b：干净的 staging，没有 environments 声明。
+  const projectB = mk('b', '')
+  // c：pipe 用**有效**的 prod 名单盖掉宿主那条写坏的 prod —— 宿主的 invalid 不再连坐 c。
+  const projectC = mk('c', 'environments:\n  prod:\n    allowedActors: [role:owner]')
+  const runtime = internals.createRuntime(fakeContext(), {
+    projects: [projectA, projectB, projectC],
+    workDir: join(dir, 'state'),
+    remoteBase: 'http://127.0.0.1:1',
+    scheduler: { enabled: false },
+    deployment: {
+      // 宿主层两条写坏：qa（不相干环境）与 prod（会被 c 的 pipe 盖掉）。
+      environments: {
+        qa: { allowedActors: ['管理员'] },
+        prod: { allowedActors: ['admin'] },
+      },
+    },
+  })
+  try {
+    const owner = { id: 'owner@acc.test', role: 'owner' }
+    // ① b 的 staging 不受任何写坏条目影响（staging 非受保护，required 都不该是 true）。
+    const bStaging = runtime.environmentGuard({ env: 'staging', projectId: 'b', actor: owner })
+    assert.equal(bStaging.required, false, '不相干环境的写坏条目不该把 staging 也拖下水：' + JSON.stringify(bStaging))
+    // ② b 的 qa 判定被宿主那条写坏拒绝（qa 是共享环境，宿主条目对它仍生效）。
+    const bQa = runtime.environmentGuard({ env: 'qa', projectId: 'b', actor: owner })
+    assert.equal(bQa.ok, false)
+    assert.ok(bQa.failures.some((item) => item.code === 'ENV_GUARD_MISCONFIGURED'), 'qa 要报配置错误：' + JSON.stringify(bQa))
+    // ③ a 自己写坏的 prod 只连坐 a 的 prod，不连坐 a 的 staging。
+    const aProd = runtime.environmentGuard({ env: 'prod', projectId: 'a', actor: owner })
+    assert.equal(aProd.ok, false)
+    assert.ok(aProd.failures.some((item) => item.code === 'ENV_GUARD_MISCONFIGURED'), 'a 的 prod 要报自己的配置错误')
+    const aStaging = runtime.environmentGuard({ env: 'staging', projectId: 'a', actor: owner })
+    assert.equal(aStaging.required, false, 'a 写坏的是 prod，staging 不该被连坐：' + JSON.stringify(aStaging))
+    // ④ c 的有效名单盖掉了宿主写坏的 prod：判 role:owner（通过），而不是宿主的 ENV_GUARD_MISCONFIGURED。
+    const cProd = runtime.environmentGuard({ env: 'prod', projectId: 'c', actor: owner })
+    assert.ok(!cProd.failures.some((item) => item.code === 'ENV_GUARD_MISCONFIGURED'), '被 pipe 盖掉的宿主条目不能再报配置错误：' + JSON.stringify(cProd))
+    assert.equal(cProd.ok, true, 'role:owner 在 c 的名单里，应当放行')
+    // ⑤ 环境页只报本项目在用的环境：a 只看到自己的 prod，看不到宿主的 qa。
+    const view = await runtime.environments('a')
+    assert.deepEqual([...new Set((view.invalid || []).map((item) => item.env))], ['prod'], '环境页的 invalid 只该有本项目在用的环境：' + JSON.stringify(view.invalid))
+    const viewB = await runtime.environments('b')
+    assert.deepEqual(viewB.invalid, [], 'b 没有用任何写坏的环境，invalid 应为空：' + JSON.stringify(viewB.invalid))
+  } finally {
+    runtime.dispose()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 // 冒烟测不到「页面长什么样」，但能钉住入口契约：整页应用只能挂 keyed 'main'。
 // conversation.view 和宿主 composer 同属 conversation.content，注册它 = 页面底部永远跟着聊天输入框
 // （用户 v3.0 报的「独立页面怎么有输入框」，同 dsh-aihot / docs/SPEC.md §4 的 v2 结论）。

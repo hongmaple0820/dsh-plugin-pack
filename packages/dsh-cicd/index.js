@@ -244,7 +244,7 @@ function normalizeConfig(config = {}, ctx) {
     },
     // v3.0-P4-3：受保护环境五条件里的 ①②④（protected / allowedActors / branchRule）。
     // 解析错误不在这里抛：配置文件写错时插件仍然要能启动去看一眼（面板会提示），
-    // 但**任何**一次受保护环境判定都会因为 invalid 非空而拒绝 —— 见 environmentGuard()。
+    // 带环境名的写错条目只拒绝同名环境的判定（按项目/环境隔离），见 environmentGuard()。
     deployment: {
       environments: rawDeployment.environments && typeof rawDeployment.environments === 'object' && !Array.isArray(rawDeployment.environments)
         ? rawDeployment.environments
@@ -712,7 +712,11 @@ function createRuntime(ctx, config) {
       const local = parseEnvironmentGuards(pipeEnvironments)
       const merged = new Map(hostGuards.byEnv)
       for (const [name, spec] of local.byEnv.entries()) merged.set(name, spec)
-      result = { byEnv: merged, invalid: hostGuards.invalid.concat(local.invalid) }
+      // pipe 用自己的有效条目盖掉了宿主同名条目（覆盖方向见上）：宿主那条写坏的 invalid
+      // 对这个项目的同名环境已不生效，留着只会让引导指向一个被盖掉的键（连坐）。
+      const overridden = new Set(local.byEnv.keys())
+      const hostInvalid = hostGuards.invalid.filter((item) => !item.env || !overridden.has(item.env))
+      result = { byEnv: merged, invalid: hostInvalid.concat(local.invalid) }
     }
     guardCache.set(key, result)
     return result
@@ -743,12 +747,16 @@ function createRuntime(ctx, config) {
   function environmentGuard({ env = '', actor = null, branch = '', tag = '', digestPresent = null, project = null } = {}) {
     const name = String(env || '')
     const guards = project ? guardsFor(project) : hostGuards
-    if (guards.invalid.length > 0) {
+    // 按项目隔离（2026-11-21 决策）：写坏的条目带着环境名，只属于那个环境——别的项目/别的环境
+    // 写坏一条（比如宿主配置里 qa 的名单写错）不再连坐本次对 staging 的判定。
+    // 只有 env 为空的条目（「配置整体不是 map」这类结构性错误）仍然全局拒绝。
+    const relevantInvalid = guards.invalid.filter((item) => !item?.env || item.env === name)
+    if (relevantInvalid.length > 0) {
       return {
         required: true,
         ok: false,
         guard: guards.byEnv.get(name) || null,
-        failures: guards.invalid.map((item) => ({ condition: 'config', code: 'ENV_GUARD_MISCONFIGURED', message: item?.message || String(item), env: item?.env || '' })),
+        failures: relevantInvalid.map((item) => ({ condition: 'config', code: 'ENV_GUARD_MISCONFIGURED', message: item?.message || String(item), env: item?.env || '' })),
       }
     }
     // 名单里没有这个环境名时，约定名（prod）仍按"受保护且名单为空"判：漏配是拒绝的理由，
@@ -956,8 +964,8 @@ function createRuntime(ctx, config) {
   const runtimeSeen = { gate: async () => { throw Object.assign(new Error('制品闸门尚未就绪'), { code: 'GATE_NOT_READY' }) } }
   // CAS 收件失败不拦发布，但必须留痕（受保护环境的闸门随后会以 ARTIFACT_NOT_PROMOTED / CORRUPTED 拒绝）。
   const artifactWarnings = []
-  // v3.0-P4-3：环境护栏只解析一次（配置在进程生命周期内不变）。写错的条目不静默忽略，
-  // 而是让**所有**受保护环境判定直接拒绝并说出原因 —— 见 environmentGuard() 的 invalid 分支。
+  // v3.0-P4-3：环境护栏只解析一次（配置在进程生命周期内不变）。写错的条目不静默忽略：
+  // 它只拒绝「同名环境」的判定并说出原因（按项目/环境隔离，2026-11-21 决策）—— 见 environmentGuard()。
   const hostGuards = parseEnvironmentGuards(options.deployment.environments)
 
   const CATALOG_TTL_MS = 5000
@@ -3455,7 +3463,14 @@ function createRuntime(ctx, config) {
         project: project.id,
         environments,
         promotionPath: path,
-        invalid: guards.invalid.map((item) => ({ env: item?.env || '', message: item?.message || String(item) })),
+        // 只报本项目在用的环境（targets + pipe 自己声明的 environments）：
+        // 别的条目写坏了归宿主/别的项目，出现在这页只会误导用户去改不属于这份 pipe 的键。
+        invalid: guards.invalid
+          .filter((item) => {
+            const name = item?.env || ''
+            return !name || Object.prototype.hasOwnProperty.call(pipe.targets || {}, name) || Object.prototype.hasOwnProperty.call(pipe.environments || {}, name)
+          })
+          .map((item) => ({ env: item?.env || '', message: item?.message || String(item) })),
       }
     },
     // ---------------------------------------------------------------------------------------
@@ -3901,7 +3916,9 @@ function createRuntime(ctx, config) {
       // 写坏的条目在 parseEnvironmentGuards 里是"收进 invalid 并整体拒绝"，byEnv 里反而没有这个名字；
       // 只按 byEnv 判会把它读成"没配"→ 误报成 NO_ALLOWLIST，用户照提示改完还是发不出去。
       // 但不许因为别的项目/别处写坏的一条就整片报错：只认这个项目自己在用的环境名。
-      const brokenFor = (guards.invalid || []).filter((item) => item.env && targetNames.includes(item.env))
+      // 空环境名 = 宿主配置整体写坏（结构性错误），任何项目都绕不过去；
+      // 带环境名的条目只认这个项目在用的环境（按项目隔离，2026-11-21 决策）。
+      const brokenFor = (guards.invalid || []).filter((item) => !item.env || targetNames.includes(item.env))
       if (brokenFor.length > 0) {
         const broken = brokenFor.map((item) => ({ env: item.env || '', reason: 'ENV_GUARD_MISCONFIGURED', message: item.message || '' }))
         return { ok: false, targetNames, environments: targetNames, invalid: broken, requiredConfig: broken.map((item) => ({ env: item.env, key: `environments.${item.env || '<环境>'}.allowedActors`, reason: item.reason, message: item.message })) }
