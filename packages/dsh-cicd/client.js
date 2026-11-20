@@ -345,6 +345,17 @@ window.__ModuleLoader__.load({
 .cicd-form-radio[aria-pressed="true"]{border-color:var(--dsw-alias-border-l4);background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-primary)}
 .cicd-create-kinds{display:flex;gap:8px;flex-wrap:wrap}
 .cicd-create-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:2px}
+/* v3.0-P6-2：模板中心 —— 先把选择摊开，选完只剩「名字 + 目录 + 创建」 */
+.cicd-template-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:8px}
+.cicd-template-card{display:flex;flex-direction:column;gap:2px;padding:8px 10px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-1);text-align:left;cursor:pointer;box-sizing:border-box;min-height:52px}
+.cicd-template-card:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.cicd-template-card[aria-pressed="true"]{border-color:var(--dsw-alias-brand-primary);box-shadow:inset 0 0 0 1px var(--dsw-alias-brand-primary)}
+.cicd-template-card:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.cicd-template-name{display:flex;align-items:center;gap:6px;color:var(--dsw-alias-label-primary);font-size:12.5px;line-height:18px;font-weight:600}
+.cicd-template-desc{color:var(--dsw-alias-label-dimmed);font-size:11px;line-height:15px}
+.cicd-template-badge{color:var(--dsw-alias-label-secondary);font-size:10.5px;line-height:14px;padding:0 5px;border:.5px solid var(--dsw-alias-border-l3);border-radius:999px}
+.cicd-template-save{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.cicd-template-save .cicd-form-input{max-width:220px}
 /* P1：审批门视图 */
 .cicd-view-approvals,.cicd-view-rbac,.cicd-view-secrets,.cicd-view-runners,.cicd-view-environments{min-width:56px}
 .cicd-approvals,.cicd-rbac,.cicd-secrets,.cicd-runners{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;box-sizing:border-box;padding:12px 16px 14px;display:flex;flex-direction:column;gap:10px}
@@ -448,6 +459,10 @@ window.__ModuleLoader__.load({
       { id: 'node', name: 'Node.js', description: 'npm 构建 + pm2 重启' },
       { id: 'python', name: 'Python', description: 'pip 安装 + systemd --user 重启' },
       { id: 'go', name: 'Go', description: 'go build 出二进制' },
+      { id: 'java', name: 'Java', description: 'mvn package 出 jar' },
+      { id: 'php', name: 'PHP', description: 'composer install 后整目录同步' },
+      { id: 'rust', name: 'Rust', description: 'cargo build --release' },
+      { id: 'docker', name: 'Docker', description: 'docker build 出镜像（容器 target）' },
       { id: 'bare', name: '空白模板', description: '只有一段 echo，改造成自己的流程' },
     ]
 
@@ -1858,21 +1873,48 @@ window.__ModuleLoader__.load({
     }
 
     /** v2-M0：新建项目向导（来源二选一 + 脚手架模板）。 */
-    function CreateView({ state, busy, onSubmit }) {
+    /**
+     * v3.0-P6-2：新建向导 = 模板中心。
+     * 选择在前、填写在后：先点一张卡（内置 9 种 / 自己存的），再补名字与目录就能创建 —— 两步。
+     * template 与 kind 是两种来源：选了自定义/内置模板就走模板里的 pipe.yml，kind 只在「不用模板」时才有意义。
+     */
+    function CreateView({ state, busy, onSubmit, templates, templateSave, onReloadTemplates, onSaveTemplate }) {
       const [sourceType, setSourceType] = useState('local')
       const [name, setName] = useState('')
       const [path, setPath] = useState('')
       const [repoUrl, setRepoUrl] = useState('')
       const [branch, setBranch] = useState('')
       const [kind, setKind] = useState('static')
+      const [templateId, setTemplateId] = useState('')
+      const [saveName, setSaveName] = useState('')
 
       const canSubmit = sourceType === 'local'
         ? (name.trim() !== '' || path.trim() !== '')
         : repoUrl.trim() !== ''
 
+      const stored = templates && Array.isArray(templates.items) ? templates.items.filter((item) => item.custom) : []
+      const builtin = templates && Array.isArray(templates.items) ? templates.items.filter((item) => !item.custom) : []
+
       const submit = useCallback(() => {
-        onSubmit({ sourceType, name: name.trim(), path: path.trim(), repoUrl: repoUrl.trim(), branch: branch.trim(), kind })
-      }, [sourceType, name, path, repoUrl, branch, kind, onSubmit])
+        onSubmit({
+          sourceType, name: name.trim(), path: path.trim(), repoUrl: repoUrl.trim(), branch: branch.trim(),
+          kind: templateId ? '' : kind,
+          template: templateId,
+        })
+      }, [sourceType, name, path, repoUrl, branch, kind, templateId, onSubmit])
+
+      /** 一张模板卡：按下即选中，再按一次取消（回到脚手架 kind）。 */
+      const card = (item) => h('button', {
+        key: item.id,
+        className: 'cicd-template-card',
+        type: 'button',
+        'aria-pressed': templateId === item.id,
+        onClick: () => setTemplateId((current) => (current === item.id ? '' : item.id)),
+        title: item.description || '',
+      },
+        h('span', { className: 'cicd-template-name' }, item.name || item.id,
+          item.custom ? h('span', { className: 'cicd-template-badge' }, '自定义') : null),
+        h('span', { className: 'cicd-template-desc' }, item.language || item.kind || ''))
 
       return h('div', { className: 'cicd-create' },
         h('div', { className: 'cicd-create-form' },
@@ -1896,7 +1938,22 @@ window.__ModuleLoader__.load({
               h('span', { className: 'cicd-form-label', style: { marginTop: '6px' } }, '分支（可选）'),
               h('input', { className: 'cicd-form-input', value: branch, onChange: (event) => setBranch(event.currentTarget.value), placeholder: '缺省用仓库默认分支' })),
           h('div', { className: 'cicd-form-field' },
-            h('span', { className: 'cicd-form-label' }, '脚手架模板'),
+            h('span', { className: 'cicd-form-label' }, '模板'),
+            templates && templates.status === 'loading' ? h(LoadingState, { text: '正在读取模板…', rows: 2 }) : null,
+            templates && templates.status === 'error'
+              ? h(ErrorState, { title: '读取模板失败', error: templates.error, onRetry: onReloadTemplates })
+              : null,
+            templates && templates.status !== 'error'
+              ? h('div', { className: 'cicd-template-grid' },
+                (builtin.length ? builtin : SCAFFOLD_KINDS.map((item) => ({ id: item.id, name: item.name, kind: item.id, description: item.description }))).map(card),
+                stored.map(card))
+              : null,
+            h('p', { className: 'cicd-form-hint' },
+              templateId
+                ? '会用这张模板里的 pipe.yml，不再套脚手架。'
+                : '不选模板就用脚手架：按扩展名猜构建命令，最省事。')),
+          templateId ? null : h('div', { className: 'cicd-form-field' },
+            h('span', { className: 'cicd-form-label' }, '不用模板时按哪种脚手架生成'),
             h('div', { className: 'cicd-create-kinds' },
               SCAFFOLD_KINDS.map((item) => h('button', {
                 key: item.id,
@@ -1906,6 +1963,28 @@ window.__ModuleLoader__.load({
                 onClick: () => setKind(item.id),
                 title: item.description || '',
               }, item.name)))),
+          h('div', { className: 'cicd-form-field' },
+            h('span', { className: 'cicd-form-label' }, '另存为模板（可选）'),
+            h('div', { className: 'cicd-template-save' },
+              h('input', {
+                className: 'cicd-form-input',
+                value: saveName,
+                onChange: (event) => setSaveName(event.currentTarget.value),
+                placeholder: '例如 team-web（把当前项目的 pipe.yml 存成模板）',
+                'aria-label': '模板名',
+              }),
+              h('button', {
+                className: 'cicd-button',
+                type: 'button',
+                disabled: !saveName.trim() || !onSaveTemplate,
+                onClick: () => { onSaveTemplate && onSaveTemplate({ name: saveName.trim() }) },
+              }, '另存为模板'))),
+          templateSave && templateSave.status === 'done'
+            ? h('p', { className: 'cicd-form-hint', role: 'status' }, '已存为模板 ' + (templateSave.id || saveName))
+            : null,
+          templateSave && templateSave.status === 'error'
+            ? h('p', { className: 'cicd-form-hint', role: 'alert' }, '存模板失败：' + ((templateSave.error && templateSave.error.message) || '未知错误'))
+            : null,
           h('div', { className: 'cicd-create-actions' },
             h('button', { className: 'cicd-button cicd-button-primary', type: 'button', onClick: submit, disabled: busy || !canSubmit }, busy ? '创建…中' : '创建并登记'),
             state.status === 'done' && state.result
@@ -2207,6 +2286,9 @@ window.__ModuleLoader__.load({
       const [editorSave, setEditorSave] = useState(null)
       /** v2-M0：新建向导的提交结果。 */
       const [create, setCreate] = useState({ status: 'idle', error: null, result: null })
+      // v3.0-P6-2：模板中心 —— 新建时选模板，或把现有 pipe.yml 另存为模板。
+      const [templates, setTemplates] = useState({ status: 'idle', items: [], dir: '', error: null })
+      const [templateSave, setTemplateSave] = useState({ status: 'idle', id: '', error: null })
       /** v2-M2：构建主机（runner）下拉。 */
       const [runners, setRunners] = useState({ status: 'idle', items: [], error: null })
       const [runnerId, setRunnerId] = useState('')
@@ -2724,7 +2806,8 @@ window.__ModuleLoader__.load({
         if (view === 'secrets') void loadSecrets(projectId)
         if (view === 'runners') void loadRunners()
         if (view === 'environments') void loadEnvironments(projectId)
-      }, [clearArmed, clearRollback, loadProjects, loadTargets, loadRuns, loadReleases, projectId, targetName, view, loadAudit, auditLimit, loadApprovals, loadRbac, loadSecrets, loadRunners, loadEnvironments])
+        if (view === 'create') void loadTemplates()
+      }, [clearArmed, clearRollback, loadProjects, loadTargets, loadRuns, loadReleases, projectId, targetName, view, loadAudit, auditLimit, loadTemplates, loadApprovals, loadRbac, loadSecrets, loadRunners, loadEnvironments])
 
       /**
        * v3.0-P0：进入各视图时按需拉自己的数据。
@@ -2914,6 +2997,35 @@ window.__ModuleLoader__.load({
         }
       }, [editor.source, projectId, freshSignal, loadTargets])
 
+      /** v3.0-P6-2：拉模板清单（内置 + 自定义）。重取不清空旧数据 —— 否则面板整块闪白。 */
+      const loadTemplates = useCallback(async () => {
+        setTemplates((current) => (current.status === 'ready' ? { ...current, status: 'loading', error: null } : { status: 'loading', items: [], dir: '', error: null }))
+        try {
+          const payload = await callApi('templates', {}, freshSignal('templates'))
+          setTemplates({ status: 'ready', items: Array.isArray(payload?.templates) ? payload.templates : [], dir: payload?.dir || '', error: null })
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          setTemplates({ status: 'error', items: [], dir: '', error })
+        }
+      }, [callApi, freshSignal])
+
+      /**
+       * v3.0-P6-2：把当前项目的 pipe.yml 另存为模板。
+       * 不传 source，让 Host 去读落盘文件 —— 前端手里的 editor.source 可能不是这个项目的。
+       */
+      const saveAsTemplate = useCallback(async ({ name, description, kind }) => {
+        if (!projectId) return
+        setTemplateSave({ status: 'running', id: '', error: null })
+        try {
+          const payload = await callApi('template-save', { project: projectId, name, description, kind, confirm: 1 }, freshSignal('template-save'))
+          setTemplateSave({ status: 'done', id: payload?.id || '', error: null })
+          void loadTemplates()
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          setTemplateSave({ status: 'error', id: '', error })
+        }
+      }, [projectId, callApi, freshSignal, loadTemplates])
+
       /** v2-M0：提交新建项目（/project-create confirm=1），成功后选中新项目并回到运行视图。 */
       const submitCreate = useCallback(async (form) => {
         setCreate({ status: 'running', error: null, result: null })
@@ -2938,6 +3050,11 @@ window.__ModuleLoader__.load({
         if (view !== 'editor') return
         void loadEditor(projectId)
       }, [view, projectId, loadEditor])
+
+      useEffect(() => {
+        if (view !== 'create') return
+        void loadTemplates()
+      }, [view, loadTemplates])
 
       const clearNotifyArmed = useCallback(() => {
         if (notifyTimer.current) {
@@ -3174,6 +3291,10 @@ window.__ModuleLoader__.load({
           state: create,
           busy: create.status === 'running',
           onSubmit: (form) => void submitCreate(form),
+          templates,
+          templateSave,
+          onReloadTemplates: () => void loadTemplates(),
+          onSaveTemplate: (payload) => void saveAsTemplate(payload),
         })
         : view === 'approvals'
         ? h(ApprovalsView, {

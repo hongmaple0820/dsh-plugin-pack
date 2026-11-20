@@ -782,14 +782,14 @@ function callPath(pathname, query = '', { headers = {} } = {}) {
   return route.resource(new Request(`http://x${pathname}${query}`, { headers }))
 }
 
-check('apply：注册 32 个工具、43 条路由（39 exact + 4 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
-  assert.equal(ctx.toolsList.length, 32)
+check('apply：注册 33 个工具、45 条路由（41 exact + 4 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
+  assert.equal(ctx.toolsList.length, 33)
   assert.deepEqual(ctx.toolsList.map((tool) => tool.name).sort(), [
     'cicd_approve', 'cicd_artifacts', 'cicd_audit', 'cicd_auth', 'cicd_cancel', 'cicd_dora', 'cicd_environments', 'cicd_locks',
     'cicd_logs', 'cicd_metrics', 'cicd_notify_ledger', 'cicd_pipe_save', 'cicd_plan', 'cicd_project_create', 'cicd_project_meta',
     'cicd_projects', 'cicd_promotions',
     'cicd_rbac', 'cicd_registry', 'cicd_releases', 'cicd_rollback', 'cicd_run', 'cicd_runners', 'cicd_secrets', 'cicd_status',
-    'cicd_storage', 'cicd_targets', 'cicd_tokens', 'cicd_toolchain', 'cicd_triggers', 'cicd_users', 'cicd_validate',
+    'cicd_storage', 'cicd_targets', 'cicd_templates', 'cicd_tokens', 'cicd_toolchain', 'cicd_triggers', 'cicd_users', 'cicd_validate',
   ])
   for (const tool of ctx.toolsList) {
     assert.equal(typeof tool.description, 'string')
@@ -798,7 +798,7 @@ check('apply：注册 32 个工具、43 条路由（39 exact + 4 prefix）、1 �
     assert.equal(typeof tool.output.render, 'function')
     assert.equal(typeof tool.execute, 'function')
   }
-  assert.equal(ctx.routes.length, 43)
+  assert.equal(ctx.routes.length, 45)
   assert.deepEqual(ctx.routes.filter((route) => route.kind === 'exact').map((route) => route.path).sort(), [
     '/api/plugins/cicd/approvals', '/api/plugins/cicd/approve', '/api/plugins/cicd/artifacts', '/api/plugins/cicd/audit', '/api/plugins/cicd/auth',
     '/api/plugins/cicd/cancel', '/api/plugins/cicd/dora', '/api/plugins/cicd/environments', '/api/plugins/cicd/locks',
@@ -809,7 +809,7 @@ check('apply：注册 32 个工具、43 条路由（39 exact + 4 prefix）、1 �
     '/api/plugins/cicd/runner-log', '/api/plugins/cicd/runner-poll', '/api/plugins/cicd/runner-register', '/api/plugins/cicd/runner-result',
     '/api/plugins/cicd/runners', '/api/plugins/cicd/runs', '/api/plugins/cicd/secrets', '/api/plugins/cicd/storage',
     '/api/plugins/cicd/targets',
-    '/api/plugins/cicd/tokens', '/api/plugins/cicd/toolchain', '/api/plugins/cicd/triggers', '/api/plugins/cicd/users', '/api/plugins/cicd/validate',
+    '/api/plugins/cicd/template-save', '/api/plugins/cicd/templates', '/api/plugins/cicd/tokens', '/api/plugins/cicd/toolchain', '/api/plugins/cicd/triggers', '/api/plugins/cicd/users', '/api/plugins/cicd/validate',
   ])
   assert.deepEqual(ctx.routes.filter((route) => route.kind === 'prefix').map((route) => route.path), [
     '/api/plugins/cicd/hooks', '/api/plugins/cicd/v2', '/api/plugins/cicd/repository', '/api/plugins/cicd/simple',
@@ -842,8 +842,8 @@ check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补�
   assert.ok(typeof scopeFn === 'function', 'apply 应把路由注册挂到 ctx.inject 上')
   // 模拟 webServer 就绪：cordis 以一个能 get 到服务的 scope 触发回调（真实环境由服务就绪事件驱动）。
   scopeFn({ get: (key) => (key === 'webServer' ? coldWeb : undefined), effect() {} })
-  assert.equal(coldRoutes.length, 43, '就绪后应补注册 39 条 exact + 4 条 prefix 路由')
-  assert.equal(coldRoutes.filter((route) => route.kind === 'exact').length, 39)
+  assert.equal(coldRoutes.length, 45, '就绪后应补注册 41 条 exact + 4 条 prefix 路由')
+  assert.equal(coldRoutes.filter((route) => route.kind === 'exact').length, 41)
   assert.equal(coldUpgrades.length, 1, '就绪后应补注册 /log-ws upgrade 路由')
 
   // remote() 惰性解析：apply 时拿不到 port（remoteBase 为空），就绪后首次调用应取到 55470。
@@ -963,6 +963,83 @@ checkAsync('v3.0-P6-1 preview：把未保存的文本插值成命令，密钥写
   assert.ok(bad.line > 0)
   assert.equal((await call('/preview', '', { origin: 'http://evil.test' })).status, 403)
   assert.equal((await call('/preview', '?extra=1')).status, 400)
+})
+checkAsync('v3.0-P6-2 模板中心：内置 9 种 + 自定义模板 + 另存为，新建两步就落地', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cicd-p6-2-'))
+  try {
+    const projectDir = join(dir, 'app')
+    mkdirSync(projectDir, { recursive: true })
+    // 项目自己的 pipe.yml：另存为模板时要原样搬运它，而不是搬一份重新生成的脚手架。
+    const projectPipe = [
+      'name: team-web',
+      'targets:',
+      '  prod:',
+      '    hosts: [web1]',
+      '    path: /srv/team-web',
+      'stages:',
+      '  - id: build',
+      '    steps:',
+      '      - name: b',
+      '        run: npm run build',
+      '',
+    ].join('\n')
+    writeFileSync(join(projectDir, 'pipe.yml'), projectPipe)
+    const repo = await repoTool(join(dir, 'state'), { projects: [{ id: 'app', name: 'app', path: projectDir }] })
+    try {
+      // ① 内置模板：9 种语言/形态，且都带各自的文本（新建前先看一眼）。
+      const listed = await repo.call('/templates?name=demo').then((response) => response.json())
+      assert.equal(listed.ok, true)
+      assert.equal(listed.builtin, 9, '内置模板应有 9 种：' + listed.templates.map((item) => item.id).join(','))
+      assert.equal(listed.custom, 0)
+      assert.deepEqual(listed.templates.map((item) => item.id).sort(),
+        ['bare', 'docker', 'go', 'java', 'node', 'php', 'python', 'rust', 'static'])
+      const node = listed.templates.find((item) => item.id === 'node')
+      assert.match(node.source, /name: demo/, '内置模板必须按目标项目名现渲染')
+      assert.match(node.source, /npm/, 'node 模板要走 npm 构建')
+      assert.equal(node.custom, false)
+
+      // ② 另存为模板：写盘走 MANAGE_PROJECT，参数拼错不能被悄悄忽略。
+      const noSession = await repo.call('/template-save?name=team-web&project=app&confirm=1', {
+        method: 'POST',
+        headers: { 'x-dsh-cicd': '1' },
+      }).then((response) => response.json())
+      // 引导期是本机 owner，没有会话也能写；这里断言的是「未知参数要被挡」而不是身份。
+      assert.equal(noSession.ok, true, '另存为模板失败：' + JSON.stringify(noSession).slice(0, 300))
+      assert.equal(noSession.id, 'team-web')
+      assert.match(noSession.source, /npm run build/, '存的应是项目里那份 pipe.yml 的原文')
+      const stray = await repo.call('/template-save?name=x&confirm=1&templte=typo', { method: 'POST', headers: { 'x-dsh-cicd': '1' } })
+      assert.equal(stray.status, 400, 'body 里的未知参数必须拒绝，而不是当成没写')
+
+      // ③ 自定义模板出现在列表里，并能按 id 取回原文本。
+      const afterSave = await repo.call('/templates?name=demo').then((response) => response.json())
+      assert.equal(afterSave.custom, 1)
+      const stored = afterSave.templates.find((item) => item.id === 'team-web')
+      assert.ok(stored && stored.custom === true)
+      assert.match(stored.source, /npm run build/)
+
+      // ④ 用模板新建：pipe.yml 是模板原文，不再套脚手架。
+      const created = await repo.call('/project-create?confirm=1&name=from-template&path=' + encodeURIComponent(join(dir, 'from-template')) + '&template=team-web', {
+        method: 'POST', headers: { 'x-dsh-cicd': '1' },
+      }).then((response) => response.json())
+      assert.equal(created.ok !== false, true, '用模板新建失败：' + JSON.stringify(created).slice(0, 300))
+      assert.equal(created.pipeSource, projectPipe, '新建时 pipe.yml 必须是模板原文')
+
+      // ⑤ 模板名要挡住路径逃逸：一个叫 ../../evil 的模板不能写到工作目录外面。
+      const escape = await repo.call('/template-save?name=' + encodeURIComponent('../../evil') + '&confirm=1&source=' + encodeURIComponent('name: evil\n'), {
+        method: 'POST',
+        headers: { 'x-dsh-cicd': '1' },
+      }).then((response) => response.json())
+      assert.equal(escape.ok, true)
+      assert.equal(escape.id.includes('..'), false, '模板 id 必须被归一，不能带 .. 逃出目录')
+      assert.equal(existsSync(join(dir, 'evil')), false, '模板目录不该被写到 workDir 之外')
+
+      // ⑥ 删除：删掉的模板不再出现在列表里，取详情返回 false。
+      const removed = await repo.call('/template-save?name=doomed&confirm=1&source=' + encodeURIComponent('name: doomed\n'), { method: 'POST', headers: { 'x-dsh-cicd': '1' } })
+      assert.equal((await removed.json()).ok, true)
+      assert.equal(repo.runtime.removeTemplate('doomed')?.removed, true)
+      assert.equal(repo.runtime.templateDetail('doomed'), null)
+    } finally { repo.close() }
+  } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 checkAsync('routes：pipe-save 校验通过才写盘，非法源不落盘，写保护与未知参数', async () => {
   assert.equal((await call('/pipe-save', '?project=demo&source=x')).status, 403)
@@ -1111,7 +1188,7 @@ checkAsync('routes：operations 时间线、notify-test 未配置与写保护', 
 })
 
 check('routes：所有资源都走 resource，没有 handler/POST 形态', () => {
-  assert.equal(ctx.routes.length, 43)
+  assert.equal(ctx.routes.length, 45)
   for (const route of ctx.routes) {
     assert.equal(route.handler, undefined)
     assert.ok(route.kind === 'exact' || route.kind === 'prefix')

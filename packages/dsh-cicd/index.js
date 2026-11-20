@@ -30,7 +30,7 @@ import { deployRelease, rollbackRelease, readReleaseDigest, verifyRemoteArtifact
 import { deployRelease as strategyDeployRelease } from './lib/strategy.js'
 import { dispatchNotifications } from './lib/notify.js'
 import { readGitMeta, fetchQuiet, cloneRepo, isGitRepo, fetchAsync, remoteHead, pullFastForward, remoteBranches, commitDate } from './lib/git.js'
-import { scaffoldPipe, SCAFFOLD_KINDS } from './lib/scaffold.js'
+import { scaffoldPipe, SCAFFOLD_KINDS, findTemplate, listTemplates, readTemplate, removeTemplate, writeTemplate } from './lib/scaffold.js'
 import { createLiveHub } from './lib/live.js'
 import { performHandshake, LogSocket, encodeFrame, refuseUpgrade } from './lib/ws.js'
 import { normalizeTriggers, matchPushRef, triggerSummary } from './lib/triggers.js'
@@ -3459,7 +3459,35 @@ function createRuntime(ctx, config) {
         })(),
       }
     },
-    async createProject({ kind = 'static', name = '', path = '', repoUrl = '', branch = '' } = {}) {
+    /**
+     * v3.0-P6-2 模板中心：内置模板 + 仓库存的模板（<workDir>/templates/<id>/），外加仓库里的「另存为模板」。
+     *
+     * 模板是纯数据（一份 pipe.yml 文本 + 几个字段），没有可执行内容：模板决定的是起点，不是行为。
+     * 读的时候坏模板不抛错，而是带上 problems 照常返回 —— 一个坏了不该让整页 500。
+     */
+    templates() {
+      return listTemplates(options)
+    },
+    templateDetail(id = '', { name = 'demo' } = {}) {
+      return readTemplate(options, id, { name })
+    },
+    removeTemplate(id = '') {
+      return removeTemplate(options, id)
+    },
+    async saveTemplate({ id = '', project = '', name = '', saveAs = '', description = '', kind = '', source = '' } = {}) {
+      // 三个来源：显式文本（编辑器里正在写的那份）、某个项目的 pipe.yml、或内置模板复制一份。
+      let text = String(source || '')
+      let derivedKind = String(kind || '')
+      if (!text && project) {
+        const target = pickProject(options, project)
+        // 坏掉的 pipe.yml 照样能存成模板（模板就是文本），但不拿它推断模板来自哪种语言。
+        try { readPipe(target) } catch { /* 形状坏也不拦着存 */ }
+        text = readFileSync(target.pipe, 'utf8')
+      }
+      if (!text) throw Object.assign(new Error('另存为模板需要给 source 文本或 project'), { code: 'TEMPLATE_SOURCE_REQUIRED' })
+      return writeTemplate(options, { id: id || saveAs || name, name: name || saveAs || id, description, kind: derivedKind, source: text })
+    },
+    async createProject({ kind = 'static', name = '', path = '', repoUrl = '', branch = '', template = '' } = {}) {
       let dir
       if (repoUrl) {
         // 从 git 新建：clone 到 workDir/<name>（名字冲突则加 -2 后缀），再按分支确定默认分支名。
@@ -3481,7 +3509,12 @@ function createRuntime(ctx, config) {
       if (existsSync(pipePath)) throw Object.assign(new Error(`目录里已有 pipe.yml：${pipePath}`), { code: 'PROJECT_CREATE_FAILED' })
       mkdirSync(dir, { recursive: true })
       const id = uniqueProjectId(options.projects, name || basename(dir))
-      const pipeSource = scaffoldPipe({ name: name || basename(dir), kind, hosts: ['host1'], path: `/srv/${name || basename(dir)}` })
+      // 模板中心（P6-2）：模板给了文本就用模板自己的文本（模板仓库里存的就是一份完整 pipe.yml），
+      // 否则按 kind 现渲染一份 —— 两条路都只产出能被 parsePipe 读进去的起点。
+      const chosen = template ? findTemplate(options, template) : null
+      const pipeSource = chosen && chosen.source
+        ? chosen.source
+        : scaffoldPipe({ name: name || basename(dir), kind: chosen?.kind || kind, hosts: ['host1'], path: `/srv/${name || basename(dir)}`, template: chosen })
       writeFileSync(pipePath, pipeSource, 'utf8')
       const meta = readGitMeta(dir)
       const defaultBranch = branch || meta.branch || ''
@@ -3850,11 +3883,12 @@ function registerTools(ctx, runtime) {
     parameters: {
       type: 'object',
       properties: {
-        kind: { type: 'string', description: '脚手架模板：static / node / python / go / bare（默认 static）' },
+        kind: { type: 'string', description: '脚手架模板：static / node / python / go / java / php / rust / docker / bare（默认 static；指定 template 时以模板为准）' },
         name: { type: 'string', description: '项目名（缺省取 path 的目录名或 repo 名）' },
         path: { type: 'string', description: '本地目标目录（repoUrl 为空时必填；默认 workDir/<name>）' },
         repoUrl: { type: 'string', description: 'git 仓库地址（给定时 clone 到 workDir/<name>）' },
         branch: { type: 'string', description: 'clone 的分支名（可选）' },
+        template: { type: 'string', description: '模板 id（内置 static/node/… 或自定义模板名）：直接用模板里的 pipe.yml，不再套脚手架' },
       },
     },
     output: {
@@ -3874,7 +3908,60 @@ function registerTools(ctx, runtime) {
       },
     },
     async execute(args = {}) {
-      return runtime.createProject({ kind: args.kind || 'static', name: args.name || '', path: args.path || '', repoUrl: args.repoUrl || '', branch: args.branch || '' })
+      return runtime.createProject({ kind: args.kind || 'static', name: args.name || '', path: args.path || '', repoUrl: args.repoUrl || '', branch: args.branch || '', template: args.template || '' })
+    },
+  })
+
+  register({
+    name: 'cicd_templates',
+    description: '模板中心：列出内置模板（9 种语言/形态）与自定义模板、读取某个模板的 pipe.yml、把一份文本或某个项目的 pipe.yml 另存为模板、删除自定义模板。新建项目时可把模板 id 传给 cicd_project_create。',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'get', 'save', 'remove'], description: 'list=列表（默认）；get=取一个模板的文本；save=另存为模板；remove=删除自定义模板' },
+        id: { type: 'string', description: '模板 id（内置用 static/node/…；自定义用保存时的名字）' },
+        name: { type: 'string', description: 'list 时用于渲染内置模板里的项目名（默认 demo）' },
+        project: { type: 'string', description: 'save 时从该项目的 pipe.yml 取文本（与 source 二选一）' },
+        source: { type: 'string', description: 'save 时直接给 pipe.yml 文本（优先级高于 project）' },
+        description: { type: 'string', description: 'save 时的模板说明' },
+        kind: { type: 'string', description: 'save 时的模板形态（static/node/…，默认 static）' },
+        confirm: { type: 'boolean', description: 'remove 需要 confirm=true' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          dir: { type: 'string' }, builtin: { type: 'number' }, custom: { type: 'number' },
+          templates: { type: 'array', items: { type: 'object' } },
+          id: { type: 'string' }, name: { type: 'string' }, language: { type: 'string' },
+          source: { type: 'string' },
+          problems: { type: 'array', items: { type: 'string' } },
+          path: { type: 'string' }, removed: { type: 'boolean' },
+        },
+      },
+      render(_args, value) {
+        if (Array.isArray(value.templates)) {
+          const lines = [`模板（内置 ${value.builtin} + 自定义 ${value.custom}）· ${value.dir || '未配置目录'}`]
+          for (const item of value.templates) {
+            lines.push(`  ${item.custom ? '☆' : '·'} ${item.id}（${item.language || item.kind || '?'}）${item.description ? ` —— ${item.description}` : ''}`)
+          }
+          return textBlocks(lines.join('\n'))
+        }
+        if (value.removed) return textBlocks(`已删除模板 ${value.id}`)
+        const lines = [`模板 ${value.id}（${value.language || value.kind || '?'}）${value.path ? ` · ${value.path}` : ' · 内置'}`]
+        if (value.problems?.length) lines.push(`解析告警：${value.problems.join('；')}`)
+        lines.push('--- pipe.yml ---', value.source || '')
+        return textBlocks(lines.join('\n'))
+      },
+    },
+    async execute(args = {}) {
+      const action = args.action || 'list'
+      if (action === 'list') return runtime.templates()
+      if (action === 'get') return runtime.templateDetail(args.id || '', { name: args.name || 'demo' })
+      if (action === 'save') return runtime.saveTemplate({ id: args.id || '', name: args.name || '', project: args.project || '', description: args.description || '', kind: args.kind || '', source: args.source || '' })
+      if (action === 'remove') return { id: args.id || '', removed: runtime.removeTemplate(args.id || '') }
+      throw new Error(`未知 action：${action}`)
     },
   })
 
@@ -5302,9 +5389,57 @@ async function projectMetaResource(request, runtime) {
   } catch (error) { return errorJson(error) }
 }
 
+/** POST /template-save 收的字段（query 与 body 都按这一张表挡）。 */
+const TEMPLATE_SAVE_PARAMS = new Set(['id', 'name', 'project', 'description', 'kind', 'source', 'confirm'])
+
+/**
+ * v3.0-P6-2 模板中心：GET /templates 列出内置 + 仓库模板（内置只给元数据与各自渲染好的文本）。
+ * 模板是可执行的起点而不是可执行内容，读它不需要身份；写模板才需要 MANAGE_PROJECT。
+ */
+async function templatesResource(request, runtime) {
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
+  const params = queryOf(request)
+  const bad = unsupportedParams(params, new Set(['name', 'project']))
+  if (bad) return json({ ok: false, error: bad }, 400)
+  try {
+    const listed = runtime.templates()
+    const name = params.get('project') || params.get('name') || 'demo'
+    // 内置模板按目标项目名现渲染，因此列表里也带上文本 —— 前端用它做「新建前先看一眼」。
+    const templates = listed.templates.map((item) => (item.custom ? item : { ...item, source: runtime.templateDetail(item.id, { name })?.source || '' }))
+    return json({ ok: true, dir: listed.dir, builtin: listed.builtin, custom: listed.custom, templates })
+  } catch (error) { return errorJson(error) }
+}
+
+/** POST /template-save：把一份文本（或某个项目的 pipe.yml）另存为模板。 */
+async function templateSaveResource(request, runtime) {
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
+  const query = queryOf(request)
+  // 正文按需读：GET 形态的写请求（前端 callApi 一直这么发）没有正文。
+  const hasBody = request.method !== 'GET' && request.method !== 'HEAD' && Number(request.headers?.get?.('content-length') || 0) > 0
+  const body = hasBody ? await jsonBodyOf(request) : {}
+  const pick = (key) => String(body[key] ?? query.get(key) ?? '')
+  const bad = unsupportedParams(query, TEMPLATE_SAVE_PARAMS)
+  if (bad) return json({ ok: false, error: bad }, 400)
+  // 正文也要挡：一个拼错的名字写在 body 里时没人会去查 query，等于悄悄忽略。
+  const strayKey = Object.keys(body).find((key) => !TEMPLATE_SAVE_PARAMS.has(key))
+  if (strayKey) return json({ ok: false, error: `不支持的参数：${strayKey}` }, 400)
+  const guard = authorize(request, query, { runtime, action: ACTIONS.MANAGE_PROJECT, resource: { type: 'project', id: pick('project') || pick('name') } })
+  if (guard) return guard
+  try {
+    const saved = await runtime.saveTemplate({
+      id: pick('id'),
+      name: pick('name'),
+      project: pick('project'),
+      description: pick('description'),
+      kind: pick('kind'),
+      source: pick('source'),
+    })
+    return json({ ok: true, ...saved })
+  } catch (error) { return errorJson(error) }
+}
 async function projectCreateResource(request, runtime) {
   const params = queryOf(request)
-  const bad = unsupportedParams(params, new Set(['kind', 'name', 'path', 'repoUrl', 'branch', 'confirm']))
+  const bad = unsupportedParams(params, new Set(['kind', 'name', 'path', 'repoUrl', 'branch', 'confirm', 'template']))
   if (bad) return json({ ok: false, error: bad }, 400)
   const guard = authorize(request, params, { runtime, action: ACTIONS.MANAGE_PROJECT, resource: { type: 'project', id: params.get('name') || '' } })
   if (guard) return guard
@@ -5315,6 +5450,7 @@ async function projectCreateResource(request, runtime) {
       path: params.get('path') || '',
       repoUrl: params.get('repoUrl') || '',
       branch: params.get('branch') || '',
+      template: params.get('template') || '',
     })
     return json({ ok: true, ...data })
   } catch (error) { return errorJson(error) }
@@ -6511,6 +6647,8 @@ function registerHttpRoutes(ctx, runtime) {
     { kind: 'exact', path: `${ROUTE_PREFIX}/projects`, resource: (request) => projectsResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/project-meta`, resource: (request) => projectMetaResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/project-create`, resource: (request) => projectCreateResource(request, runtime) },
+    { kind: 'exact', path: `${ROUTE_PREFIX}/templates`, resource: (request) => templatesResource(request, runtime) },
+    { kind: 'exact', path: `${ROUTE_PREFIX}/template-save`, resource: (request) => templateSaveResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/validate`, resource: (request) => validateResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/preview`, resource: (request) => previewResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/pipe-save`, resource: (request) => pipeSaveResource(request, runtime) },
