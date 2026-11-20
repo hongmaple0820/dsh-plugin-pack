@@ -19,6 +19,9 @@
 import { createHash, timingSafeEqual, randomBytes } from 'node:crypto'
 import { Readable } from 'node:stream'
 import fs, { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync } from 'node:fs'
+// v3.0-P7 混沌：磁盘满不是「日志写不进去」就完了——SQLite 写库、CAS 落盘、release 目录都同时跟着死。
+// statfs 只在出问题时调用（它本身也可能失败），所以按名字取，缺失时返回 null 而不是抛。
+const statfsOf = (target) => (typeof fs.statfs === 'function' ? fs.statfs(target, { bigint: true }) : null)
 import { homedir } from 'node:os'
 import { basename, isAbsolute, join, relative, resolve } from 'node:path'
 import { parsePipe, planPipeline, interpolate, matchArtifacts, isHostSelector, parseHostSelector, explainWhen, stageConditionOf } from './lib/pipe.js'
@@ -2087,6 +2090,22 @@ function createRuntime(ctx, config) {
     const database = (() => {
       try { return statSync(dbFile()).size } catch { return 0 }
     })()
+    // v3.0-P7 混沌：磁盘余量。以前 /storage 只会说「这些东西占了多少」，
+    // 而运维真正要问的是「还剩多少、够不够再跑一次」——制品与日志都是无上限增长的。
+    // 512MiB 是「还能再跑一次」的粗线，不是警告的真正含义，前端按它给一句提醒。
+    const DISK_LOW_BYTES = 512 * 1024 * 1024
+    const disk = (() => {
+      try {
+        const stats = statfsOf(options.workDir)
+        if (!stats || typeof stats.bfree !== 'bigint') return { ok: false, message: '平台不提供 statfs', free: 0, total: 0, path: options.workDir }
+        const free = Number(stats.bavail * stats.bsize)
+        const total = Number(stats.blocks * stats.bsize)
+        return { ok: true, free, total, path: options.workDir, low: free < DISK_LOW_BYTES, freeBytes: free, totalBytes: total }
+      } catch (error) {
+        // 统计不出来不许让 /storage 整条失败：字节数那一半仍然有用。
+        return { ok: false, message: String(error?.message || error || 'unknown'), free: 0, total: 0, path: options.workDir }
+      }
+    })()
     return {
       workDir: options.workDir,
       logs: dir(join(options.workDir, 'logs')),
@@ -2095,6 +2114,7 @@ function createRuntime(ctx, config) {
       database: { path: dbFile(), bytes: database },
       // 磁盘告警线：日志与制品是无上限增长的，这一条用来回答「现在离满还有多远」。
       total: dir(options.workDir),
+      disk,
     }
   }
 
@@ -5680,7 +5700,28 @@ function errorStatus(error) {
   if (code === 'PROMOTION_SOURCE_NOT_FOUND') return 404
   if (code === 'ARTIFACT_NOT_PROMOTED') return 409
   if (code.startsWith('PIPE_') || code === 'COMMAND_INVALID') return 400
+  // v3.0-P7 混沌：磁盘满 / 配额满。这不是 Host 内部的 bug（500 会让人去翻堆栈），
+  // 也不是客户端的错（400 更不对）——是这台机器的一个资源状态，要的是「去清磁盘」。
+  // 507 = Insufficient Storage，语义正好对上；424 留给「因为别的资源失败而连带失败」。
+  if (code === 'DISK_FULL' || code === 'DISK_QUOTA') return 507
+  if (code === 'DISK_UNAVAILABLE') return 503
   return 500
+}
+
+/**
+ * v3.0-P7 混沌：磁盘满的统一报错。文案要说清「是哪块盘、为什么读不出来」——
+ * 只说 "No space left on device" 时，运维不知道指的是 workDir 还是制品库。
+ */
+function diskFullError(path, detail, code = 'DISK_FULL') {
+  const error = new Error(`磁盘写不进去 ${path ? '(' + path + ')' : ''}：${detail}。清出空间后重试；日志请去看 /storage 的 disk.free`)
+  error.code = code
+  return error
+}
+
+/** 判断一个错误是不是「盘写满了」：同一条代码要在 CAS、日志、release 三处复用。 */
+function isDiskFullError(error) {
+  const code = String(error?.code || '')
+  return code === 'ENOSPC' || code === 'EDQUOT' || code === 'EFBIG' || code === 'DISK_FULL' || code === 'DISK_QUOTA'
 }
 
 function errorJson(error) {

@@ -308,12 +308,15 @@ export async function runPipeline({
    * 以前这里是裸 appendFileSync 用 try/catch 吞掉：磁盘满之后面板上一个字都不动，
    * 用户看到的就是「设备卡住了」，而真实原因是这条日志根本没落盘。
    * 只喊一次是因为每一行都喊会把同一个事故刷成几十条，反而盖住真正的第一现场。
+   * ENOSPC/EDQUOT 要单独说：那种情况下写库、CAS、release 也会跟着失败，
+   * 用户需要的是「去清磁盘」，而不是「重启 Host」。
    */
   let logWriteFailed = false
   const noteLogWriteFailure = (error) => {
     if (logWriteFailed) return false
     logWriteFailed = true
-    return error?.message || String(error || 'unknown')
+    const full = String(error?.code || '') === 'ENOSPC' || String(error?.code || '') === 'EDQUOT'
+    return full ? '磁盘满了（' + (error?.message || error || 'ENOSPC') + '）。清出空间后重试——这条运行之后也会继续失败' : (error?.message || String(error || 'unknown'))
   }
   if (logFile) {
     try {
@@ -408,9 +411,23 @@ export async function runPipeline({
     ? await runJobGraph({ pipe, project, target, stages, stage, runId, hub, store, runRecord, vars, signal, stepContext, concurrency, modelEnv })
     : await runStageLoop({ stages, runId, hub, store, runRecord, stepContext })
 
-  if (hub) hub.end(runId, outcome.status)
-  store?.appendRun({ ...runRecord, finished_at: new Date().toISOString(), status: outcome.status, error: outcome.error })
-  return { runId, status: outcome.status, stages: outcome.stages, plan, jobs: outcome.jobs || null }
+  // v3.0-P7 混沌：日志一直写不进去时，这条运行不能算成功。
+  // 磁盘满会让 appendRun / CAS / release 目录同时失败——上面几步「看起来跑完了」只是
+  // 因为命令在内存里跑完。此时如实报失败，用户才知道要去清磁盘，而不是拿到一次绿色发布。
+  const diskBlocked = logWriteFailed && String(outcome.status) === 'success'
+  if (diskBlocked) {
+    log({ stageId: '', index: -1 }, '⚠ 这次运行被判为失败：日志无法落盘（磁盘满或目录不可写），同一块盘上的运行记录与发布产物也不可能写成功。')
+  }
+  const finalStatus = diskBlocked ? 'failed' : outcome.status
+  const finalError = diskBlocked ? (outcome.error || '磁盘写不进去：日志无法落盘，发布产物与运行记录同样写不了') : outcome.error
+  if (hub) hub.end(runId, finalStatus)
+  try {
+    store?.appendRun({ ...runRecord, finished_at: new Date().toISOString(), status: finalStatus, error: finalError })
+  } catch (error) {
+    // v3.0-P7：库也写不进去时不能再抛——finally 里的收尾（取消进程、标失败）还没跑。
+    log({ stageId: '', index: -1 }, `⚠ 运行记录也没写进去（${error?.message || error}）：这次运行的结果只存在于内存里。`)
+  }
+  return { runId, status: finalStatus, stages: outcome.stages, plan, jobs: outcome.jobs || null, code: diskBlocked ? 'DISK_FULL' : '' }
 }
 
 /* ------------------------------------------------------------------------------------------------

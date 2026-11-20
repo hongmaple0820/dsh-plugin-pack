@@ -325,6 +325,36 @@ checkAsync('runner：成功/失败/allow_failure/retries，日志与运行记录
   }
 })
 
+
+// v3.0-P7 混沌：日志目录写不进去时，这条命令在内存里跑完的运行必须如实报失败。
+// 磁盘满会让 appendRun / CAS / release 目录同时失败——上面几步「看起来跑完了」只是因为
+// 命令跑在内存里。此时若返回 success，用户拿到的就是一次绿色的假发布。
+// 试验结论（Windows/Node 22）：把 <state>/logs 这个目录换成一个普通文件即可触发同一条路径——
+// mkdirSync 抛 EEXIST、appendFileSync 抛 ENOENT，两者都进 noteLogWriteFailure 的同一条分支。
+checkAsync('runner：日志无法落盘时这次运行被判为失败并给出 DISK_FULL 码', async () => {
+  const { dir, project } = runnerProject()
+  const store = createStore({ dir: join(dir, '.state') })
+  try {
+    const pipe = parsePipe([
+      'stages:',
+      '  - id: build',
+      '    steps:',
+      '      - run: node -e "console.log(1)"',
+    ].join('\n'))
+    rmSync(join(dir, '.state', 'logs'), { recursive: true, force: true })
+    writeFileSync(join(dir, '.state', 'logs'), 'not a directory', 'utf8')
+    const lines = []
+    const result = await runPipeline({ pipe, project, target: '', store, runId: 'r-disk', onLog: (entry) => lines.push(entry.line) })
+    assert.equal(result.status, 'failed')
+    assert.equal(result.code, 'DISK_FULL')
+    assert.ok(lines.some((line) => line.includes('这次运行被判为失败')), '必须告诉用户为什么失败')
+    assert.equal(store.run('r-disk').status, 'failed', '运行记录也必须落库为失败')
+  } finally {
+    store.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 checkAsync('runner：dryRun 不写 store、不执行命令，按 stage 只取依赖闭包', async () => {
   const { dir, project } = runnerProject()
   const store = createStore({ dir: join(dir, '.state') })
