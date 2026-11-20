@@ -18,3 +18,7 @@ packages/*/r.txt
 /-w
 /novnc.tmp
 /examples/demo-site/dist/
+
+# dsh-user-data-backup 的安装验证产物：里面是临时 profile、凭据与备份 zip，只属于本机实验
+packages/dsh-user-data-backup/.debug/
+packages/dsh-user-data-backup/package-lock.json

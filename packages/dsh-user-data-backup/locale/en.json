@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Data backup",
+    "description": "Back up this profile's configuration, settings, sessions and credentials, preview every restore, and keep a copy on WebDAV or S3-compatible storage."
+  }
+}

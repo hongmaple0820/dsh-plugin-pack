@@ -1,0 +1,357 @@
+/* Every color, radius, and focus ring resolves through host --dsw-* tokens, so this section follows the active theme and the dsh-claude-style shapes. */
+
+.local-user-data {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  width: 100%;
+  max-width: 880px;
+  min-width: 0;
+  min-height: 0;
+  margin-inline: auto;
+  padding-block: 8px;
+  color: var(--dsw-alias-label-primary);
+  font-size: 13px;
+  line-height: 22px;
+}
+
+.local-user-data *,
+.local-user-data *::before,
+.local-user-data *::after {
+  box-sizing: border-box;
+}
+
+/* Settings type scale: 16/24 title, 14/22 intro, 13/22 body. */
+.local-user-data .local-user-data-head {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.local-user-data h2 {
+  margin: 0;
+  font-size: 16px;
+  line-height: 24px;
+  font-weight: 500;
+}
+
+.local-user-data h3 {
+  margin: 0;
+  font-size: 14px;
+  line-height: 22px;
+  font-weight: 500;
+}
+
+.local-user-data h4,
+.local-user-data legend {
+  margin: 0;
+  padding: 0;
+  font-size: 13px;
+  line-height: 22px;
+  font-weight: 500;
+}
+
+.local-user-data p {
+  margin: 0;
+  min-width: 0;
+}
+
+.local-user-data .local-user-data-intro {
+  font-size: 14px;
+  line-height: 22px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* One card per section, with an outline that always reads heavier than its inner separators. */
+.local-user-data > section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  min-height: 0;
+  padding: 16px;
+  border: 0.5px solid var(--dsw-alias-settings-card-stroke);
+  border-radius: var(--dsw-radius-xl);
+  background: var(--dsw-alias-settings-card-fill);
+}
+
+.local-user-data ul {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  min-width: 0;
+  padding-inline-start: 20px;
+}
+
+.local-user-data li {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* auto-fit keeps two columns on a wide panel and one on a narrow one, without a width breakpoint. */
+.local-user-data fieldset {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.local-user-data fieldset > fieldset,
+.local-user-data fieldset > p,
+.local-user-data .local-user-data-option-wide {
+  grid-column: 1 / -1;
+}
+
+.local-user-data .local-user-data-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 12px;
+  border: 0.5px solid var(--dsw-alias-settings-card-stroke);
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-base);
+  cursor: pointer;
+}
+
+/* Selected options must read at a glance: accent tint plus a doubled 1px outline, not a hairline colour change. */
+.local-user-data .local-user-data-option:has(:checked) {
+  border-color: var(--dsw-alias-border-selected);
+  box-shadow: inset 0 0 0 1px var(--dsw-alias-border-selected);
+  background: var(--dsw-alias-interactive-bg-hover-accent);
+  font-weight: 500;
+}
+
+.local-user-data .local-user-data-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  min-width: 0;
+}
+
+.local-user-data .local-user-data-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.local-user-data .local-user-data-field,
+.local-user-data .local-user-data-file {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.local-user-data input:not([type=checkbox]):not([type=file]),
+.local-user-data select {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  height: 32px;
+  padding: 0 10px;
+  border: 0.5px solid var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-sm);
+  background: var(--dsw-alias-bg-base);
+  color: inherit;
+  font: inherit;
+}
+
+/* The native file control is styled into the same 32px field as inputs and selects; it stays a real input so the keyboard reaches it. */
+.local-user-data input[type=file] {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  height: 32px;
+  padding: 0;
+  border: 0.5px solid var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-sm);
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-secondary);
+  font: inherit;
+  cursor: pointer;
+}
+
+.local-user-data input[type=checkbox] {
+  flex: none;
+  margin: 0;
+  accent-color: var(--dsw-alias-brand-primary);
+}
+
+.local-user-data :focus-visible {
+  outline: var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+  outline-offset: 2px;
+}
+
+/* Feedback rows: one shape, with the tone carrying severity. */
+.local-user-data [role=status],
+.local-user-data [role=alert] {
+  min-width: 0;
+  padding: 8px 12px;
+  border: 0.5px solid var(--dsw-alias-settings-card-stroke);
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-base);
+}
+
+.local-user-data [role=status] {
+  color: var(--dsw-alias-label-secondary);
+}
+
+.local-user-data [role=alert] {
+  border-color: var(--dsw-alias-state-error-secondary);
+  color: var(--dsw-alias-state-error-primary);
+}
+
+/* Long previews scroll inside their card instead of widening it. */
+.local-user-data .local-user-data-scroll {
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+  max-height: min(360px, 60vh);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.local-user-data .local-user-data-table {
+  width: 100%;
+  min-width: 0;
+  border-collapse: collapse;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.local-user-data .local-user-data-table th,
+.local-user-data .local-user-data-table td {
+  padding: 6px 8px;
+  text-align: start;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+/* Narrow windows shrink the path column; the short columns stay on one line instead of breaking inside words. */
+.local-user-data .local-user-data-table th:not(:first-child),
+.local-user-data .local-user-data-table td:not(:first-child) {
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
+.local-user-data .local-user-data-table thead th {
+  font-weight: 500;
+  color: var(--dsw-alias-label-tertiary);
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
+}
+
+.local-user-data .local-user-data-table tbody tr + tr > * {
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+}
+
+.local-user-data .local-user-data-path {
+  overflow-wrap: anywhere;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.local-user-data .local-user-data-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.local-user-data .local-user-data-destination {
+  min-width: 0;
+  border: 0.5px solid var(--dsw-alias-settings-card-stroke);
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-base);
+}
+
+.local-user-data .local-user-data-destination > summary {
+  padding: 8px 12px;
+  border-radius: inherit;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.local-user-data .local-user-data-destination > fieldset {
+  padding: 4px 12px 12px;
+}
+
+.local-user-data .local-user-data-remote-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  max-height: min(320px, 50vh);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.local-user-data .local-user-data-remote-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 12px;
+  border: 0.5px solid var(--dsw-alias-settings-card-stroke);
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-alias-bg-base);
+}
+
+.local-user-data .local-user-data-remote-name {
+  flex: 1 1 200px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+.local-user-data input[type=file]::file-selector-button {
+  height: 100%;
+  margin: 0 10px 0 0;
+  padding: 0 12px;
+  border: 0;
+  border-inline-end: 0.5px solid var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-sm) 0 0 var(--dsw-radius-sm);
+  background: var(--dsw-alias-interactive-bg-hover-solid);
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  cursor: pointer;
+}
+
+@media (hover: hover) {
+  .local-user-data .local-user-data-option:not(:has(:checked)):hover,
+  .local-user-data .local-user-data-check:hover,
+  .local-user-data .local-user-data-destination > summary:hover,
+  .local-user-data input[type=file]::file-selector-button:hover {
+    background: var(--dsw-alias-interactive-bg-hover);
+  }
+}
+
+@media (pointer: coarse) {
+  .local-user-data input:not([type=checkbox]),
+  .local-user-data select {
+    height: auto;
+    min-height: 44px;
+    font-size: 16px;
+  }
+
+  .local-user-data button,
+  .local-user-data summary,
+  .local-user-data .local-user-data-option,
+  .local-user-data .local-user-data-check {
+    min-height: 44px;
+  }
+}

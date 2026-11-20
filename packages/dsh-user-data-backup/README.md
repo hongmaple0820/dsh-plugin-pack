@@ -1,34 +1,47 @@
 # @local/dsh-user-data-backup
 
-Composition-only bundle: inserts the two data-management plugins into a profile.
+独立的 DSH 数据管理插件，包含 Host 接口和「设置 → 数据管理」页面。实现由本包拥有，运行时使用宿主提供的 Session、Connection、Settings、Credentials 和 React 服务；不需要 DSH 源码检出，也不依赖 Claude Style 主题。当前开发验证不等于已安装到用户日常使用的 profile。
 
-- `@deepseek-ai/dsh-user-data-backup` (host) — `/api/user-data.*` routes: export, import
-  preview, import apply, remote list, sync list/push/bundle.
-- `@deepseek-ai/dsh-client-ui-settings-user-data` (client) — the 数据管理 section inside
-  设置.
+## 使用流程
 
-Both packages stay in F:/maple/deepseek-harness and are linked into the profile, so
-rebuilding them (pnpm run build:artifacts) updates the installed plugin.
+页面依次展示备份与恢复内容、创建备份、从备份恢复、浏览器侧栏偏好和远程备份。每块内容是一张卡片，内容选择与目标表单按可用宽度自动排成两列，空间不足时收为单列；预览目录表和远端备份列表在卡片内滚动，不撑宽页面。远程连接字段位于“目标设置”展开区，备份状态和常用操作保留在外；恢复仍需预览后应用。间距、圆角与边框取自宿主 --dsw-* 设计令牌，焦点环用宿主 --dsw-focus-ring-color，不依赖 Claude Style。
 
-## Install (already done for the desktop profile)
+默认选择配置文件与设置。会话记录和凭据需要单独选择；凭据还需要明确确认，导出的 ZIP 及恢复副本不加密。配置导出只包含 package.json、cordis.patch.yml 和 pnpm-lock.yaml，设置通过宿主描述信息脱敏。YAML 按语法树处理而不执行标签，无法解析时拒绝导出；字段名称与常见授权值的检查不能识别任意文本中的所有秘密。
+
+导入先读取归档、选择组件并生成恢复预览。页面显示每个文件、设置命名空间、预览到期时间和风险说明。配置文件里的脱敏值会保留目标文件的当前值；含脱敏值的数组整体保留，避免把秘密移到其他条目。目标没有相应值时拒绝生成预览，需要先在目标上配置该值。合并使用预览时捕获并核对摘要的原文件，保留的秘密值不会返回浏览器。应用使用服务端保管的一次性计划；修改目标文件或设置后必须重新预览。计划默认五分钟有效，最多保存八份。服务拒绝重叠的数据准备或恢复操作。
+
+恢复前保存原始值，再逐文件替换；文件哈希、目标目录身份、恢复目录身份、链接检查和设置 revision 在写入前重新核对。恢复目录被替换为普通文件或链接时，停止恢复，不向替换路径写入副本。它不是跨文件事务，也不提供跨进程的文件系统锁。部分失败会列出已写入的文件、保留对应恢复副本，并在已有文件写入时提示重启；后续设置不会继续应用，也不会自动回滚。会话文件要求相同的 Session 格式版本，并拒绝覆盖宿主仍保留的会话。配置和凭据文件的更改需要重启后重新加载；正在使用的 profile 应先备份，检查预览后再应用。
+
+## 浏览器侧栏偏好
+
+数据管理页可以单独下载和恢复侧栏偏好 JSON。白名单仅包含 Claude Style 的侧栏视图和所选项目标识；不读取其他存储，也不纳入 ZIP、定时备份或远端传输。导入先显示视图和项目数量；若当前值在预览后变动，须重新预览。应用后刷新页面；目标上不存在的项目由主题在加载项目列表后移除。
+
+## 远程备份
+
+支持 WebDAV 和 S3 兼容服务，使用维护中的 webdav 与 AWS SDK 客户端。目的地址要求 HTTPS；仅本机测试地址允许 HTTP。连接密码和密钥通过宿主 Credentials 服务保存，远端配置文件只记录引用；缺少该服务时不能保存新的凭据。
+
+保存目的地后可测试连接、上传、列出、下载、删除或生成远端归档的恢复预览。每次上传使用唯一文件名，下载回读并核对 SHA-256 后才清理超过保留数量的本插件备份，不删除其他文件。若新备份已通过校验但旧备份清理失败，页面将备份记为成功并单独显示清理警告；新备份仍可下载恢复。远端归档恢复与本地导入共用同一套校验和一次性计划。
+
+定时备份默认关闭，启用后仅在宿主运行期间执行；最短间隔一分钟，同一远端操作不会重叠。定时组件不包含凭据。失败状态在页面显示，不用失败的上传触发保留清理。当前只支持单个目的地，不提供跨机器 Session 合并。
+
+## 构建与安装
 
 ```sh
-cd ~/.dsh/profiles/desktop
-# package.json: dependencies + dsh.profile.bundles already list @local/dsh-user-data-backup
-node <pnpm>/bin/pnpm.mjs install --prefer-offline
+npm install --ignore-scripts
+npm test
+npm run build
 ```
 
-Restart the app afterwards: the loader composes bundles at process start.
+包的 Host 入口由构建生成 lib/host.js，浏览器入口为 lib/client.js。协议与归档库打入 Host 产物，React 和宿主包保持外部依赖；lib/THIRD_PARTY_NOTICES.txt 收录实际打包库的许可文本。包内 cordis.patch.yml 仅声明本插件；安装使用 DSH 的插件管理入口或 `dsh plugin --profile <profile> add <package-spec>`，然后重启对应宿主。开发脚本和测试不修改用户的 profile。不要同时启用旧版官方数据管理实现，以免出现重复页面和不同的恢复格式。
 
-## Remove
+本包提供可重复的独立安装验收。先运行上述构建命令，再执行 `npm pack` 生成归档，并运行 `node scripts/verify-install.mjs --archive <tgz> --cli <已安装的dsh入口> --chrome <Chrome或Edge可执行文件>`。脚本只在新建的 `.debug` 测试目录安装归档，打开原生设置页并向本机认证 WebDAV 上传和回读，验证服务拒绝删除时页面显示清理警告且保留新旧备份，不使用日常配置。此脚本不启动 S3 服务。
 
-```sh
-cd ~/.dsh/profiles/desktop
-node -e "const fs=require('fs');const p='package.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));
-delete j.dependencies['@local/dsh-user-data-backup'];
-delete j.dependencies['@deepseek-ai/dsh-user-data-backup'];
-delete j.dependencies['@deepseek-ai/dsh-client-ui-settings-user-data'];
-j.dsh.profile.bundles=j.dsh.profile.bundles.filter(b=>b!=='@local/dsh-user-data-backup');
-fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
-node <pnpm>/bin/pnpm.mjs install --prefer-offline
-```
+## 接口与限制
+
+Connection Fetch 提供经过宿主身份验证的精确路由 `/api/local-user-data.context`、`export`、`preview`、`apply`、`remote.status`、`remote.save` 和 `remote.run`。写入请求使用有界流式读取，GET 使用 buffered 模式以兼容现有宿主桥接。请求不能指定文件系统根目录。
+
+ZIP 格式为 dsh-user-data version 1，包含清单、字节长度和 SHA-256。默认上限为归档 64 MiB、单文件 32 MiB、展开总量 256 MiB、10,000 个文件。导入拒绝绝对路径、越界、大小写或 Unicode 重名、文件与目录冲突、Windows 保留名称、符号链接、加密条目和清单不一致。
+
+备份并不覆盖任意插件浏览器存储、整个 DSH_HOME 或工作项目内容。文件与目录身份检查用于发现导出期间变化，不提供操作系统级目录锁或跨文件事务。测试使用隔离目录、真实本地 WebDAV 服务和 SeaweedFS 4.54 的 S3 服务；实际宿主验证使用独立 DSH_HOME，未更改日常安装和用户配置。
+
+构建依赖中的 WebDAV minimatch 子依赖限定到已修复版本后打入 Host，使用者不需要继承 npm overrides。调整版本后须重跑传输测试、构建和依赖审计。独立 tarball 已在全新隔离 DSH_HOME 安装验证：无主题依赖，原生设置页可用，通过页面保存真实认证 WebDAV 目的地并完成上传与回读；公开配置和状态只含凭据引用。相同页面连接真实 SeaweedFS S3 服务，完成访问密钥保存、签名上传、回读校验、列表和二次确认删除，未捕获页面异常。远端错误对客户端使用不包含连接凭据的说明。
