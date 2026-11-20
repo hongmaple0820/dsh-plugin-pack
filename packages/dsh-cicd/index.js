@@ -49,7 +49,7 @@ import { createApprovalGate } from './lib/approval.js'
 import { normalizeEnvironments, promotionPath, isProtected, requiresApproval, parseEnvironmentGuards, assertEnvironmentGuard, actorMatchesAllowlist } from './lib/environments.js'
 import {
   PROMOTION_ERRORS, promotionError, envRequiresPromotion, findSourceRelease,
-  currentPointer, isPromoted, listPromotions, recordPromotion, promotionView,
+  currentPointer, reachablePointer, isPromoted, listPromotions, recordPromotion, promotionView,
 } from './lib/promotions.js'
 import { createRbac } from './lib/rbac.js'
 import { createAuth, SESSION_COOKIE, ROLES, readSessionId } from './lib/auth.js'
@@ -2983,13 +2983,92 @@ function createRuntime(ctx, config) {
     ociStats() {
       return { ok: true, uploads: ociUploads.size(), sessions: ociUploads.sweep().length ? 'swept' : 'idle', stats: artifactStore.stats() }
     },
-    environments(projectId = '') {
+    /**
+     * 环境页（v3.0-P6-3）：一眼看到 prod 跑什么。
+     *
+     * 一个环境的事实分散在五处：pipe 里的 target 形状（主机、策略）、releases 表（哪台机器上是哪一行）、
+     * promotions 表（谁在什么时候把哪份字节放行到这里的）、CAS（那份字节还在不在、还对不对得上）、
+     * 以及护栏（谁能发、要什么审批）。分五处就是让人自己在脑子里 join；这里一次算完，
+     * 并且**只在这一处**回答「这个环境现在跑的是哪份字节」。
+     */
+    async environments(projectId = '') {
       const project = pickProject(options, projectId)
       const pipe = readPipe(project)
       const envs = normalizeEnvironments(pipe.targets)
+      const guards = guardsFor(project)
       const fromName = project.defaultTarget || ''
       const path = promotionPath(envs, fromName)
-      return { project: project.id, environments: Object.values(envs).sort((a, b) => a.order - b.order), promotionPath: path }
+      // 选择器展不开（dsh-remote 未就绪）不该让整页打不开：只有那一个环境标 envsUnknown，
+      // 别的主机照样看得见 —— 一个环境查不清不等于所有环境都查不清。
+      const resolutions = new Map()
+      for (const name of Object.keys(pipe.targets)) {
+        try { resolutions.set(name, await tryExpandTarget(name, pipe.targets[name])) } catch { /* 标记在下面 */ }
+      }
+      const ordered = Object.values(envs).sort((a, b) => a.order - b.order || String(a.name).localeCompare(String(b.name)))
+      // 护栏里出现、pipe 里没有的环境：share prod 的常见形状（生产项目只发布不构建）。
+      for (const [name, spec] of guards.byEnv.entries()) {
+        if (ordered.some((item) => item.name === name)) continue
+        ordered.push({ name, order: 99, protected: spec?.protected === true || String(name).toLowerCase() === 'prod', approvalRequired: spec?.approval === true, strategy: null, canary: null, hosts: [], guard: spec, guardOnly: true })
+      }
+      const environments = ordered.map((env) => {
+        const name = String(env.name)
+        const target = pipe.targets[name] || null
+        const resolution = resolutions.get(name) || null
+        const hosts = Array.isArray(resolution?.hosts) ? resolution.hosts : (Array.isArray(env.hosts) ? env.hosts : [])
+        const guardSpec = guards.byEnv.get(name) || null
+        const pointer = reachablePointer(store.db, { projectId: project.id, env: name, target: name })
+        // normalizeDigest 对空串是抛错而不是返回空串：没有晋级就是空值，不能当非法 digest 处理。
+        const promotedDigest = pointer?.digest ? normalizeDigest(pointer.digest) : ''
+        const rows = target ? store.releases({ target: name, limit: 200 }) : []
+        const active = hosts.map((host) => {
+          const release = target ? store.activeRelease({ target: name, host }) : null
+          return { host, releaseId: publicReleaseId(release), digest: release?.artifact_digest ? normalizeDigest(release.artifact_digest) : '', activatedAt: release?.activated_at || release?.created_at || '', status: release?.status || '' }
+        })
+        // 存活：这份字节还在 CAS 里，而且内容地址对得上。对不上比不在更难查（部署会成功、跑的是坏包）。
+        let digestState = 'empty'
+        if (promotedDigest) {
+          if (!artifactStore.has(promotedDigest)) digestState = 'missing'
+          else digestState = 'present'
+        }
+        // 指针漂移：晋级说 prod 该跑 A，但机器上跑的还是 B —— 这是最该被一眼看到的一行。
+        const liveDigests = [...new Set(active.map((item) => item.digest).filter(Boolean))]
+        const drift = Boolean(promotedDigest) && liveDigests.length > 0 && liveDigests.some((digest) => digest !== promotedDigest)
+        return {
+          name,
+          order: env.order,
+          protected: Boolean(env.protected),
+          approvalRequired: Boolean(env.approvalRequired),
+          strategy: env.strategy || null,
+          canary: env.canary || null,
+          guardOnly: Boolean(env.guardOnly),
+          hosts,
+          envs: resolution ? resolution.envs : [],
+          envsUnknown: Boolean(resolution?.degraded) || !resolution,
+          current: promotedDigest,
+          currentReleaseId: pointer ? String(pointer.release_id || '') : '',
+          promotedAt: pointer ? String(pointer.created_at || '') : '',
+          promotedFrom: pointer ? String(pointer.from_env || '') : '',
+          promotedBy: pointer ? String(pointer.approved_by || '') : '',
+          digestState,
+          drift,
+          liveDigests,
+          active,
+          history: rows.slice(0, 5).map((release) => ({
+            id: publicReleaseId(release), recordId: release.id || '', host: release.host || '', digest: release.artifact_digest ? normalizeDigest(release.artifact_digest) : '',
+            status: release.status || '', activatedAt: release.activated_at || '', createdAt: release.created_at || '',
+          })),
+          // 护栏：这一页只说「规则长什么样」，判定仍只发生在 lib/environments.js 里那一个函数。
+          guard: guardSpec
+            ? { configured: true, protected: Boolean(env.protected), allowedActors: Array.isArray(guardSpec.allowedActors) ? guardSpec.allowedActors : [], branchRule: guardSpec.branchRule || '', digestRequired: guardSpec.digestRequired !== false, approval: Boolean(env.approvalRequired) }
+            : { configured: false, protected: Boolean(env.protected), allowedActors: [], branchRule: '', digestRequired: Boolean(env.protected), approval: Boolean(env.approvalRequired) },
+        }
+      })
+      return {
+        project: project.id,
+        environments,
+        promotionPath: path,
+        invalid: guards.invalid.map((item) => ({ env: item?.env || '', message: item?.message || String(item) })),
+      }
     },
     // ---------------------------------------------------------------------------------------
     // v3.0-P5-5：环境晋级（promotion）—— 跨环境只移指针，字节永远只有 CAS 里那一份
@@ -4351,19 +4430,42 @@ function registerTools(ctx, runtime) {
         type: 'object',
         properties: {
           project: { type: 'string' },
-          environments: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, order: { type: 'number' }, protected: { type: 'boolean' }, approvalRequired: { type: 'boolean' } } } },
+          environments: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string' }, order: { type: 'number' }, protected: { type: 'boolean' }, approvalRequired: { type: 'boolean' },
+                guardOnly: { type: 'boolean' }, hosts: { type: 'array', items: { type: 'string' } },
+                current: { type: 'string' }, digestState: { type: 'string' }, drift: { type: 'boolean' },
+                active: { type: 'array', items: { type: 'object' } },
+              },
+            },
+          },
           promotionPath: { type: 'array', items: { type: 'string' } },
+          invalid: { type: 'array', items: { type: 'object' } },
         },
       },
       render(_args, value) {
         const lines = [`项目 ${value.project || '全局'} 的环境：`]
-        for (const item of value.environments || []) lines.push(`- ${item.name}（order=${item.order}${item.protected ? '，protected' : ''}${item.approvalRequired ? '，需审批' : ''}）`)
+        for (const item of value.environments || []) {
+          const bits = [`order=${item.order}`]
+          if (item.protected) bits.push('protected')
+          if (item.approvalRequired) bits.push('需审批')
+          // 当前版本要连带说清「字节还在不在」：说 prod 跑 abc1234 却不说它已经不在库里，等于给了个假地址。
+          if (item.current) bits.push(`当前 ${item.current.slice(0, 12)}${item.digestState === 'missing' ? '（字节已丢失）' : ''}`)
+          else bits.push('尚未晋级')
+          if (item.drift) bits.push('⚠ 与机器上的版本不一致')
+          if (item.hosts && item.hosts.length > 0) bits.push(`${item.hosts.length} 台主机`)
+          lines.push(`- ${item.name}（${bits.join('，')}）`)
+        }
         if (value.promotionPath) lines.push(`晋升路径：${value.promotionPath.join(' → ')}`)
+        for (const item of value.invalid || []) lines.push(`护栏配置有误 [${item.env || '全局'}]：${item.message}`)
         return textBlocks(lines.join('\n'))
       },
     },
     async execute(args = {}) {
-      return runtime.environments(args.project || '')
+      return await runtime.environments(args.project || '')
     },
   })
 
@@ -6223,7 +6325,7 @@ async function environmentsResource(request, runtime) {
   if (guard) return guard
   try {
     const project = params.get('project') || ''
-    return json({ ok: true, ...runtime.environments(project) })
+    return json({ ok: true, ...(await runtime.environments(project)) })
   } catch (error) { return errorJson(error) }
 }
 

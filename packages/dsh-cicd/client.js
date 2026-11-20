@@ -346,8 +346,28 @@ window.__ModuleLoader__.load({
 .cicd-create-kinds{display:flex;gap:8px;flex-wrap:wrap}
 .cicd-create-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:2px}
 /* P1：审批门视图 */
-.cicd-view-approvals,.cicd-view-rbac,.cicd-view-secrets,.cicd-view-runners{min-width:56px}
+.cicd-view-approvals,.cicd-view-rbac,.cicd-view-secrets,.cicd-view-runners,.cicd-view-environments{min-width:56px}
 .cicd-approvals,.cicd-rbac,.cicd-secrets,.cicd-runners{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;box-sizing:border-box;padding:12px 16px 14px;display:flex;flex-direction:column;gap:10px}
+.cicd-environments{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;box-sizing:border-box;padding:12px 16px 14px;display:flex;flex-direction:column;gap:10px}
+.cicd-environments-head{flex:none;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.cicd-environments-foot{display:flex;gap:8px}
+.cicd-environments-invalid{flex:none;border:1px solid var(--dsw-alias-border-error,currentColor);border-radius:8px;padding:8px 10px;display:flex;flex-direction:column;gap:4px;font-size:12px}
+.cicd-env-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:10px;align-items:start}
+.cicd-env-card{display:flex;flex-direction:column;gap:6px;padding:10px 12px;border:1px solid var(--dsw-alias-border-base,currentColor);border-radius:10px;box-sizing:border-box;min-width:0}
+.cicd-env-card.is-protected{border-color:var(--dsw-alias-brand-primary)}
+.cicd-env-card.is-drift{border-color:var(--dsw-alias-text-warning,var(--dsw-alias-brand-primary))}
+.cicd-env-card-head{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.cicd-env-name{font-weight:600;font-size:13px}
+.cicd-env-tag{font-size:11px;padding:0 6px;border-radius:999px;border:1px solid var(--dsw-alias-border-base,currentColor);line-height:16px}
+.cicd-env-row{display:flex;gap:8px;align-items:baseline;font-size:12px;min-width:0}
+.cicd-env-label{flex:none;width:64px;opacity:.65}
+.cicd-env-muted{opacity:.6}
+.cicd-env-warn{font-size:12px;color:var(--dsw-alias-text-warning,inherit)}
+.cicd-env-active{width:100%;font-size:12px}
+.cicd-env-active tr.is-drift td{color:var(--dsw-alias-text-warning,inherit)}
+.cicd-env-history{display:flex;flex-direction:column;gap:2px;font-size:12px}
+.cicd-env-history-row{display:flex;gap:8px;opacity:.85}
+.cicd-view-environments{min-width:56px}
 .cicd-approvals-head,.cicd-rbac-head,.cicd-secrets-head,.cicd-runners-head{flex:none;display:flex;align-items:center;justify-content:space-between;gap:8px}
 .cicd-approvals-list{display:flex;flex-direction:column;gap:6px}
 .cicd-approval-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm,6px);background:var(--dsw-alias-bg-layer-1)}
@@ -493,9 +513,10 @@ window.__ModuleLoader__.load({
      * history API：面板挂在既有页面里，`pushState` 会改掉宿主页面自身的路径，刷新时宿主不认识这个
      * 路由；hash 只动片段，宿主刷新后仍能挂载面板，面板自己把视图还原回来。
      */
-    const ROUTE_VIEWS = ['run', 'releases', 'editor', 'create', 'approvals', 'rbac', 'secrets', 'runners', 'audit']
+    const ROUTE_VIEWS = ['run', 'environments', 'releases', 'editor', 'create', 'approvals', 'rbac', 'secrets', 'runners', 'audit']
     /** 视图 → 路径段（`run` 是默认视图，不带段，保证 `#/projects/x` 是最短可分享形式）。 */
     const VIEW_SEGMENTS = {
+      environments: 'environments',
       releases: 'releases',
       editor: 'pipeline',
       create: 'new',
@@ -2054,6 +2075,88 @@ window.__ModuleLoader__.load({
           : null)
     }
 
+    /**
+     * v3.0-P6-3 环境页：一眼看到 prod 跑什么。
+     *
+     * 这一页只回答四个问题，且都在第一屏：每个环境现在跑的是哪份字节、那台机器上真的是不是它、
+     * 谁能往里发（护栏长什么样）、要恢复该点哪个历史版本。**不做任何动作**——
+     * 回滚仍需二次确认，放在「发布」视图里，免得这一个页面成了误点的现场。
+     */
+    function EnvironmentsView({ state, project, onRefresh, onOpenReleases }) {
+      const items = Array.isArray(state.items) ? state.items : []
+      const invalid = Array.isArray(state.invalid) ? state.invalid : []
+      const drifts = items.filter((item) => item.drift).length
+      const shortDigest = (value) => (value ? String(value).replace(/^sha256:/, '').slice(0, 12) : '')
+      return h('div', { className: 'cicd-environments' },
+        h('div', { className: 'cicd-environments-head' },
+          h('span', { className: 'cicd-col-title' }, '环境 · ' + (project || '全局') + ' · ' + items.length + (drifts > 0 ? ' · ' + drifts + ' 个与机器不一致' : '')),
+          h('span', { className: 'cicd-environments-foot' },
+            h('button', { className: 'cicd-button', type: 'button', onClick: onOpenReleases }, '发布记录与回滚'),
+            h('button', { className: 'cicd-button', type: 'button', onClick: onRefresh, disabled: state.status === 'loading' }, state.status === 'loading' ? '刷新…中' : '刷新'))),
+        state.status === 'loading' ? h(LoadingState, { text: '正在读取环境…', rows: 3 }) : null,
+        state.status === 'error' ? h(ErrorState, { title: '读取环境失败', error: state.error, onRetry: onRefresh }) : null,
+        invalid.length > 0
+          ? h('div', { className: 'cicd-environments-invalid', role: 'status' },
+            h('div', { className: 'cicd-empty-title' }, '护栏配置有误，相关环境按「谁都发不进去」处理'),
+            ...invalid.map((item, index) => h('div', { key: (item.env || 'global') + index, className: 'cicd-mono' }, (item.env || '全局') + '：' + item.message)))
+          : null,
+        state.status === 'ready' && items.length === 0
+          ? h(EmptyState, { text: '这个项目还没有环境。', hint: '在 pipe.yml 的 targets 里加一个 target，或用宿主配置声明 environments。' })
+          : null,
+        state.status === 'ready' && items.length > 0
+          ? h('div', { className: 'cicd-env-grid' }, ...items.map((env) => h('section', { key: env.name, className: 'cicd-env-card' + (env.drift ? ' is-drift' : '') + (env.protected ? ' is-protected' : '') },
+            h('div', { className: 'cicd-env-card-head' },
+              h('span', { className: 'cicd-env-name' }, env.name),
+              env.protected ? h('span', { className: 'cicd-env-tag' }, 'protected') : null,
+              env.approvalRequired ? h('span', { className: 'cicd-env-tag' }, '需审批') : null,
+              env.guardOnly ? h('span', { className: 'cicd-env-tag' }, '仅护栏声明') : null),
+            // 当前版本：说 digest 却不说字节还在不在，等于给了个查不到的地址。
+            h('div', { className: 'cicd-env-row' },
+              h('span', { className: 'cicd-env-label' }, '当前版本'),
+              env.current
+                ? h('span', { className: 'cicd-mono' }, shortDigest(env.current))
+                : h('span', { className: 'cicd-env-muted' }, '尚未晋级')),
+            env.digestState === 'missing'
+              ? h('div', { className: 'cicd-env-warn' }, '⚠ 指针指向的字节已不在制品库（' + shortDigest(env.current) + '），重发与回滚都会失败')
+              : null,
+            env.drift
+              ? h('div', { className: 'cicd-env-warn' }, '⚠ 机器上跑的不是晋级的那一份：' + (env.liveDigests || []).map(shortDigest).join(', '))
+              : null,
+            env.promotedAt
+              ? h('div', { className: 'cicd-env-row' }, h('span', { className: 'cicd-env-label' }, '晋级时间'), h('span', null, formatTime(env.promotedAt)))
+              : null,
+            env.hosts && env.hosts.length > 0
+              ? h('div', { className: 'cicd-env-row' },
+                h('span', { className: 'cicd-env-label' }, '实例'),
+                h('span', { className: 'cicd-mono' }, env.hosts.length > 4 ? env.hosts.slice(0, 4).join(', ') + ' …+ ' + (env.hosts.length - 4) : env.hosts.join(', ')))
+              : h('div', { className: 'cicd-env-row' }, h('span', { className: 'cicd-env-label' }, '实例'), h('span', { className: 'cicd-env-muted' }, env.envsUnknown ? '主机清单尚未展开' : '没有主机')),
+            env.active && env.active.length > 0
+              ? h('table', { className: 'cicd-table cicd-env-active' },
+                h('thead', null, h('tr', null, h('th', null, '主机'), h('th', null, '在跑的版本'), h('th', null, '激活时间'))),
+                h('tbody', null, env.active.map((item) => h('tr', { key: item.host, className: item.digest && item.digest !== env.current ? 'is-drift' : '' },
+                  h('td', { className: 'cicd-mono' }, item.host),
+                  h('td', { className: 'cicd-mono' }, shortDigest(item.digest) || '—'),
+                  h('td', null, item.activatedAt ? formatTime(item.activatedAt) : '—')))))
+              : null,
+            h('div', { className: 'cicd-env-row' },
+              h('span', { className: 'cicd-env-label' }, '护栏'),
+              env.guard && env.guard.allowedActors && env.guard.allowedActors.length > 0
+                ? h('span', { className: 'cicd-mono' }, env.guard.allowedActors.join(', '))
+                : h('span', { className: 'cicd-env-muted' }, env.protected ? '未配置名单（写坏了会变成谁都发不进去）' : '不限（非保护环境）')),
+            env.guard && env.guard.branchRule
+              ? h('div', { className: 'cicd-env-row' }, h('span', { className: 'cicd-env-label' }, '分支规则'), h('span', { className: 'cicd-mono' }, env.guard.branchRule))
+              : null,
+            env.history && env.history.length > 0
+              ? h('div', { className: 'cicd-env-history' },
+                h('div', { className: 'cicd-env-label' }, '最近几次'),
+                ...env.history.map((item, index) => h('div', { key: (item.recordId || item.id || '') + index, className: 'cicd-env-history-row' },
+                  h('span', { className: 'cicd-mono' }, shortDigest(item.digest) || '—'),
+                  h('span', { className: 'cicd-env-muted' }, item.status || ''),
+                  h('span', { className: 'cicd-env-muted' }, item.activatedAt ? formatTime(item.activatedAt) : '—'))))
+              : null)))
+          : null)
+    }
+
     function CicdPage() {
       /**
        * v3.0-P0：视图/项目/选中运行三件事的初值全部从 hash 读，
@@ -2113,6 +2216,8 @@ window.__ModuleLoader__.load({
       const [rbac, setRbac] = useState({ status: 'idle', users: [], audit: [], error: null, verifyResult: null })
       /** P1：Secrets 视图数据。 */
       const [secrets, setSecrets] = useState({ status: 'idle', items: [], error: null, setResult: null })
+      /** v3.0-P6-3：环境页数据（当前版本 / 实例 / 护栏）。 */
+      const [environments, setEnvironments] = useState({ status: 'idle', items: [], invalid: [], error: null })
       /** P1：Runner 管理视图数据（复用 runners 状态）。 */
       /** v3.0-P6-5：命令面板展开状态（⌘K / Ctrl+K 切换）。 */
       const [palette, setPalette] = useState(false)
@@ -2558,6 +2663,24 @@ window.__ModuleLoader__.load({
         }
       }, [callApi, freshSignal])
 
+      /** v3.0-P6-3：环境页 —— 指针、实例、护栏一次取回。 */
+      const loadEnvironments = useCallback(async (project) => {
+        // 重取时保留旧卡片：整块换成骨架会让「prod 现在跑什么」这几秒里变成空白。
+        setEnvironments((prev) => (prev.status === 'ready' ? { ...prev, status: 'loading', error: null } : { status: 'loading', items: prev.items || [], invalid: prev.invalid || [], error: null }))
+        try {
+          const payload = await callApi('environments', { project: project || '' }, freshSignal('environments'))
+          setEnvironments({
+            status: 'ready',
+            items: Array.isArray(payload.environments) ? payload.environments : [],
+            invalid: Array.isArray(payload.invalid) ? payload.invalid : [],
+            error: null,
+          })
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          setEnvironments({ status: 'error', items: [], invalid: [], error })
+        }
+      }, [freshSignal])
+
       /** P1：Secrets 视图数据加载。 */
       const loadSecrets = useCallback(async (project) => {
         setSecrets((prev) => ({ status: 'loading', items: prev.items, error: null, setResult: null }))
@@ -2600,7 +2723,8 @@ window.__ModuleLoader__.load({
         if (view === 'rbac') void loadRbac()
         if (view === 'secrets') void loadSecrets(projectId)
         if (view === 'runners') void loadRunners()
-      }, [clearArmed, clearRollback, loadProjects, loadTargets, loadRuns, loadReleases, projectId, targetName, view, loadAudit, auditLimit, loadApprovals, loadRbac, loadSecrets, loadRunners])
+        if (view === 'environments') void loadEnvironments(projectId)
+      }, [clearArmed, clearRollback, loadProjects, loadTargets, loadRuns, loadReleases, projectId, targetName, view, loadAudit, auditLimit, loadApprovals, loadRbac, loadSecrets, loadRunners, loadEnvironments])
 
       /**
        * v3.0-P0：进入各视图时按需拉自己的数据。
@@ -2612,7 +2736,8 @@ window.__ModuleLoader__.load({
         if (view === 'rbac') void loadRbac()
         if (view === 'secrets') void loadSecrets(projectId)
         if (view === 'runners') void loadRunners()
-      }, [view, projectId, loadApprovals, loadRbac, loadSecrets, loadRunners])
+        if (view === 'environments') void loadEnvironments(projectId)
+      }, [view, projectId, loadApprovals, loadRbac, loadSecrets, loadRunners, loadEnvironments])
 
       /**
        * v3.0-P0：切视图只有一个入口。
@@ -3074,6 +3199,13 @@ window.__ModuleLoader__.load({
           onSet: (scope, name, value) => void setSecret(scope, name, value),
           busy,
         })
+        : view === 'environments'
+        ? h(EnvironmentsView, {
+          state: environments,
+          project: projectId,
+          onRefresh: () => void loadEnvironments(projectId),
+          onOpenReleases: () => goView('releases'),
+        })
         : view === 'runners'
         ? h(RunnersView, {
           state: runners,
@@ -3132,6 +3264,7 @@ window.__ModuleLoader__.load({
           title: '流水线',
           entries: [
             { view: 'run', label: '运行', hint: '阶段 / 运行历史 / 发布三栏' },
+            { view: 'environments', label: '环境', hint: 'prod 跑的是什么、谁能发、护栏长什么样' },
             { view: 'releases', label: '发布', hint: '当前目标的发布记录与回滚' },
             { view: 'approvals', label: '审批', hint: '待审批的 prod 部署', badge: pendingApprovals },
           ],
@@ -3227,8 +3360,11 @@ window.__ModuleLoader__.load({
 
       const paletteItems = useMemo(() => {
         const list = []
+        // 环境也是「去哪」：prod 出问题时第一个动作是去看环境页，让用户点左侧栏属于绕路。
+        list.push({ id: 'view:environments', kind: '视图', label: '环境', hint: 'prod 跑的是什么、谁能发、护栏长什么样', run: () => goView('environments') })
         navSections.forEach((section) => {
           section.entries.forEach((entry) => {
+            if (entry.view === 'environments') return
             list.push({
               id: 'view:' + entry.view,
               kind: '视图',

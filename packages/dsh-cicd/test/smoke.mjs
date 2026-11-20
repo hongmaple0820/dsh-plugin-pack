@@ -15,7 +15,7 @@ import {
 } from '../index.js'
 import { parsePipe, planPipeline, interpolate, matchArtifacts, PipeError, defaultRestartCommand, isHostSelector, parseHostSelector, splitTargetHosts } from '../lib/pipe.js'
 import { createStore } from '../lib/store.js'
-import { PROMOTION_ERRORS, promotionError, envRequiresPromotion, findSourceRelease, currentPointer, isPromoted, listPromotions, recordPromotion, promotionView } from '../lib/promotions.js'
+import { PROMOTION_ERRORS, promotionError, envRequiresPromotion, findSourceRelease, currentPointer, reachablePointer, isPromoted, listPromotions, recordPromotion, promotionView } from '../lib/promotions.js'
 import { openDatabase } from '../lib/db.js'
 import { DatabaseSync } from 'node:sqlite'
 import { runPipeline, makeRunId } from '../lib/runner.js'
@@ -60,6 +60,15 @@ check('manifest 是 @local/dsh-cicd 3.0.0-p2 且导出 Host 形状', () => {
   assert.equal(packageName, '@local/dsh-cicd')
   assert.deepEqual(inject, ['tools'])
   assert.equal(typeof apply, 'function')
+
+  // client.js 从没被任何人编译过：它的语法错误只会在宿主加载面板时炸，smoke 一路全绿。
+  // 这里只做语法体检（new Function 不执行），因为浏览器半边在 Node 里没有 DOM 可跑。
+  const clientSource = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
+  const factoryAt = clientSource.indexOf('  factory(require) {')
+  const tailAt = clientSource.lastIndexOf('    return {')
+  assert.ok(factoryAt > 0 && tailAt > factoryAt, 'client.js 应当仍是 factory(require) { … return { … } 的形状')
+  const body = clientSource.slice(factoryAt + '  factory(require) {'.length, tailAt)
+  assert.doesNotThrow(() => new Function('require', body), 'client.js 的 factory 体必须能通过语法解析')
 })
 
 // ---------------------------------------------------------------------------------------------
@@ -4809,6 +4818,85 @@ checkAsync('P4-3 接线：pipe.yml 里的 environments 真的会被执行', asyn
     // 没有分支 → 撞上 pipe.yml 里的 branchRule，且日志说得出是哪一个条件。
     assert.match(logText, /环境护栏拦下 \[prod\] ENV_BRANCH_NOT_ALLOWED/, 'pipe.yml 里的 branchRule 没被执行：' + logText.slice(-500))
   } finally { tool.close(); rmSync(root, { recursive: true, force: true }) }
+})
+
+checkAsync('P6-3：环境页说得出 prod 在跑什么 —— 指针、实例、漂移、护栏，以及回滚后指针不再骗人', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cicd-p6-3-'))
+  const projectDir = join(dir, 'envs')
+  mkdirSync(projectDir, { recursive: true })
+  writeFileSync(join(projectDir, 'pipe.yml'), [
+    'name: envs-demo',
+    'environments:',
+    '  prod:',
+    '    allowedActors: [role:owner]',
+    '    branchRule: "^release/.*$"',
+    'targets:',
+    '  staging:',
+    '    hosts: [stage1]',
+    '    path: /srv/stage',
+    '  prod:',
+    '    hosts: [api1, api2]',
+    '    path: /srv/prod',
+    'stages:',
+    '  - id: build',
+    '    steps:',
+    '      - run: echo hi',
+    '',
+  ].join('\n'))
+  const digA = 'sha256:' + 'a'.repeat(64)
+  const digB = 'sha256:' + 'b'.repeat(64)
+  const runtime = internals.createRuntime({ get: () => undefined }, {
+    projects: [{ id: 'envs', path: projectDir, pipe: join(projectDir, 'pipe.yml') }],
+    workDir: join(dir, 'state'),
+    scheduler: { enabled: false },
+  })
+  const insertRelease = (id, host, digest, status, at) => runtime.store.db
+    .prepare('INSERT INTO releases (id, project_id, target, host, run_id, status, created_at, activated_at, artifact_digest) VALUES (?,?,?,?,?,?,?,?,?)')
+    .run(id, 'envs', 'prod', host, id.split('@')[0], status, at, at, digest)
+  const findEnv = (view, name) => view.environments.find((item) => item.name === name)
+  try {
+    // ① 空环境：说得出「尚未晋级」，而不是给一个空字符串让人以为是生产跑空包。
+    const empty = await runtime.environments('envs')
+    assert.equal(empty.project, 'envs')
+    assert.deepEqual(empty.environments.map((item) => item.name), ['staging', 'prod'])
+    const emptyProd = findEnv(empty, 'prod')
+    assert.equal(emptyProd.current, '')
+    assert.equal(emptyProd.digestState, 'empty')
+    assert.equal(emptyProd.drift, false)
+    assert.deepEqual(emptyProd.hosts, ['api1', 'api2'])
+    assert.equal(emptyProd.guard.configured, true, 'pipe.yml 里的护栏应当出现')
+    assert.deepEqual(emptyProd.guard.allowedActors, ['role:owner'])
+    assert.equal(emptyProd.guard.branchRule, '^release/.*$')
+
+    // ② 晋级 A、机器上跑 B → 漂移，且要说得出现在机器上的是哪个 digest。
+    //    字节不在 CAS 里时 digestState 是 missing：说「prod 跑 A」却不说 A 已经不在库里，等于给了个查不到的地址。
+    insertRelease('r-b@api1', 'api1', digB, 'active', '2026-01-01T00:00:00.000Z')
+    recordPromotion(runtime.store.db, { id: 'pm-a', projectId: 'envs', digest: digA, fromEnv: 'staging', toEnv: 'prod', createdAt: '2026-01-02T00:00:00.000Z' })
+    const prod = findEnv(await runtime.environments('envs'), 'prod')
+    assert.equal(prod.current, digA)
+    assert.equal(prod.digestState, 'missing', '字节不在 CAS 里时要说丢失，不能装作没事')
+    assert.equal(prod.drift, true, '晋级说 A、机器上跑 B，这就是 drift')
+    assert.deepEqual(prod.liveDigests, [digB])
+    assert.equal(prod.active.find((item) => item.host === 'api1').digest, digB)
+    assert.equal(prod.active.find((item) => item.host === 'api2').digest, '', '没有 active release 的主机不该编一个版本出来')
+    assert.ok(prod.history.some((item) => item.digest === digB), '最近几次要能看到机器上那一行')
+
+    // ③ 回滚/重发把上一行改成 superseded 之后，那次晋级的字节已经不在线上 —— 指针必须继续往前找，
+    //    否则环境页会拿一个已经下线的版本回答「prod 在跑什么」。
+    // 同一个 (target, host) 只可能有一行 active：换版本就是把这行改成 superseded 再写新行。
+    const supersede = (id, at, status) => runtime.store.db
+      .prepare('UPDATE releases SET status = ?, deactivated_at = ? WHERE id = ?').run(status, at, id)
+    supersede('r-b@api1', '2026-01-03T00:00:00.000Z', 'superseded')
+    insertRelease('r-a@api1', 'api1', digA, 'active', '2026-01-03T00:00:00.000Z')
+    recordPromotion(runtime.store.db, { id: 'pm-b', projectId: 'envs', digest: digB, fromEnv: 'staging', toEnv: 'prod', createdAt: '2026-01-04T00:00:00.000Z' })
+    const afterRollback = findEnv(await runtime.environments('envs'), 'prod')
+    assert.equal(afterRollback.current, digA, '最新的那次晋级已经下线，指针要退回到仍在线上的一环')
+    assert.equal(afterRollback.drift, false, '指针与机器上的版本一致时不该报 drift')
+    assert.equal(currentPointer(runtime.store.db, { projectId: 'envs', env: 'prod' }).digest, digB, 'currentPointer 仍按时间序（晋级冲突判定用它）')
+    const reach = reachablePointer(runtime.store.db, { projectId: 'envs', env: 'prod' })
+    assert.equal(reach.id, 'pm-a')
+    assert.equal(reach.releaseId, 'r-a@api1', '指向的 release 要从 active 行里取')
+  } finally { try { runtime.store.close() } catch { /* 已关 */ } rmSync(dir, { recursive: true, force: true }) }
 })
 
 checkAsync('P5-S5：指针（tag）只动引用 —— 指向不存在的 digest 被拒，GC 两段式且默认 dry-run', async () => {

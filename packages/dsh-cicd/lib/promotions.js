@@ -64,6 +64,32 @@ export function findSourceRelease(db, { projectId = '', fromEnv = '', releaseId 
   return row || null
 }
 
+/**
+ * 某个环境当前指针 = 最新一行「仍然有效」的晋级。
+ *
+ * v3.0-P6-3：只按 created_at 取最新行会把一次已经回滚掉的晋级当成线上跑的东西。
+ * 匹配用 target 而不是 env：release 行的 env 列由部署时的主机标签推出，主机没打标签就是空串。
+ * 指针是可达性，不是时间顺序。这里用 release 的 status 来判「这一环还在线上」——
+ * 回滚与重发都会把上一行改成 superseded（同一个 (target, host) 只可能有一行 active），
+ * 那一环就不是线上那一个了，指针继续往前找。
+ */
+export function reachablePointer(db, { projectId = '', env = '', target = '', limit = 50 } = {}) {
+  const rows = listPromotions(db, { projectId, env, limit })
+  for (const row of rows) {
+    const digest = String(row.digest || '')
+    if (!digest) continue
+    // 这个 digest 有没有落在该环境里、且仍是 active 的 release。按 target 匹配：release 的 env 列
+    // 由部署时的主机标签推出，可能是空串（主机没打 env 标签就发布过），只按 env 匹配会让
+    // 「这一环还在线上吗」永远答否，指针就一路退到最早那次晋级。
+    const live = db.prepare(
+      "SELECT id FROM releases WHERE artifact_digest = ? AND (? = '' OR target = ?) AND status = 'active' ORDER BY activated_at DESC, created_at DESC, rowid DESC LIMIT 1",
+    ).get(digest, target, target)
+    if (live) return { ...row, releaseId: String(row.release_id || live.id || '') }
+  }
+  // 一行 release 都没落上：整个环境还是空的，指针就是最新那次晋级（升级尚未部署）。
+  return rows[0] || null
+}
+
 /** 某个环境当前指针（最新一次晋级）：没有就是 null。 */
 export function currentPointer(db, { projectId = '', env = '' } = {}) {
   const row = db
