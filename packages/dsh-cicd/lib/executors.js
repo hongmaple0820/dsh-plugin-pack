@@ -210,6 +210,8 @@ export function createRemoteExecutor({ broker, runnerId } = {}) {
         onLine: context.onLine,
         signal: context.signal,
         timeoutMs: context.claimTimeoutMs || 0,
+        liveness: context.runnerLiveness || null,
+        livenessEveryMs: context.livenessEveryMs || 5000,
       })
     },
     cancel() {
@@ -369,7 +371,7 @@ export function createTaskBroker({ onTaskForRunner = null, log = () => {} } = {}
    * 无 dispatcher（onTaskForRunner=null）时任务停在 queued，timeoutMs 到后按失败收尾，
    * 避免「runner 没上线就 claim」永久悬挂。
    */
-  async function claim(spec, runnerId, { onLine = null, signal = null, timeoutMs = 0 } = {}) {
+  async function claim(spec, runnerId, { onLine = null, signal = null, timeoutMs = 0, liveness = null, livenessEveryMs = 5000 } = {}) {
     const task = enqueue(spec, runnerId)
     if (onLine) task.onLine = onLine
     const abortListener = () => {
@@ -386,6 +388,24 @@ export function createTaskBroker({ onTaskForRunner = null, log = () => {} } = {}
     const effectiveTimeout = timeoutMs > 0 ? timeoutMs : 0
     return await new Promise((resolveWaiter) => {
       const startedAt = Date.now()
+      let checkedAt = startedAt
+      let dead = null
+      // v3.0-P7 混沌：runner 掉线时任务必须**当场**失败并说清原因。
+      // 没有这一步，掉线的机器只会让这次 run 一直挂到超时——而超时原因写的是
+      // 「未在 Ns 内响应」，运维会去查命令为什么慢，而真实原因是那台机器没了（或者
+      // 任务已经被 revoke 时 cancelAll 取消掉，永远等不到结果）。
+      // liveness 是宿主注入的探针（读 DB 注册表），每 livenessEveryMs 问一次是否还活着。
+      const probe = () => {
+        if (typeof liveness !== 'function') return
+        const stamp = Date.now()
+        if (stamp - checkedAt < livenessEveryMs) return
+        checkedAt = stamp
+        try {
+          dead = liveness() || null
+        } catch {
+          dead = null // 探针自己出错不能变成运行失败，退回纯超时保护
+        }
+      }
       const tick = () => {
         if (task.status === 'finished') {
           resolveWaiter(task.result || { status: 'failed', exitCode: -1, error: '远端 runner 没有返回结果' })
@@ -393,6 +413,13 @@ export function createTaskBroker({ onTaskForRunner = null, log = () => {} } = {}
         }
         if (task.cancelRequested) {
           resolveWaiter({ status: 'canceled', exitCode: -1, error: '已取消' })
+          return
+        }
+        probe()
+        if (dead) {
+          task.status = 'finished'
+          task.result = { status: 'failed', exitCode: -1, error: dead.message || 'runner 已不可用', code: dead.code || 'RUNNER_OFFLINE' }
+          resolveWaiter(task.result)
           return
         }
         if (effectiveTimeout > 0 && Date.now() - startedAt > effectiveTimeout) {

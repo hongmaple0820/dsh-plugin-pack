@@ -1123,6 +1123,100 @@ checkAsync('v3.0-P7 混沌与兼容：只读盘不写库、备份可换回去、
   }
 })
 
+checkAsync('v3.0-P7 混沌：runner 掉线后派出去的任务当场判失败，而不是挂到超时', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cicd-runner-drop-'))
+  // 不造假时钟：注册表把「判死」算在读取的那一刻（now() - last_seen_at），
+  // 而配置里的 now 到不了注册表——两条时间轴一混，测出来的「永远 online」是测试的假象。
+  // 用真实的 30s 间隔 + 真实的最后一跳时间，只把「最后心跳」推回到 91 秒前。
+  const repo = await repoTool(join(dir, 'state'), { runners: { joinToken: 'drop-token' } })
+
+  try {
+    // ---- ① 注册表：online 是推导值，心跳停了 3 个周期就是 offline ----
+    await repo.call('/runner-register?runnerId=drop-01&token=drop-token&labels=build')
+    let verdict = repo.runtime.runners().find((row) => row.runnerId === 'drop-01')
+    assert.equal(verdict.status, 'online')
+    await repo.call('/runner-poll?runnerId=drop-01&token=drop-token')
+    assert.equal(repo.runtime.runners().find((row) => row.runnerId === 'drop-01').status, 'online', '心跳还在，就不能判死')
+    // 让这台机器「停跳」：注册表缓存的是一个 1 秒的**时钟读数**，读数没变它就认为还是刚才那一刻。
+    // 所以不能只改库——库里那行属于另一个读数键。先把读数拨走，缓存自然失效，下一读才看得到改后的行。
+    const staleSeen = new Date(Date.now() - 91 * 1000).toISOString()
+    const db = openDatabase(join(dir, 'state', 'cicd.db'))
+    try {
+      db.prepare('UPDATE runners SET last_seen_at = ? WHERE runner_id = ?').run(staleSeen, 'drop-01')
+    } finally { db.close() }
+    await new Promise((resolve) => setTimeout(resolve, 1100))
+
+    verdict = repo.runtime.runners().find((row) => row.runnerId === 'drop-01')
+    assert.equal(verdict.status, 'offline', '3 × 30s 没有心跳就必须是 offline')
+    assert.equal(verdict.stale, true)
+    assert.equal(verdict.lifecycle, 'active', 'offline 不等于吊销：库里的生命周期还是 active')
+
+    // ---- ② broker：派出去的任务在探针周期内失败，错误指向机器而不是「超时」 ----
+    const broker = internals.createTaskBroker({})
+    broker.register('drop-01', {})
+    const startedAt = Date.now()
+    let live = false
+    const claim = broker.claim(
+      { taskId: 'drop-task', command: 'echo hi', cwd: dir, env: {}, timeoutSec: 600, runId: 'r-drop' },
+      'drop-01',
+      { liveness: () => (live ? { code: 'RUNNER_OFFLINE', message: 'runner drop-01 已 91s 未心跳（阈值 90s）' } : null), livenessEveryMs: 50 },
+    )
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    assert.equal(broker.task('drop-task').status, 'queued', '机器还活着时不许自己把任务判死')
+    live = true
+    const dropped = await claim
+    assert.equal(dropped.status, 'failed')
+    assert.equal(dropped.code, 'RUNNER_OFFLINE')
+    assert.match(dropped.error, /未心跳/)
+    assert.equal(Date.now() - startedAt < 5000, true, '掉线要当场知道，不能等到步骤超时（600s）')
+    assert.equal(broker.activeFor('drop-01'), false, '判死之后不能还挂着「有在跑任务」')
+
+    // ---- ③ 探针自己抛错不能把运行变成失败：退回纯超时保护 ----
+    const broker2 = internals.createTaskBroker({})
+    broker2.register('flaky-01', {})
+    const claim2 = broker2.claim({ taskId: 'flaky-task', command: 'echo hi' }, 'flaky-01', {
+      liveness: () => { throw new Error('注册表读不到') },
+      livenessEveryMs: 20,
+    })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.equal(broker2.task('flaky-task').status, 'queued')
+    broker2.resolve('flaky-task', { status: 'success', exitCode: 0 })
+    assert.equal((await claim2).status, 'success')
+
+    // ---- ④ 派任务前就 offline：错误码必须是 RUNNER_OFFLINE，不能并进「不存在」 ----
+    // 以前这里写的是 `verdict.code === 'RUNNER_REVOKED' ? 'RUNNER_REVOKED' : 'RUNNER_NOT_FOUND'`，
+    // 于是「机器掉线」被 HTTP 报成 404「runner 不存在」，运维会去改配置而不是去看那台机器。
+    await assert.rejects(
+      () => repo.runtime.run({ projectId: 'demo', targetName: 'prod', runnerId: 'drop-01', confirm: true, env: { name: 'staging' } }),
+      (error) => error.code === 'RUNNER_OFFLINE',
+    )
+    // ---- ⑤ runnerWaitSec：等不到就一直等，等到了才放行 ----
+    // 这条用例没有远端 runner 进程，门禁放行后流水线会卡在等远端接单——
+    // 所以断言只到「门禁这一关」，不 await 整个运行：那是另一条用例的主题。
+    const waitedAt = Date.now()
+    await assert.rejects(
+      () => repo.runtime.run({ projectId: 'demo', targetName: 'prod', runnerId: 'drop-01', confirm: true, runnerWaitSec: 1, env: { name: 'staging' } }),
+      (error) => error.code === 'RUNNER_OFFLINE',
+    )
+    assert.equal(Date.now() - waitedAt >= 900, true, 'runnerWaitSec=1 必须真的等约 1 秒，而不是立刻判死')
+    // 等回来了：心跳重新记上，门禁不再拦它。
+    // 放行之后流水线才会去等那台并不存在的远端机器接单——这里不 await，
+    // 只确认「它没有以 RUNNER_OFFLINE 被拒」，然后取消掉这次运行。
+    await repo.call('/runner-poll?runnerId=drop-01&token=drop-token')
+    const passed = repo.runtime.run({ projectId: 'demo', targetName: 'prod', runnerId: 'drop-01', confirm: true, runnerWaitSec: 1, env: { name: 'staging' } })
+    passed.catch(() => {})
+    const settled = await Promise.race([
+      passed.then(() => 'resolved', (error) => (error.code === 'RUNNER_OFFLINE' ? 'rejected-offline' : 'rejected-other')),
+      new Promise((resolve) => setTimeout(() => resolve('still-running'), 500)),
+    ])
+    assert.equal(settled === 'rejected-offline', false, '心跳回来了，门禁就不该再判它掉线')
+    for (const runId of repo.runtime.hub.activeRunIds?.() || []) repo.runtime.cancel({ runId })
+  } finally {
+    try { repo?.close() } catch { /* 可能没起 */ }
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 checkAsync('v3.0-P7 缓存命中率：构建缓存与工具链分两本账，从不命中的 key 族要指名道姓', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'cicd-cache-stats-'))
   const tick = { t: Date.parse('2026-05-01T00:00:00Z') }

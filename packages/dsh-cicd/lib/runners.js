@@ -22,7 +22,12 @@ import { randomBytes, createHash } from 'node:crypto'
 export const DEFAULT_HEARTBEAT_SEC = 30
 /** 判死阈值：3 × 心跳周期。 */
 export const OFFLINE_MULTIPLIER = 3
-/** 缓存窗口：避免每次调度都打一次 DB（1 秒足够，吊销的实时性靠 revoke 清缓存保证）。 */
+/**
+ * 缓存窗口：避免每次调度都打一次 DB。
+ * 缓存里存的是**行**，不是结论——offline/online 是时间的函数，每次读都按此刻重算。
+ * 这一点曾经写错过：缓存了算好的 status 之后，一个早就过了心跳阈值的 runner
+ * 会在整个窗口里继续显示 online，判死被缓存拖后（而且拖多久取决于窗口有多长）。
+ */
 const CACHE_TTL_MS = 1000
 
 export const RUNNER_STATUS = {
@@ -30,9 +35,11 @@ export const RUNNER_STATUS = {
   REVOKED: 'revoked',
 }
 
+/** 注册表的时钟。测试会注入一个「跳着走」的假时钟，所以这里不能直接用 Date.now()。 */
 function nowIso(now) {
   return new Date(now()).toISOString()
 }
+
 
 function parseTime(value) {
   const n = Date.parse(String(value || ''))
@@ -76,6 +83,11 @@ export function createRunnerRegistry({ db, heartbeatSec = DEFAULT_HEARTBEAT_SEC,
     cacheAt = 0
   }
 
+  /**
+   * 把库里的行变成对外的形状。**每次调用都重算 online/offline**——判死是时间的函数，
+   * 不是那一行的属性。以前缓存里存的是算好的 status，于是缓存窗口一到就漏判：
+   * 现在缓存只存「这一行是什么」，要不要判死由读取的那一刻决定。
+   */
   function shape(row) {
     if (!row) return null
     const lastSeen = parseTime(row.last_seen_at)
@@ -102,10 +114,14 @@ export function createRunnerRegistry({ db, heartbeatSec = DEFAULT_HEARTBEAT_SEC,
 
   function load() {
     const stamp = now()
-    if (cache && stamp - cacheAt < CACHE_TTL_MS) return cache
-    cache = stmts.selectAll.all().map(shape)
-    cacheAt = stamp
-    return cache
+    // 缓存的是**行**，不是结论：形状与 online/offline 每次读都按此刻重算。
+    // （缓存算好的 status 会把判死拖后整个窗口——窗口多长就晚多久。）
+    const fresh = cache && stamp >= cacheAt && stamp - cacheAt < CACHE_TTL_MS
+    if (!fresh) {
+      cache = stmts.selectAll.all()
+      cacheAt = stamp
+    }
+    return cache.map((row) => shape(row))
   }
 
   /** 注册（幂等）：吊销过的 runner 重新注册**不会**复活，必须先 unrevoke（手工改库或重新加入）。 */

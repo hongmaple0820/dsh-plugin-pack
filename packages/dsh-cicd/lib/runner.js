@@ -260,6 +260,7 @@ export async function runPipeline({
   concurrency = DEFAULT_CONCURRENCY,
   toolchainSetup = null,
   actions = null,
+  runnerLiveness = null,
 } = {}) {
   // runId 先生成：RELEASE_ID 在 plan 阶段就要能插值，否则产物文件名会是空的。
   // V2-M1：宿主要提前注册 activeRuns（取消要能找到 runId），所以允许传入。
@@ -353,7 +354,9 @@ export async function runPipeline({
   // T2 的 `secrets` 上下文：`extraVars` 就是 `secrets.refsForInterpolate()` 交出来的「名字 → 值」表。
   // 另一个入参 `secrets` 是**值列表**（只用于日志脱敏），两者用途不同，别混。
   const secretMap = extraVars || {}
-  const stepContext = { runId, log, store, logFile, activeExecutor, project, vars, signal, executeDeploy, secrets: secretMap, toolchainEnv: null, actions }
+  // runnerLiveness：远端步骤在等结果期间用来判断「那台机器还在不在」的探针（本地执行为 null）。
+  // 没有它，派出去的任务只能在超时后失败，而超时原因会把人的注意力引向命令而不是机器。
+  const stepContext = { runId, log, store, logFile, activeExecutor, project, vars, signal, executeDeploy, secrets: secretMap, toolchainEnv: null, actions, runnerLiveness }
 
   // 工具链在这里装、在这里断言：放到 runPipeline 之外会让安装失败的构建没有 run 记录，
   // 用户只看到一条 500 和空日志；放进来则失败也是一次可见的、可回看的运行。

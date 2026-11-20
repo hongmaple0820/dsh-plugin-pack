@@ -84,6 +84,9 @@ const ROUTE_PREFIX = '/api/plugins/cicd'
 const CICD_HEADER = 'x-dsh-cicd'
 const CICD_HEADER_VALUE = '1'
 const WRITE_HEADER = 'x-dsh-remote-exec'
+// v3.0-P7：runner 掉线时门禁的轮询间隔。1 秒足够让「等它回来」这句话在面板上看起来是实时的，
+// 又不会把库读成热点——判死本身只读一次 all，不写盘。
+const RUNNER_WAIT_POLL_MS = 1000
 
 const textBlocks = (text) => [{ type: 'text', text }]
 
@@ -557,7 +560,11 @@ function createRuntime(ctx, config) {
   let audit = createAudit({ db: store.db })
   let locks = createDeployLocks({ db: store.db, ttlSec: options.deploy?.lockTtlSec })
   // v3.0-P0：远端构建机注册表落库（吊销持久生效，心跳超时按 3× 周期判死）。
-  const runners = createRunnerRegistry({ db: store.db, heartbeatSec: options.runners?.heartbeatSec })
+  // now 只在这份注册表里注入（测试用它把「心跳停了 100 秒」变成一次真实的状态推导）；
+  // 生产里物理上等不到 90 秒，只能靠假时钟把 offline 这个分支真的跑到一次。
+  // heartbeatSec 不在这里传：库里的 runner 行存的是注册那一刻的 intervalSec，
+  // 换配置只影响之后的注册，不去改已有机器的心跳约定（否则改一次间隔，所有在线机器同时被判死）。
+  const runners = createRunnerRegistry({ db: store.db, now: options.runners?.now })
   // v3.0-P2：工具链托管（JDK/Node/Python/Maven…）。store 在 workDir 下，所以同一台机器上
   // 所有项目共享一份下载与解包结果；锁文件放项目的 pipe.lock，跟着仓库走。
   const toolchainRoot = options.toolchain?.storeDir || join(options.workDir, 'toolchains')
@@ -1485,6 +1492,9 @@ function createRuntime(ctx, config) {
     runnerId = '',
     actor = null,
     approvalId = '',
+    // v3.0-P7 混沌：runner 掉线时最多等它多久（秒）。0 = 立刻失败。
+    // 等待发生在**跑之前**：构造一个「先等 90 秒再派给死机器」的 run 没有意义。
+    runnerWaitSec = 0,
   }) {
     const baseProject = pickProject(options, projectId)
     const pipe = readPipe(baseProject)
@@ -1661,14 +1671,34 @@ function createRuntime(ctx, config) {
     // V2-M2：执行面可迁移——runnerId 非空时走远端 broker，缺省本地 spawn。
     // v3.0-P0：判活改读 DB 注册表（吊销/心跳超时都算不可用），不再信任内存 Map。
     let executor = null
+    let runnerLiveness = null
     if (runnerId && !dryRun) {
-      const verdict = runners.isRunnable(runnerId)
+      executor = createRemoteExecutor({ broker, runnerId })
+      // v3.0-P7 混沌：runner 掉线不是「运行失败」，是「这次运行还没开始」。
+      // 步骤一旦派给一台死机器，要么等超时（错误信息写着「未响应」，把人指向命令而不是机器），
+      // 要么因为 revoke/取消路径永远等不到结果。所以先在门禁上等它回来，最多 runnerWaitSec，
+      // 等不到就整次运行失败、原因写明是哪台机器、多久没心跳。
+      // 注意：isRunnable 是读库的，而 online 由 last_seen_at 推导——它天然会「自愈」，
+      // 不需要在这里做任何写操作。
+      const waitUntil = Date.now() + runnerWaitSec * 1000
+      let verdict = runners.isRunnable(runnerId)
+      while (!verdict.ok && verdict.code === 'RUNNER_OFFLINE' && runnerWaitSec > 0 && Date.now() < waitUntil) {
+        await new Promise((resolve) => setTimeout(resolve, RUNNER_WAIT_POLL_MS))
+        verdict = runners.isRunnable(runnerId)
+      }
       if (!verdict.ok) {
         const error = new Error(verdict.message)
-        error.code = verdict.code === 'RUNNER_REVOKED' ? 'RUNNER_REVOKED' : 'RUNNER_NOT_FOUND'
+        // RUNNER_OFFLINE 是「机器暂时不可达」，不是「没这台机器」：调度器要知道可以等、
+        // 运维要知道去查那台机器的网络，所以不能并进 RUNNER_NOT_FOUND（以前正是这么并的，
+        // HTTP 会回 404「不存在」，把一次掉线说成了配置错误）。
+        error.code = verdict.code
         throw error
       }
-      executor = createRemoteExecutor({ broker, runnerId })
+      // 派出去之后再盯一次活口：探针只是兜底，误判代价是这条流水线白跑。
+      runnerLiveness = () => {
+        const live = runners.isRunnable(runnerId)
+        return live.ok ? null : { code: live.code, message: live.message }
+      }
     }
     {
       // V2-M4：secrets 注入——interpolate 的 vars 里合并 secrets 值（仅运行时，不落明文到日志/DB）。
@@ -1694,6 +1724,7 @@ function createRuntime(ctx, config) {
         hub,
         signal: controller?.signal || null,
         executor,
+        runnerLiveness,
         extraVars,
         secrets: secretValues,
         concurrency: options.jobs?.concurrency,
@@ -2476,14 +2507,28 @@ function createRuntime(ctx, config) {
     },
     runnerPoll({ runnerId } = {}) {
       // poll 兼心跳：runner 活着就续 last_seen_at。吊销/不存在的机器直接拒绝，不给任务。
+      // 注意顺序：先续心跳，再判活。反过来的话，一台刚过离线阈值的机器来 poll 时会被
+      // 判死并拒绝——于是它永远等不到那条「你其实还活着」的心跳，只能重新注册。
+      // 心跳的语义是「我这台机器在这里」，只要这台机器存在、没被吊销，就该被记下来。
       if (runnerId) {
+        const row = runners.describe(runnerId)
+        if (!row) {
+          const error = new Error(`runner ${runnerId} 不存在，请先注册`)
+          error.code = 'RUNNER_NOT_FOUND'
+          throw error
+        }
+        if (row.revoked) {
+          const error = new Error(`runner ${runnerId} 已被吊销`)
+          error.code = 'RUNNER_REVOKED'
+          throw error
+        }
+        try { runners.heartbeat(runnerId) } catch { /* 刚被吊销，下面再判一次 */ }
         const verdict = runners.isRunnable(runnerId)
         if (!verdict.ok) {
           const error = new Error(verdict.message)
           error.code = verdict.code
           throw error
         }
-        try { runners.heartbeat(runnerId) } catch { /* 刚被吊销，下面再判一次 */ }
       }
       const task = broker.taskForRunner(runnerId)
       if (!task) return { ok: true, task: null }
@@ -4309,6 +4354,7 @@ function registerTools(ctx, runtime) {
         confirm: { type: 'boolean', description: '确认执行（默认 true；显式 false 会被拒绝）' },
         confirmProd: { type: 'boolean', description: '目标展开后含 env=prod 的主机时才需要；为 true 表示已确认生产发布' },
         runner: { type: 'string', description: '远端 runner id（V2-M2 执行面）；省略或 local 则本机执行' },
+    runnerWaitSec: { type: 'number', description: 'runner 掉线时最多等它回来多少秒（默认 0 = 立刻失败）。等不到就整次失败，原因写明是哪台机器' },
         approvalId: { type: 'string', description: '已批准的审批 id（v3.0-P0）；带上它会一次性消费该审批放行部署' },
       },
     },
@@ -4322,6 +4368,7 @@ function registerTools(ctx, runtime) {
         dryRun: Boolean(args.dryRun),
         confirmProd: Boolean(args.confirmProd),
         runnerId: args.runner || '',
+        runnerWaitSec: args.runnerWaitSec || 0,
         approvalId: args.approvalId || '',
       })
     },
@@ -4436,7 +4483,12 @@ function registerTools(ctx, runtime) {
         const lines = ['远端构建主机：']
         for (const runner of runners) {
           const label = Array.isArray(runner.labels) && runner.labels.length > 0 ? ` [${runner.labels.join(',')}]` : ''
-          lines.push(`  ${runner.runnerId} · ${runner.status}${label}${runner.active ? ' · 有在跑任务' : ''}`)
+          // 离线要把「多久没心跳 / 阈值多少 / 在跑的步骤会怎样」一次说完：运维看到 offline
+          // 的第一反应通常是「是不是网络抖动」，第二反应才是「那现在跑着的那次怎么办」。
+          const seen = runner.status === 'online' ? '' : runner.lastSeenAt ? ` · 最后心跳 ${runner.lastSeenAt}` : ' · 从未心跳'
+          // 判活探针按固定 5s 一个周期读注册表（见 lib/executors.js 的 claim），不跟着心跳周期走。
+          const stuck = runner.status !== 'online' && runner.active ? ' · 它手上的任务会在 5s 内判为失败' : ''
+          lines.push(`  ${runner.runnerId} · ${runner.status}${label}${runner.active ? ' · 有在跑任务' : ''}${seen}${stuck}`)
         }
         return textBlocks(lines.join('\n'))
       },
@@ -5884,7 +5936,7 @@ async function planResource(request, runtime) {
 
 async function runResource(request, runtime) {
   const params = queryOf(request)
-  const bad = unsupportedParams(params, new Set(['project', 'target', 'stage', 'dryRun', 'confirm', 'runner', 'approvalId', 'env', 'branch', 'tag']))
+  const bad = unsupportedParams(params, new Set(['project', 'target', 'stage', 'dryRun', 'confirm', 'runner', 'runnerWaitSec', 'approvalId', 'env', 'branch', 'tag']))
   if (bad) return json({ ok: false, error: bad }, 400)
   const targetName = params.get('target') || ''
   const projectId = params.get('project') || ''
@@ -5917,6 +5969,7 @@ async function runResource(request, runtime) {
       dryRun,
       confirmProd: isProd,
       runnerId: params.get('runner') || '',
+      runnerWaitSec: Math.max(0, Math.min(600, Number(params.get('runnerWaitSec') || 0) || 0)),
       actor: request.__cicdActor || null,
       approvalId: params.get('approvalId') || '',
     })

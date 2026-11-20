@@ -204,6 +204,7 @@ P1+P2+P3 ─→ P5 制品库(3w) ─→ P6 体验(4w) ─→ P7 加固(持续)
 
 - 压测：1000 并发 run、10 万行日志、50 台主机。
 - 混沌：runner 掉线、DB 锁、磁盘满、网络分区。
+  - ✅ **runner 掉线**：掉线不是「运行失败」，是「这次运行还没开始」。派发前门禁读注册表，判死就报 `RUNNER_OFFLINE`（不再并进「runner 不存在」的 404）；`runnerWaitSec` 让它有界地等回来再放行。派出去之后 broker 每个探针周期复查一次活口，机器半路没了当场判失败并把错误指向那台机器，而不是等步骤超时；探针自己出错只退回纯超时保护，绝不把运行判死。`runner-poll` 先续心跳再判活——反过来的话，一台刚过离线阈值的机器来 poll 会被拒死，永远等不到那条「其实还活着」的心跳。
 - 兼容：v1 pipe.yml 长期支持；DB 迁移可回滚。
   - ✅ **迁移台账**：`lib/db.js:MIGRATION_NOTES` + `schema_migrations` 表，每版一行人话说明，并诚实标出破坏性变更（v1 建表、v7 重建 steps 主键、v11 指针表改 WITHOUT ROWID）——只有 `PRAGMA user_version` 时，「退回去会怎样」没人答得上。
   - ✅ **迁移是一次事务**：`runInTransaction` 把 DDL 与 ALTER 一起包进 `BEGIN IMMEDIATE`。以前每步各自提交，中途断电会留下半个版本（runs 已有 config_snapshot 但 user_version 还停在 7）。
