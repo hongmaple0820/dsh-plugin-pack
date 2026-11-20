@@ -1041,6 +1041,9 @@ function createRuntime(ctx, config) {
       cache: {
         restore: ({ key, paths, restoreKeys }) => cacheStore.restore({ projectId: project.id, projectPath: project.path, key, paths, restoreKeys }),
         save: ({ key, paths }) => cacheStore.save({ projectId: project.id, projectPath: project.path, key, paths }),
+        // 台账要能回答「哪个项目从不命中」：project 由这一层补，actions 里不必知道项目是谁的。
+        record: (entry) => cacheStore.record({ projectId: project.id, ...entry }),
+        stats: (options) => cacheStore.stats(options),
       },
 
       /**
@@ -1945,9 +1948,32 @@ function createRuntime(ctx, config) {
     }
     return {
       project: projectId || '',
-      ...summarizeRunQuality({ runs, steps, now: Date.now(), days: windowDays }),
+      ...summarizeRunQuality({ runs, steps, now: Date.now(), days: windowDays, cache: cacheStatsOf({ projectId, days: windowDays }) }),
       scheduler: scheduler ? scheduler.snapshot() : null,
     }
+  }
+
+  /**
+   * v3.0-P7：缓存命中率查询（HTTP 与工具共用的出入口）。
+   */
+  function cacheStats({ projectId = '', days = 30 } = {}) {
+    return cacheStatsOf({ projectId, days })
+  }
+
+  /**
+   * v3.0-P7：缓存命中率（构建缓存 + 工具链两本账，分开报）。
+   *
+   * 分成两本是有意的：构建缓存按 key 命中，省的是下载与编译；工具链命中是「这个版本早就解包好了」，
+   * 省的是下载解包。合成一个百分比之后，前者掉到 0 会被后者的高命中掩掉——
+   * 而「缓存从不命中」恰恰是 pipe.yml 里 key 写错了（混进时间戳、随机值）的唯一征兆。
+   */
+  function cacheStatsOf({ projectId = '', days = 30 } = {}) {
+    const windowDays = Number.isInteger(days) ? Math.max(1, Math.min(365, days)) : 30
+    let build = { ok: false, error: '缓存台账不可读' }
+    try { build = cacheStore.stats({ projectId, days: windowDays }) } catch (error) { build = { ok: false, error: error.message } }
+    let toolchain = { ok: false, error: '工具链台账不可读' }
+    try { toolchain = createToolchain({ storeDir: toolchainStore, offline: true }).stats({ days: windowDays }) } catch (error) { toolchain = { ok: false, error: error.message } }
+    return { windowDays, build, toolchain }
   }
 
   /** v3.0-P7：磁盘里「哪些东西在长」——工作目录、日志目录、制品库、缓存、数据库。 */
@@ -2419,6 +2445,7 @@ function createRuntime(ctx, config) {
     dora,
     // v3.0-P7：运行质量与磁盘占用（指标的分母换过一次就不该和 DORA 混在一个窗口里算）
     metrics,
+    cacheStats,
     storage,
     hook: runHook,
     // v3.0-P0：runner 列表以 DB 注册表为准（broker 只负责任务队列/在跑计数），
@@ -4523,10 +4550,60 @@ function registerTools(ctx, runtime) {
         if (Array.isArray(value.repeated) && value.repeated.length) {
           lines.push(`同一份配置重跑：${value.repeated.slice(0, 3).map((item) => `${item.projectId}${item.target ? `→${item.target}` : ''} ×${item.runs}`).join('、')}`)
         }
+        const cache = value.cache
+        if (cache) {
+          const pct = (rate) => (rate === null || rate === undefined ? '无样本' : `${Math.round(rate * 100)}%`)
+          lines.push(`缓存命中：构建 ${pct(cache.build?.hitRate)}（${cache.build?.lookups ?? 0} 次查找）· 工具链 ${pct(cache.toolchain?.hitRate)}（${cache.toolchain?.lookups ?? 0} 次）`)
+          if (Array.isArray(cache.build?.coldPrefixes) && cache.build.coldPrefixes.length) {
+            lines.push(`从不命中的 key 族：${cache.build.coldPrefixes.slice(0, 3).map((item) => `${item.key}（${item.lookups} 次）`).join('、')}——多半是 key 里混进了每次都变的东西`)
+          }
+        }
         return textBlocks(lines.join('\n'))
       },
     },
     async execute(args = {}) { return runtime.metrics({ project: args.project, days: args.days }) },
+  })
+
+  register({
+    name: 'cicd_cache_stats',
+    description: '缓存命中率：构建缓存（uses: cache 的 key 命中，省下载与编译）与工具链缓存（版本早就解包好，省下载解包）分开报，并列出「从不命中」的 key 族——那通常意味着 pipe.yml 的 key 里混进了每次都变的东西。',
+    parameters: {
+      type: 'object',
+      properties: {
+        project: PROJECT_PARAM,
+        days: { type: 'number', description: '统计窗口天数（1-365，默认 30）' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          windowDays: { type: 'number' },
+          build: { type: 'object', properties: { lookups: { type: 'number' }, hitRate: { type: 'number' }, exact: { type: 'number' }, prefix: { type: 'number' }, miss: { type: 'number' }, save: { type: 'number' }, saveFailed: { type: 'number' }, hitBytes: { type: 'number' }, entries: { type: 'number' } } },
+          toolchain: { type: 'object', properties: { lookups: { type: 'number' }, hitRate: { type: 'number' }, hit: { type: 'number' }, install: { type: 'number' }, installed: { type: 'number' } } },
+        },
+      },
+      render(_args, value) {
+        const pct = (rate) => (rate === null || rate === undefined ? '无样本' : `${Math.round(rate * 100)}%`)
+        const mb = (bytes) => `${Math.round((Number(bytes) || 0) / 1024 / 102.4) / 10} MB`
+        const build = value.build || {}
+        const tc = value.toolchain || {}
+        const lines = [
+          `缓存命中率 · 最近 ${value.windowDays} 天`,
+          `构建缓存：命中 ${pct(build.hitRate)}（精确 ${build.exact ?? 0} · 前缀 ${build.prefix ?? 0} · 未命中 ${build.miss ?? 0}）· 省下 ${mb(build.hitBytes)} · 现存 ${build.entries ?? 0} 条`,
+          `保存：成功 ${build.save ?? 0} 次 · 失败 ${build.saveFailed ?? 0} 次`,
+          `工具链：命中 ${pct(tc.hitRate)}（命中 ${tc.hit ?? 0} · 真装 ${tc.install ?? 0}）· 已装 ${tc.installed ?? 0} 个`,
+        ]
+        if (Array.isArray(build.coldPrefixes) && build.coldPrefixes.length) {
+          lines.push(`从不命中的 key 族：${build.coldPrefixes.slice(0, 5).map((item) => `${item.key}（${item.lookups} 次）`).join('、')}`)
+        }
+        if (Array.isArray(build.projects) && build.projects.length > 1) {
+          lines.push('按项目：', ...build.projects.slice(0, 5).map((item) => `  ${item.key}：${pct(item.hitRate)}（${item.lookups} 次查找）`))
+        }
+        return textBlocks(lines.join('\n'))
+      },
+    },
+    async execute(args = {}) { return runtime.cacheStats({ projectId: args.project || '', days: args.days }) },
   })
 
   register({
@@ -5984,6 +6061,23 @@ async function metricsResource(request, runtime) {
   try { return json({ ok: true, ...runtime.metrics({ project, days }) }) } catch (error) { return errorJson(error) }
 }
 
+/** v3.0-P7：`/cache-stats` —— 缓存命中率（构建缓存与工具链分开报）。 */
+async function cacheStatsResource(request, runtime) {
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
+  const params = queryOf(request)
+  const bad = unsupportedParams(params, new Set(['project', 'days']))
+  if (bad) return json({ ok: false, error: bad }, 400)
+  const raw = params.get('days')
+  const days = raw === null || raw === '' ? undefined : Number(raw)
+  if (days !== undefined && (!Number.isInteger(days) || days < 1 || days > 365)) {
+    return json({ ok: false, error: 'days 必须是 1-365 的整数' }, 400)
+  }
+  const project = params.get('project') || ''
+  const guard = authorizeRead(request, params, { runtime, resource: { type: 'project', id: project, projectId: project } })
+  if (guard) return guard
+  try { return json({ ok: true, ...runtime.cacheStats({ projectId: project, days }) }) } catch (error) { return errorJson(error) }
+}
+
 /** v3.0-P7：`/storage` —— 工作目录各部分的字节数与文件数。 */
 async function storageResource(request, runtime) {
   if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
@@ -6988,6 +7082,7 @@ function registerHttpRoutes(ctx, runtime) {
     // 换库（恢复备份）：写操作，必须 confirm=1，且不能在有人跑的时候换。
     { kind: 'exact', path: `${ROUTE_PREFIX}/database/switch`, resource: (request) => databaseSwitchResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/metrics`, resource: (request) => metricsResource(request, runtime) },
+    { kind: 'exact', path: `${ROUTE_PREFIX}/cache-stats`, resource: (request) => cacheStatsResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/storage`, resource: (request) => storageResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/notify-ledger`, resource: (request) => notifyLedgerResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/triggers`, resource: (request) => triggersResource(request, runtime) },
@@ -7128,7 +7223,7 @@ export const internals = {
     runnerRegisterResource, runnerPollResource, runnerResultResource, runnerLogResource, runnersResource,
     approveResource, approvalsResource, secretsResource, environmentsResource, rbacResource,
     authResource, usersResource, tokensResource, auditResource, locksResource, toolchainResource,
-    metricsResource, storageResource, notifyLedgerResource,
+    metricsResource, cacheStatsResource, storageResource, notifyLedgerResource,
   },
   // v3.0-P2：工具链（解析 / 安装 / 注入 / 断言）
   toolchain: { createToolchain, envFor, assertVersions, inferFromFiles, writeDualLocks, TOOLCHAIN_ERRORS, LANGS: TOOLCHAIN_LANGS },

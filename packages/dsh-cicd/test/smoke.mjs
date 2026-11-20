@@ -782,11 +782,11 @@ function callPath(pathname, query = '', { headers = {} } = {}) {
   return route.resource(new Request(`http://x${pathname}${query}`, { headers }))
 }
 
-check('apply：注册 36 个工具、48 条路由（44 exact + 4 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
-  assert.equal(ctx.toolsList.length, 36)
+check('apply：注册 37 个工具、49 条路由（45 exact + 4 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
+  assert.equal(ctx.toolsList.length, 37)
   assert.deepEqual(ctx.toolsList.map((tool) => tool.name).sort(), [
-    'cicd_approve', 'cicd_artifacts', 'cicd_audit', 'cicd_auth', 'cicd_cancel', 'cicd_database', 'cicd_database_switch', 'cicd_dora', 'cicd_environments', 'cicd_locks',
-    'cicd_logs', 'cicd_metrics', 'cicd_notify_ledger', 'cicd_onboarding', 'cicd_pipe_save', 'cicd_plan', 'cicd_project_create', 'cicd_project_meta',
+    'cicd_approve', 'cicd_artifacts', 'cicd_audit', 'cicd_auth', 'cicd_cache_stats', 'cicd_cancel', 'cicd_database', 'cicd_database_switch', 'cicd_dora', 'cicd_environments',
+    'cicd_locks', 'cicd_logs', 'cicd_metrics', 'cicd_notify_ledger', 'cicd_onboarding', 'cicd_pipe_save', 'cicd_plan', 'cicd_project_create', 'cicd_project_meta',
     'cicd_projects', 'cicd_promotions',
     'cicd_rbac', 'cicd_registry', 'cicd_releases', 'cicd_rollback', 'cicd_run', 'cicd_runners', 'cicd_secrets', 'cicd_status',
     'cicd_storage', 'cicd_targets', 'cicd_templates', 'cicd_tokens', 'cicd_toolchain', 'cicd_triggers', 'cicd_users', 'cicd_validate',
@@ -798,10 +798,11 @@ check('apply：注册 36 个工具、48 条路由（44 exact + 4 prefix）、1 �
     assert.equal(typeof tool.output.render, 'function')
     assert.equal(typeof tool.execute, 'function')
   }
-  assert.equal(ctx.routes.length, 48)
+  assert.equal(ctx.routes.length, 49)
   assert.deepEqual(ctx.routes.filter((route) => route.kind === 'exact').map((route) => route.path).sort(), [
     '/api/plugins/cicd/approvals', '/api/plugins/cicd/approve', '/api/plugins/cicd/artifacts', '/api/plugins/cicd/audit', '/api/plugins/cicd/auth',
-    '/api/plugins/cicd/cancel', '/api/plugins/cicd/database', '/api/plugins/cicd/database/switch', '/api/plugins/cicd/dora', '/api/plugins/cicd/environments', '/api/plugins/cicd/locks',
+    '/api/plugins/cicd/cache-stats', '/api/plugins/cicd/cancel', '/api/plugins/cicd/database', '/api/plugins/cicd/database/switch', '/api/plugins/cicd/dora',
+    '/api/plugins/cicd/environments', '/api/plugins/cicd/locks',
     '/api/plugins/cicd/log', '/api/plugins/cicd/metrics', '/api/plugins/cicd/notify-ledger', '/api/plugins/cicd/notify-test', '/api/plugins/cicd/onboarding',
     '/api/plugins/cicd/operations', '/api/plugins/cicd/pipe-save',
     '/api/plugins/cicd/plan', '/api/plugins/cicd/preview', '/api/plugins/cicd/project-create', '/api/plugins/cicd/project-meta', '/api/plugins/cicd/projects',
@@ -820,7 +821,7 @@ check('apply：注册 36 个工具、48 条路由（44 exact + 4 prefix）、1 �
   assert.equal(typeof ctx.upgrades[0].handler, 'function')
 })
 
-check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补注册 44+4 条；remote() 惰性取 port', () => {
+check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补注册 45+4 条；remote() 惰性取 port', () => {
   const coldRoutes = []
   const coldUpgrades = []
   const coldWeb = {
@@ -842,8 +843,8 @@ check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补�
   assert.ok(typeof scopeFn === 'function', 'apply 应把路由注册挂到 ctx.inject 上')
   // 模拟 webServer 就绪：cordis 以一个能 get 到服务的 scope 触发回调（真实环境由服务就绪事件驱动）。
   scopeFn({ get: (key) => (key === 'webServer' ? coldWeb : undefined), effect() {} })
-  assert.equal(coldRoutes.length, 48, '就绪后应补注册 44 条 exact + 4 条 prefix 路由')
-  assert.equal(coldRoutes.filter((route) => route.kind === 'exact').length, 44)
+  assert.equal(coldRoutes.length, 49, '就绪后应补注册 45 条 exact + 4 条 prefix 路由')
+  assert.equal(coldRoutes.filter((route) => route.kind === 'exact').length, 45)
   assert.equal(coldUpgrades.length, 1, '就绪后应补注册 /log-ws upgrade 路由')
 
   // remote() 惰性解析：apply 时拿不到 port（remoteBase 为空），就绪后首次调用应取到 55470。
@@ -1122,6 +1123,112 @@ checkAsync('v3.0-P7 混沌与兼容：只读盘不写库、备份可换回去、
   }
 })
 
+checkAsync('v3.0-P7 缓存命中率：构建缓存与工具链分两本账，从不命中的 key 族要指名道姓', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cicd-cache-stats-'))
+  const tick = { t: Date.parse('2026-05-01T00:00:00Z') }
+  const clock = () => tick.t
+  try {
+    // ---- ① 构建缓存台账 ----
+    const { createCacheStore } = internals.cache
+    const store = createCacheStore({ dir: join(dir, 'cache'), now: clock })
+    const app = join(dir, 'app')
+    mkdirSync(join(app, 'out'), { recursive: true })
+    writeFileSync(join(app, 'out', 'a.txt'), 'artifact-a')
+    const saved = await store.save({ projectId: 'app', projectPath: app, key: 'npm-aaa', paths: ['out/*.txt'] })
+    assert.equal(saved.ok, true, '先得存进去一份才谈得上命中')
+    assert.deepEqual((await store.restore({ projectId: 'app', projectPath: app, key: 'npm-aaa', paths: ['out/*.txt'] })).exact, true)
+    // 前缀命中：key 变了、前缀没变，仍应该拿到上一份（restore_keys 的语义）
+    tick.t += 60 * 1000
+    writeFileSync(join(app, 'out', 'a.txt'), 'artifact-b')
+    const prefixed = await store.restore({ projectId: 'app', projectPath: app, key: 'npm-bbb', paths: ['out/*.txt'], restoreKeys: ['npm-'] })
+    assert.equal(prefixed.hit, true)
+    assert.equal(prefixed.exact, false, '换了 key 只能算前缀命中')
+    // 三次「每次都换 key」的未命中：这是 pipe.yml 里 key 混进时间戳的典型形状。
+    // 不带 restore_keys —— 带了前缀就会命中 npm-aaa，那测的就不是「从不命中」了。
+    // 用不同的文件名：同一批文件在上一轮已经落地，restore 会「恢复成功」而不是落空。
+    for (let i = 0; i < 3; i += 1) {
+      tick.t += 60 * 1000
+      const missed = await store.restore({ projectId: 'app', projectPath: app, key: 'stamp-' + tick.t, paths: ['stamp/*.txt'] })
+      assert.equal(missed.hit, false, '没有缓存条目时必须是未命中')
+    }
+    // 存一次空的：save-failed 也要记账，否则「缓存一直没存上」看起来像「没人用缓存」
+    tick.t += 60 * 1000
+    const emptySave = await store.save({ projectId: 'app', projectPath: app, key: 'npm-empty', paths: ['dist/*.js'] })
+    assert.equal(emptySave.ok, false)
+
+    const build = store.stats({ days: 30 })
+    assert.equal(build.ok, true)
+    assert.equal(build.exact, 1)
+    assert.equal(build.prefix, 1)
+    assert.equal(build.miss, 3)
+    assert.equal(build.lookups, 5)
+    assert.equal(build.hitRate, 0.4, '两次命中除以五次查找')
+    assert.equal(build.exactRate, 0.2)
+    assert.equal(build.save, 1, '只存进去一份：后来那次为空，不能算保存成功')
+    assert.equal(build.saveFailed, 1)
+    assert.ok(build.hitBytes > 0, '命中要能说出省了多少字节')
+    // 从不命中的那一族必须被点出来：stamp 三次全落空，npm 有命中所以不算冷
+    // 这条断言钉的是真缺陷：分组名一度叫 prefix，把同名的「前缀命中次数」覆盖掉了，
+    // 「前缀命中数 === 0」于是永远不成立，冷族永远是空的。分组名现在叫 key。
+    const cold = build.coldPrefixes.map((item) => item.key)
+    assert.deepEqual(cold, ['stamp'])
+    assert.equal(build.prefixes[0].key, 'stamp', '按命中次数倒序，冷族排前面')
+    // 窗口之外的不算进命中率，否则上个月的坏 key 会永远压低这个月的数
+    assert.equal(store.stats({ days: 30, projectId: 'nobody' }).lookups, 0)
+    assert.equal(store.stats({ days: 30, projectId: 'nobody' }).hitRate, null, '没有样本时命中率是 null，不是 0')
+    tick.t += 400 * 24 * 60 * 60 * 1000
+    assert.equal(store.stats({ days: 30 }).lookups, 0, '窗口外的事件不该再计入')
+
+    // ---- ② 工具链台账：命中与真装分开计 ----
+    const tc = createToolchain({ storeDir: join(dir, 'toolchains'), offline: true, now: clock })
+    // 注意台账固定落在 <storeDir>/usage.jsonl：createToolchain 每次调用都会 mkdir storeDir，
+    // 所以得在第一次调用之后才写的进这个文件，路径不能想当然多拼一层。
+    const tcFile = join(dir, 'toolchains', 'usage.jsonl')
+    mkdirSync(join(dir, 'toolchains'), { recursive: true })
+    writeFileSync(tcFile, [
+      { at: new Date(tick.t).toISOString(), event: 'hit', lang: 'node', version: '20.0.0' },
+      { at: new Date(tick.t).toISOString(), event: 'hit', lang: 'node', version: '20.0.0' },
+      { at: new Date(tick.t).toISOString(), event: 'install', lang: 'node', version: '21.0.0' },
+      { at: new Date(tick.t).toISOString(), event: 'install', lang: 'java', version: 'temurin-17' },
+    ].map((row) => JSON.stringify(row)).join('\n') + '\n')
+    const tcStats = tc.stats({ days: 30 })
+    assert.equal(tcStats.hit, 2)
+    assert.equal(tcStats.install, 2)
+    assert.equal(tcStats.hitRate, 0.5)
+    assert.deepEqual(tcStats.langs.map((item) => item.lang).sort(), ['java', 'node'])
+    const nodeRow = tcStats.langs.find((item) => item.lang === 'node')
+    assert.equal(nodeRow.hitRate, Math.round((2 / 3) * 10000) / 10000)
+
+    // ---- ③ 两本账绝不合成一个数：构建缓存 0 命中不该被工具链的高命中掩掉 ----
+    const repo = await repoTool(join(dir, 'state'), { projects: [{ id: 'app', name: 'app', path: app }] })
+    try {
+      const body = await repo.call('/api/plugins/cicd/metrics').then((response) => response.json())
+      assert.equal(body.ok, true)
+      assert.ok(body.cache, '指标接口必须带上缓存命中率')
+      assert.equal(typeof body.cache.build, 'object')
+      assert.equal(typeof body.cache.toolchain, 'object')
+      assert.equal(body.cache.build.hitRate, null, '这个工作目录里还没有查找记录')
+      assert.equal('cache' in (body.dora || {}), false, '缓存命中率不进 DORA 四指标：它影响成本，不影响发布速度')
+      const viaHttp = await repo.call('/cache-stats?days=7').then((response) => response.json())
+      assert.equal(viaHttp.ok, true)
+      assert.equal(viaHttp.windowDays, 7)
+      assert.equal(typeof viaHttp.build.coldPrefixes, 'object')
+      assert.equal((await repo.call('/cache-stats?days=0')).status, 400, '窗口天数必须被校验')
+      assert.equal((await repo.call('/cache-stats?bogus=1')).status, 400, '不认识的参数要拒绝，而不是悄悄忽略')
+      // 工具层同一份数据：两个入口必须说同一句话
+      const tool = ctx.toolsList.find((item) => item.name === 'cicd_cache_stats')
+      assert.ok(tool, '缓存命中率要有一个工具入口，否则只有前端看得到')
+      const toolBody = await tool.execute({ days: 30 }, {})
+      assert.equal(typeof toolBody.build, 'object')
+      const rendered = tool.output.render({ days: 30 }, toolBody).map((block) => block.text).join('\n')
+      assert.ok(rendered.includes('缓存命中率'), rendered)
+      assert.ok(rendered.includes('工具链'), rendered)
+    } finally { repo.close() }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 checkAsync('v3.0-P6-6 引导：四步全由库现算，做完才打勾，项目换一个不会假装已完成', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'cicd-p6-6-'))
   try {
@@ -1341,7 +1448,7 @@ checkAsync('routes：operations 时间线、notify-test 未配置与写保护', 
 })
 
 check('routes：所有资源都走 resource，没有 handler/POST 形态', () => {
-  assert.equal(ctx.routes.length, 48)
+  assert.equal(ctx.routes.length, 49)
   for (const route of ctx.routes) {
     assert.equal(route.handler, undefined)
     assert.ok(route.kind === 'exact' || route.kind === 'prefix')
@@ -5654,9 +5761,9 @@ for (const item of checks) {
     console.log(`ok ${passed} - ${item.title}`)
   } catch (error) {
     console.error(`not ok ${passed + 1} - ${item.title}`)
+    // 打完就跑：后面还有会起进程、占端口的用例，失败之后继续只会掩盖真正的第一现场。
     console.error(error)
-    process.exitCode = 1
-    break
+    process.exit(1)
   }
 }
 

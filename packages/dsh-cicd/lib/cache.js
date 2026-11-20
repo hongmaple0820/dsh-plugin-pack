@@ -21,7 +21,7 @@
  */
 
 import {
-  cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync,
+  appendFileSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
@@ -128,10 +128,120 @@ function dirBytes(dir) {
   return total
 }
 
-export function createCacheStore({ dir, maxBytes = 2 * 1024 * 1024 * 1024, home = homedir() } = {}) {
+/**
+ * 一次「缓存起了没有作用」的记录。
+ *
+ * 只记结论不记正文：命中率是「省了多少次下载/编译」的证据，而 key 里常含 hash，
+ * 记全文会让台账迅速变成日志。带 projectId 是为了让多项目共用一个 workDir 时还分得清。
+ */
+const USAGE_FILE = 'usage.jsonl'
+const USAGE_KEEP = 500
+
+function emptyUsage() {
+  return { exact: 0, prefix: 0, miss: 0, save: 0, saveFailed: 0, restoredBytes: 0, savedBytes: 0 }
+}
+
+function addUsage(bucket, entry) {
+  const hit = String(entry?.result || entry?.event || '')
+  if (hit === 'hit') {
+    if (entry.exact === false) bucket.prefix += 1
+    else bucket.exact += 1
+    bucket.restoredBytes += Number(entry.bytes) || 0
+  } else if (hit === 'miss') {
+    bucket.miss += 1
+  } else if (hit === 'save') {
+    bucket.save += 1
+    bucket.savedBytes += Number(entry.bytes) || 0
+  } else if (hit === 'save-failed') {
+    bucket.saveFailed += 1
+  }
+  return bucket
+}
+
+function usageRates(bucket) {
+  const lookups = bucket.exact + bucket.prefix + bucket.miss
+  return {
+    lookups,
+    // 唯一有意义的那个数：有多少次「本来要重新下载/编译」被缓存挡掉了。前缀命中单独算，
+    // 因为它命中的是上一份 key 的缓存，价值真实但比精确命中低。
+    hitRate: lookups > 0 ? Math.round(((bucket.exact + bucket.prefix) / lookups) * 10000) / 10000 : null,
+    exactRate: lookups > 0 ? Math.round((bucket.exact / lookups) * 10000) / 10000 : null,
+  }
+}
+
+export function createCacheStore({ dir, maxBytes = 2 * 1024 * 1024 * 1024, home = homedir(), now = Date.now } = {}) {
   if (!dir) throw cacheError('createCacheStore 需要 dir', CACHE_ERRORS.SAVE)
   const keysDir = join(dir, 'keys')
   mkdirSync(keysDir, { recursive: true })
+  const usageFile = join(dir, USAGE_FILE)
+
+  /**
+   * 记一条使用记录并返回它。写盘失败只吞掉——台账坏了不该让构建失败，
+   * 这和 cache.save 的软失败是同一个原则。
+   */
+  function record(entry) {
+    const row = { at: new Date(now()).toISOString(), project: entry.projectId || '', ...entry }
+    try {
+      appendFileSync(usageFile, `${JSON.stringify(row)}\n`)
+      // 台账只保留最近 USAGE_KEEP 行：它是「最近的命中率」，不是审计账本。
+      const lines = readFileSync(usageFile, 'utf8').split(`\n`).filter(Boolean)
+      if (lines.length > USAGE_KEEP * 2) writeFileSync(usageFile, `${lines.slice(-USAGE_KEEP).join('\n')}\n`)
+    } catch { /* best effort */ }
+    return row
+  }
+
+  /**
+   * 命中率汇总。`days` 是最近窗口（默认 30 天），`projectId` 为空表示全部项目。
+   *
+   * 除了总体，还按 key 前缀分组：一个项目的缓存常年 0% 命中，往往不是「机器慢」，
+   * 而是 key 里混进了每次都会变的东西（时间戳、随机 sha）——分组之后一眼能看出是哪一族 key 从不命中。
+   */
+  function stats({ projectId = '', days = 30 } = {}) {
+    const windowDays = Number.isInteger(days) ? Math.max(1, Math.min(365, days)) : 30
+    const from = now() - windowDays * 24 * 60 * 60 * 1000
+    const total = emptyUsage()
+    const byPrefix = new Map()
+    const byProject = new Map()
+    let samples = 0
+    let lines = []
+    try { lines = readFileSync(usageFile, 'utf8').split('\n').filter(Boolean) } catch { lines = [] }
+    for (const line of lines) {
+      let row
+      try { row = JSON.parse(line) } catch { continue }
+      const at = Date.parse(String(row.at || ''))
+      if (!Number.isFinite(at) || at < from) continue
+      if (projectId && row.project !== projectId) continue
+      samples += 1
+      addUsage(total, row)
+      const key = String(row.key || '')
+      // 前缀取到第一个变量分隔符为止：`npm-<hash>` 与 `npm-<other>` 应归成一组。
+      const prefix = key.split(/[-:/]/)[0] || '(empty)'
+      byPrefix.set(prefix, addUsage(byPrefix.get(prefix) || emptyUsage(), row))
+      const project = row.project || '(none)'
+      byProject.set(project, addUsage(byProject.get(project) || emptyUsage(), row))
+    }
+    // 分组名放在 key 上：bucket 里本来就有一个叫 prefix 的计数器（前缀命中次数），
+    // 用 prefix 当分组名会把它覆盖掉，「前缀命中数 === 0」的判断随后永远不成立，冷族永远是空的。
+    const decorate = ([key, bucket]) => ({ key, ...bucket, ...usageRates(bucket), hitBytes: bucket.restoredBytes })
+    const prefixes = [...byPrefix.entries()].map(decorate).sort((a, b) => b.lookups - a.lookups)
+    const projects = [...byProject.entries()].map(decorate).sort((a, b) => b.lookups - a.lookups)
+    // 「从不命中」的 key 族：样本够多（≥3）却一次都没命过，这才是需要改 key 的那一族。
+    const coldPrefixes = prefixes.filter((item) => item.lookups >= 3 && item.exact === 0 && item.prefix === 0)
+    return {
+      ok: true,
+      windowDays,
+      from: new Date(from).toISOString(),
+      to: new Date(now()).toISOString(),
+      samples,
+      entries: listKeys(projectId).length,
+      ...total,
+      ...usageRates(total),
+      hitBytes: total.restoredBytes,
+      prefixes,
+      projects,
+      coldPrefixes,
+    }
+  }
 
   const entryDir = (projectId, key) => join(keysDir, sha256(`${projectId}\u0000${key}`))
 
@@ -178,9 +288,13 @@ export function createCacheStore({ dir, maxBytes = 2 * 1024 * 1024 * 1024, home 
           } catch { /* 单个文件恢复失败不该让整次构建失败 */ }
         }
         if (restored === 0) continue
+        // 命中率要能回答「省了多少」，所以一次命中在台账里是一行（含字节数），
+        // 不是只加一个计数器——计数器回答不了「这周比上周省得多吗」。
+        record({ result: 'hit', key: entry, exact, bytes: meta.bytes || 0, files: restored, projectId })
         return { hit: true, key: entry, exact, bytes: meta.bytes || 0, files: restored }
       }
     }
+    record({ result: 'miss', key, exact: false, bytes: 0, files: 0, projectId })
     return { hit: false, key, exact: false, bytes: 0, files: 0 }
   }
 
@@ -219,11 +333,13 @@ export function createCacheStore({ dir, maxBytes = 2 * 1024 * 1024 * 1024, home 
       }
       if (files.length === 0) {
         rmSync(staging, { recursive: true, force: true })
-        return { ok: false, key, bytes: 0, files: 0, error: '没有匹配到任何文件' }
+        record({ result: 'save-failed', key, bytes: 0, files: 0, projectId, error: '没有匹配到任何文件' })
+      return { ok: false, key, bytes: 0, files: 0, error: '没有匹配到任何文件' }
       }
       const bytes = dirBytes(filesDir)
       if (bytes > maxBytes) {
         rmSync(staging, { recursive: true, force: true })
+        record({ result: 'save-failed', key, bytes, files: 0, projectId, error: `缓存体积 ${bytes} 超过上限 ${maxBytes}` })
         return { ok: false, key, bytes, files: 0, error: `缓存体积 ${bytes} 超过上限 ${maxBytes}` }
       }
       // files 存个数、entries 存清单：两者同名最容易踩「数字当数组遍历」，
@@ -232,9 +348,11 @@ export function createCacheStore({ dir, maxBytes = 2 * 1024 * 1024 * 1024, home 
       // 原子提交：先删旧条目再 rename，避免「写了一半的缓存被当成命中」
       rmSync(target, { recursive: true, force: true })
       renameSync(staging, target)
+      record({ result: 'save', key, bytes, files: files.length, projectId })
       return { ok: true, key, bytes, files: files.length }
     } catch (error) {
       try { rmSync(staging, { recursive: true, force: true }) } catch { /* 清理尽力而为 */ }
+      record({ result: 'save-failed', key, bytes: 0, files: 0, projectId, error: String(error.message || error).slice(0, 200) })
       return { ok: false, key, bytes: 0, files: 0, error: error.message }
     }
   }
@@ -282,5 +400,5 @@ export function createCacheStore({ dir, maxBytes = 2 * 1024 * 1024 * 1024, home 
     return { removed, bytes: total }
   }
 
-  return { dir, keysDir, restore, save, list: listKeys, remove, gc, entryDir }
+  return { dir, keysDir, restore, save, list: listKeys, remove, gc, entryDir, stats, record }
 }

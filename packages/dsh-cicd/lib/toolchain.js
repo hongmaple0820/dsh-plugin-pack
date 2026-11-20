@@ -28,7 +28,7 @@
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import {
-  chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync,
+  appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
 import { basename, dirname, join, resolve as resolvePath } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -577,6 +577,19 @@ export function createToolchain({
 
   const lock = readLock(lockFile)
   const inflight = new Map()
+  const usageFile = join(store, 'usage.jsonl')
+
+  /**
+   * 记一次「命中 / 真装」。写盘失败只吞掉——台账坏了不该让构建失败。
+   * 只留最近 1000 行：这是最近的命中率，不是审计账本。
+   */
+  function noteUsage(entry) {
+    try {
+      appendFileSync(usageFile, `${JSON.stringify({ at: new Date(now()).toISOString(), ...entry })}\n`)
+      const lines = readFileSync(usageFile, 'utf8').split('\n').filter(Boolean)
+      if (lines.length > 2000) writeFileSync(usageFile, `${lines.slice(-1000).join('\n')}\n`)
+    } catch { /* best effort */ }
+  }
 
   async function resolveOne(lang, spec) {
     if (!LANGS.includes(lang)) {
@@ -630,14 +643,24 @@ export function createToolchain({
     const key = `${item.lang}/${item.resolved}`
     const target = join(store, item.lang, item.resolved, plat)
     const marker = join(target, '.ok')
-    if (existsSync(marker)) return { lang: item.lang, version: item.resolved, dir: target, root: normalizeRoot(item.lang, target), cached: true }
+    if (existsSync(marker)) {
+      // 磁盘上已经解包好的就不必再走一遍锁与校验——但「命中」这件事必须留下痕迹，
+      // 否则「工具链缓存到底省了多少」只能靠翻日志猜。
+      const hit = { lang: item.lang, version: item.resolved, dir: target, root: normalizeRoot(item.lang, target), cached: true }
+      noteUsage({ event: 'hit', lang: item.lang, version: item.resolved })
+      return hit
+    }
 
     // 同一个进程里并发装同一版本：复用同一个 Promise（mkdir 锁只能跨进程，跨不掉同进程的 await 间隙）
     if (inflight.has(key)) return inflight.get(key)
     const task = (async () => {
       const unlock = mkdirLock(join(locksDir, `install-${key.replace(/[^A-Za-z0-9_.-]+/g, '_')}-${plat}.lock`), { now })
       try {
-        if (existsSync(marker)) return { lang: item.lang, version: item.resolved, dir: target, root: normalizeRoot(item.lang, target), cached: true }
+        if (existsSync(marker)) {
+          const hit = { lang: item.lang, version: item.resolved, dir: target, root: normalizeRoot(item.lang, target), cached: true }
+          noteUsage({ event: 'hit', lang: item.lang, version: item.resolved })
+          return hit
+        }
         const platformInfo = item.platforms?.[plat]
         if (!platformInfo?.url) {
           throw toolchainError(`${item.lang}@${item.resolved} 没有 ${plat} 的下载地址`, TOOLCHAIN_ERRORS.NOT_FOUND, { lang: item.lang, platform: plat })
@@ -685,6 +708,7 @@ export function createToolchain({
           try { rmSync(tmp, { recursive: true, force: true }) } catch { /* best effort */ }
           throw error
         }
+        noteUsage({ event: 'install', lang: item.lang, version: item.resolved })
         return { lang: item.lang, version: item.resolved, dir: target, root: normalizeRoot(item.lang, target), cached: false }
       } finally {
         unlock()
@@ -732,6 +756,47 @@ export function createToolchain({
     return out
   }
 
+  /**
+   * 工具链缓存命中率。
+   *
+   * 与构建缓存（`uses: cache`）分开算：那边按 key 命中，这边是「这台机器上这个版本早就解包好了」。
+   * 两者都叫「缓存命中率」，但一个是省下载、一个是省解包+下载，混成一个数会让两边都看不明白。
+   * `days` 是最近窗口，按条目时间过滤；文件里只留最近 1000 行，所以窗口再长也只看得到近况。
+   */
+  function stats({ days = 30 } = {}) {
+    const windowDays = Number.isInteger(days) ? Math.max(1, Math.min(365, days)) : 30
+    const from = now() - windowDays * 24 * 60 * 60 * 1000
+    const byLang = new Map()
+    let hit = 0
+    let install = 0
+    let lines = []
+    try { lines = readFileSync(usageFile, 'utf8').split('\n').filter(Boolean) } catch { lines = [] }
+    for (const line of lines) {
+      let row
+      try { row = JSON.parse(line) } catch { continue }
+      const at = Date.parse(String(row.at || ''))
+      if (!Number.isFinite(at) || at < from) continue
+      const lang = String(row.lang || '?')
+      const entry = byLang.get(lang) || { lang, hit: 0, install: 0, hitRate: null }
+      if (row.event === 'hit') { entry.hit += 1; hit += 1 } else if (row.event === 'install') { entry.install += 1; install += 1 }
+      byLang.set(lang, entry)
+    }
+    const langs = [...byLang.values()]
+      .map((entry) => ({ ...entry, hitRate: entry.hit + entry.install > 0 ? Math.round((entry.hit / (entry.hit + entry.install)) * 10000) / 10000 : null }))
+      .sort((a, b) => (b.hit + b.install) - (a.hit + a.install))
+    return {
+      windowDays,
+      from: new Date(from).toISOString(),
+      to: new Date(now()).toISOString(),
+      hit,
+      install,
+      lookups: hit + install,
+      hitRate: hit + install > 0 ? Math.round((hit / (hit + install)) * 10000) / 10000 : null,
+      langs,
+      installed: list().length,
+    }
+  }
+
   function remove(lang, version) {
     const dir = join(store, lang, version)
     if (!existsSync(dir)) return false
@@ -772,6 +837,7 @@ export function createToolchain({
     install,
     ensure,
     list,
+    stats,
     remove,
     gc,
     lock: () => lock,

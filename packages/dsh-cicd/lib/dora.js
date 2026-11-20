@@ -104,7 +104,7 @@ function buildSeries(rows, { now, windowDays }) {
  * 这里回答「机器忙不忙」——排队多久、跑多久、时间花在哪个 stage、同一份配置重跑了几次。
  * 两者都从同一批行算，不引入新的采集管道：一次性任务的监控数据，最贵的部分从来不是计算，是埋点。
  */
-export function summarizeRunQuality({ runs = [], steps = {}, now = Date.now(), days = 30 } = {}) {
+export function summarizeRunQuality({ runs = [], steps = {}, cache = null, now = Date.now(), days = 30 } = {}) {
   const windowDays = Number.isInteger(days) ? Math.max(1, Math.min(365, days)) : 30
   const from = now - windowDays * DAY_MS
   const busy = []
@@ -219,6 +219,9 @@ export function summarizeRunQuality({ runs = [], steps = {}, now = Date.now(), d
     longest: longest ? { ...longest, startedAt: new Date(longest.startedAt).toISOString(), finishedAt: new Date(longest.finishedAt).toISOString() } : null,
     stages,
     repeated,
+    // 缓存命中率是「省」而不是「稳」，所以它跟着运行质量一起报、但不进 DORA 四指标：
+    // 命中率掉一半不会让发布变慢，只会让它变贵。
+    cache: cache || null,
   }
 }
 /**
