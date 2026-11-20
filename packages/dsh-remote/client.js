@@ -4079,13 +4079,9 @@ window.__ModuleLoader__.load({
       // Pure helpers exposed for the package smoke test; the host ignores unknown module fields.
       internals: { computeTerminalGrid, pushCommandHistory, resolveHistoryStep, formatLogStamp },
       apply(ctx) {
-        // In-conversation page: unchanged since v1.
-        ctx.effect(() => ctx.slots.inject('conversation.view', () => ctx.slots.register({
-          name: 'conversation.view',
-          id: 'remote',
-          order: 30,
-          label: () => '远程主机',
-        }, RemotePage)))
+        // 不再注册 conversation.view（v2 起，与 aihot / SPEC.md §4 一致）：会话内 View 与宿主 composer
+        // 同属 conversation.content，页面下面永远跟着输入框；整页应用必须走 keyed 'main' 槽。
+        // 副作用也一起消失：shell 会把「当前 View」按会话持久化，曾点进来的会话会一直回到这一页。
 
         // Global panel row in the left sidebar; the shell owns the row chrome and switching.
         ctx.effect(() => ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({

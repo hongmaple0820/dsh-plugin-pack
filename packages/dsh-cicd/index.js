@@ -84,6 +84,13 @@ export const name = '@local/dsh-cicd'
 export const inject = ['tools']
 
 const ROUTE_PREFIX = '/api/plugins/cicd'
+
+/**
+ * 工具输出 schema 的「没有数据」表达。
+ * DSH 的校验子集只认单个 type（没有 type: ["number","null"]），所以可空用 oneOf 写，
+ * 否则空库/无样本时真实返回的 null 会让这次工具调用直接判 INVALID_TOOL_OUTPUT。
+ */
+const nullable = (schema) => ({ oneOf: [schema, { type: 'null' }] })
 const CICD_HEADER = 'x-dsh-cicd'
 const CICD_HEADER_VALUE = '1'
 const WRITE_HEADER = 'x-dsh-remote-exec'
@@ -2779,8 +2786,10 @@ function createRuntime(ctx, config) {
       const withValues = rows.map((row) => ({ ...row, value: secrets.get(row.project, row.scope, row.name) }))
       return { project, scope, secrets: withValues, revealed: true }
     },
-    // 路由层读字节只走这一个入口：它同时给出 status/size/range，避免调用方自己拼 header。
-    artifactStream(digest, rangeHeader = '') {
+    // 路由层读字节只走这一个入口：先按 digest 验一遍 sha256，再给出 status/size/range。
+    // 这样任何一条下载路径都不会把被改过的字节发出去，也不用每个调用方各记一次校验。
+    async artifactStream(digest, rangeHeader = '') {
+      await artifactStore.assertIntact(digest)
       return artifactStore.readRange(digest, rangeHeader)
     },
     // ---- v3.0-P5：制品 CAS ----------------------------------------------------------------
@@ -4557,7 +4566,7 @@ function registerTools(ctx, runtime) {
     description: '列出一个项目 pipe.yml 里的部署目标、主机、服务/重启命令与当前活跃 release。',
     parameters: { type: 'object', properties: { project: PROJECT_PARAM } },
     output: {
-      schema: { type: 'object', properties: { project: { type: 'string' }, targets: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, hosts: { type: 'array', items: { type: 'string' } }, path: { type: 'string' }, runtime: { type: 'string' }, app: { type: 'string' }, onHostFailure: { type: 'string' }, keep: { type: 'number' }, canary: { type: 'object', properties: { first: { type: 'number' }, waitSec: { type: 'number' } } }, strategy: STRATEGY_SCHEMA, restartCommand: { type: 'string' }, service: { type: 'string' }, restart: { type: 'string' }, health: { type: 'string' }, current: { type: 'string' }, selectors: { type: 'array', items: { type: 'string' } }, envs: { type: 'array', items: { type: 'string' } }, prodHosts: { type: 'array', items: { type: 'string' } }, envsUnknown: { type: 'boolean' }, active: { type: 'array', items: { type: 'object', properties: { host: { type: 'string' }, releaseId: { type: 'string' } } } } } } } } },
+      schema: { type: 'object', properties: { project: { type: 'string' }, targets: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, hosts: { type: 'array', items: { type: 'string' } }, path: { type: 'string' }, runtime: { type: 'string' }, app: { type: 'string' }, onHostFailure: { type: 'string' }, keep: { type: 'number' }, canary: nullable({ type: 'object', properties: { first: { type: 'number' }, waitSec: { type: 'number' } } }), strategy: STRATEGY_SCHEMA, restartCommand: { type: 'string' }, service: { type: 'string' }, restart: { type: 'string' }, health: { type: 'string' }, current: { type: 'string' }, selectors: { type: 'array', items: { type: 'string' } }, envs: { type: 'array', items: { type: 'string' } }, prodHosts: { type: 'array', items: { type: 'string' } }, envsUnknown: { type: 'boolean' }, active: { type: 'array', items: { type: 'object', properties: { host: { type: 'string' }, releaseId: { type: 'string' } } } } } } } } },
       render: renderTargets,
     },
     async execute(args = {}) { return runtime.targets({ project: args.project }) },
@@ -4658,9 +4667,9 @@ function registerTools(ctx, runtime) {
           project: { type: 'string' }, windowDays: { type: 'number' }, from: { type: 'string' }, to: { type: 'string' },
           total: { type: 'number' }, deployments: { type: 'number' }, failures: { type: 'number' },
           deploymentFrequency: { type: 'object', properties: { deployments: { type: 'number' }, perDay: { type: 'number' }, perWeek: { type: 'number' } } },
-          leadTimeHours: { type: 'object', properties: { avg: { type: 'number' }, median: { type: 'number' }, samples: { type: 'number' } } },
-          changeFailureRate: { type: 'number' },
-          mttrHours: { type: 'object', properties: { avg: { type: 'number' }, samples: { type: 'number' } } },
+          leadTimeHours: nullable({ type: 'object', properties: { avg: nullable({ type: 'number' }), median: nullable({ type: 'number' }), samples: { type: 'number' } } }),
+          changeFailureRate: nullable({ type: 'number' }),
+          mttrHours: nullable({ type: 'object', properties: { avg: nullable({ type: 'number' }), samples: { type: 'number' } } }),
           levels: { type: 'object', properties: { deploymentFrequency: { type: 'string' }, leadTime: { type: 'string' }, changeFailureRate: { type: 'string' }, mttr: { type: 'string' } } },
           series: { type: 'array', items: { type: 'object', properties: { date: { type: 'string' }, deployments: { type: 'number' }, failures: { type: 'number' }, canceled: { type: 'number' } } } },
         },
@@ -4700,9 +4709,9 @@ function registerTools(ctx, runtime) {
         properties: {
           project: { type: 'string' }, windowDays: { type: 'number' }, total: { type: 'number' },
           concurrency: { type: 'object', properties: { peak: { type: 'number' }, average: { type: 'number' } } },
-          durationSec: { type: 'object', properties: { p50: { type: 'number' }, p95: { type: 'number' }, max: { type: 'number' }, samples: { type: 'number' } } },
-          queueSec: { type: 'object', properties: { p50: { type: 'number' }, p95: { type: 'number' }, samples: { type: 'number' } } },
-          longest: { type: 'object', properties: { id: { type: 'string' }, projectId: { type: 'string' }, durationMs: { type: 'number' } } },
+          durationSec: nullable({ type: 'object', properties: { p50: nullable({ type: 'number' }), p95: nullable({ type: 'number' }), max: nullable({ type: 'number' }), samples: { type: 'number' } } }),
+          queueSec: nullable({ type: 'object', properties: { p50: nullable({ type: 'number' }), p95: nullable({ type: 'number' }), samples: { type: 'number' } } }),
+          longest: nullable({ type: 'object', properties: { id: { type: 'string' }, projectId: { type: 'string' }, durationMs: { type: 'number' } } }),
           stages: { type: 'array', items: { type: 'object', properties: { stage: { type: 'string' }, steps: { type: 'number' }, durationMs: { type: 'number' }, share: { type: 'number' }, failed: { type: 'number' } } } },
           repeated: { type: 'array', items: { type: 'object', properties: { projectId: { type: 'string' }, target: { type: 'string' }, runs: { type: 'number' } } } },
         },
@@ -4751,8 +4760,8 @@ function registerTools(ctx, runtime) {
         type: 'object',
         properties: {
           windowDays: { type: 'number' },
-          build: { type: 'object', properties: { lookups: { type: 'number' }, hitRate: { type: 'number' }, exact: { type: 'number' }, prefix: { type: 'number' }, miss: { type: 'number' }, save: { type: 'number' }, saveFailed: { type: 'number' }, hitBytes: { type: 'number' }, entries: { type: 'number' } } },
-          toolchain: { type: 'object', properties: { lookups: { type: 'number' }, hitRate: { type: 'number' }, hit: { type: 'number' }, install: { type: 'number' }, installed: { type: 'number' } } },
+          build: { type: 'object', properties: { lookups: { type: 'number' }, hitRate: nullable({ type: 'number' }), exact: { type: 'number' }, prefix: { type: 'number' }, miss: { type: 'number' }, save: { type: 'number' }, saveFailed: { type: 'number' }, hitBytes: { type: 'number' }, entries: { type: 'number' } } },
+          toolchain: { type: 'object', properties: { lookups: { type: 'number' }, hitRate: nullable({ type: 'number' }), hit: { type: 'number' }, install: { type: 'number' }, installed: { type: 'number' } } },
         },
       },
       render(_args, value) {
@@ -4790,7 +4799,7 @@ function registerTools(ctx, runtime) {
           total: { type: 'object', properties: { path: { type: 'string' }, bytes: { type: 'number' }, files: { type: 'number' } } },
           logs: { type: 'object', properties: { path: { type: 'string' }, bytes: { type: 'number' }, files: { type: 'number' } } },
           artifacts: { type: 'object', properties: { path: { type: 'string' }, bytes: { type: 'number' }, files: { type: 'number' } } },
-          cache: { type: 'object', properties: { path: { type: 'string' }, bytes: { type: 'number' }, files: { type: 'number' } } },
+          cache: nullable({ type: 'object', properties: { path: { type: 'string' }, bytes: { type: 'number' }, files: { type: 'number' } } }),
           database: { type: 'object', properties: { path: { type: 'string' }, bytes: { type: 'number' } } },
         },
       },
@@ -4902,8 +4911,8 @@ function registerTools(ctx, runtime) {
               manual: { type: 'boolean' },
             },
           },
-          schedulers: { type: 'object', properties: { started: { type: 'boolean' }, tickSec: { type: 'number' }, pollSec: { type: 'number' }, lastError: { type: 'string' } } },
-          webhook: { type: 'object', properties: { url: { type: 'string' }, requiresToken: { type: 'boolean' }, target: { type: 'string' }, branches: { type: 'array', items: { type: 'string' } }, tags: { type: 'array', items: { type: 'string' } } } },
+          schedulers: nullable({ type: 'object', properties: { started: { type: 'boolean' }, tickSec: { type: 'number' }, pollSec: { type: 'number' }, lastError: { type: 'string' } } }),
+          webhook: nullable({ type: 'object', properties: { url: { type: 'string' }, requiresToken: { type: 'boolean' }, target: { type: 'string' }, branches: { type: 'array', items: { type: 'string' } }, tags: { type: 'array', items: { type: 'string' } } } }),
         },
       },
       render(_args, value) {
@@ -5149,7 +5158,7 @@ function registerTools(ctx, runtime) {
           hasUsers: { type: 'boolean' },
           sessionId: { type: 'string' },
           expiresAt: { type: 'string' },
-          policy: { type: 'object' },
+          policy: { type: 'array', items: { type: 'object', properties: { role: { type: 'string' }, action: { type: 'string' }, allow: { type: 'boolean' }, reason: { type: 'string' } } } },
         },
       },
       render(_args, value) {
@@ -5309,7 +5318,7 @@ function registerTools(ctx, runtime) {
           orphans: { type: 'array', items: { type: 'string' } },
           cleared: { type: 'array', items: { type: 'object', properties: { target: { type: 'string' }, runId: { type: 'string' } } } },
           marked: { type: 'number' },
-          unavailable: { type: 'object', properties: { message: { type: 'string' }, code: { type: 'string' } } },
+          unavailable: nullable({ type: 'object', properties: { message: { type: 'string' }, code: { type: 'string' } } }),
           database: { type: 'object', properties: { ok: { type: 'boolean' }, message: { type: 'string' } } },
           released: { type: 'boolean' },
         },
@@ -6442,7 +6451,7 @@ async function registryResource(request, runtime, pathname) {
   // 字节：和 CAS 下载共用同一段 Range 逻辑（大 tarball 断点续传要靠它）。
   try {
     const range = request.headers?.get?.('range') || ''
-    const slice = runtime.artifactStream(resolved.digest, range)
+    const slice = await runtime.artifactStream(resolved.digest, range)
     headers['content-type'] = resolved.mediaType || 'application/octet-stream'
     headers['content-length'] = String(slice.end - slice.start + 1)
     headers['accept-ranges'] = 'bytes'
@@ -6452,6 +6461,7 @@ async function registryResource(request, runtime, pathname) {
     return new Response(method === 'HEAD' ? null : Readable.toWeb(slice.stream()), { status: slice.status, headers })
   } catch (error) {
     if (error?.code === 'ARTIFACT_NOT_FOUND') return registryError('REGISTRY_NOT_FOUND', '制品的字节已不在 CAS 里（可能被 GC 收走）')
+    if (error?.code === 'ARTIFACT_CORRUPTED') return registryError('REGISTRY_CORRUPTED', '制品的字节与 digest 不符，拒绝发送；先 verify，再重新上传同一份字节', 409)
     throw error
   }
 }
@@ -6837,7 +6847,7 @@ async function ociResource(request, runtime, pathname) {
     }
     try {
       if (method === 'GET' || method === 'HEAD') {
-        const slice = runtime.artifactStream(digest, request.headers?.get?.('range') || '')
+        const slice = await runtime.artifactStream(digest, request.headers?.get?.('range') || '')
         const headers = {
           'content-type': 'application/octet-stream',
           'content-length': String(slice.end - slice.start + 1),
@@ -6914,7 +6924,7 @@ async function artifactsResource(request, runtime) {
   if (readOnly) {
     try {
       const range = request.headers?.get?.('range') || ''
-      const slice = runtime.artifactStream(digest, range)
+      const slice = await runtime.artifactStream(digest, range)
       const headers = {
         'content-type': 'application/octet-stream',
         'content-length': String(slice.end - slice.start + 1),

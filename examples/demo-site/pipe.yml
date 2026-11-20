@@ -8,7 +8,7 @@ vars:
 targets:
   demo:
     hosts: [linux26]
-    mode: release
+    mode: native
     path: /srv/dsh-demo
     # 注意：别用 pkill -f 带端口/命令名去杀自己——这条命令自身的命令行也含同样的字符串，会被一起杀掉（exit 空）
     restart: "fuser -k 8099/tcp >/dev/null 2>&1 || true; cd /srv/dsh-demo/current && setsid -f python3 -m http.server 8099 >/tmp/dsh-demo.log 2>&1 </dev/null; sleep 0.6"

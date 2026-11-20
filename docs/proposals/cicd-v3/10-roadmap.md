@@ -164,12 +164,12 @@ P1+P2+P3 ─→ P5 制品库(3w) ─→ P6 体验(4w) ─→ P7 加固(持续)
 
 | # | 任务 | 交付物 | 验收 |
 |---|---|---|---|
-| P4-1 | 角色管理 UI + API | 项目/环境级授予 | Owner 才能授予 |
-| P4-2 | 审批实体 | `approvals(id, digest, env, requested_by, decided_by, reason, expires_at)` | 禁自批、TTL、一次性 |
+| P4-1 ✅ | 角色管理 UI + API | `lib/auth.js` 的成员表 `(user_id, project_id, role)`（`project_id='*'` 是全局角色，项目级优先）+ `lib/policy.js` 把 `MANAGE_MEMBERS` 只留给 owner + `cicd_users` 工具与 `/users` 路由（写操作过 `MANAGE_MEMBERS`，读走 READ）+ `#/…/rbac` 视图与 `cicd_rbac` 工具。环境粒度不另设授权表：`environments.*.allowedActors` 可写 `role:owner`，部署期按真实角色判 | Owner 才能授予：admin 建人、给自己升 owner 都是 403 `POLICY_DENY`（`P4-1：只有 owner 能授予角色` 用例，被拒那次也进审计）✅ |
+| P4-2 ✅ | 审批实体 | `lib/approval.js` + `approvals` 表（`id, run_id, project_id, target, artifact_digest, status, requested_by, requested_at, expires_at, decided_by, decided_at, reason, detail, consumed_at`——env 由 `target` 落到环境）+ `createApprovalGate`（部署闸门）与 `reapExpiredApprovals`（到期收口） | 禁自批：`requested_by === decided_by` 服务端直接拒（`验收③` 403 `SELF_APPROVAL_FORBIDDEN`）✅ · TTL：到期收成 `failed(approval_timeout)`（`验收②`、`V2-M4 approvalGate TTL`）✅ · 一次性：同一条审批用不到第二个 digest（`验收④` `APPROVAL_CONSUMED`）✅ |
 | P4-3 ✅ | prod 五条件 | `lib/environments.js` 的 `parseEnvironmentGuards` / `assertEnvironmentGuard`（单点判定、**永不抛**：拒绝原因要跟着审计走）+ `allowedActors` 只认 `user:`/`token:`/`role:`/`service:` 前缀、`branchRule` 解析期编译、写错一条即整体拒绝（`ENV_GUARD_MISCONFIGURED`，不静默放行）。护栏来源两级：插件配置 `deployment.environments`（宿主默认）+ **pipe.yml 的 `environments:`（同名覆盖宿主，`lib/pipe.js` 的 `normalizePipeEnvironments`）**。执行点在 `deployStep`：先逐环境跑护栏（`ENV_GUARD_NO_ALLOWLIST` / `ENV_ACTOR_NOT_ALLOWED` / `ENV_BRANCH_NOT_ALLOWED` / `ENV_DIGEST_REQUIRED`），**再**进制品闸门 —— 「有没有资格」比「字节验过没」更早；展开主机清单用宽容版 `tryExpandTarget`，dsh-remote 没就绪也要先把「不发出去」的结论给出来。prod 是约定即存在的环境：主机没标 env 也照样上护栏 | 缺一即拦：没有名单拒绝（空名单=谁都不许）、主体不在名单拒绝、分支不匹配拒绝、缺 digest 拒绝（`P4-3 五条件` 用例）✅ · pipe.yml 写的 `allowedActors` / `branchRule` 真的被执行（`P4-3 接线` 用例：解析出 `role:owner`，无分支的部署被 `ENV_BRANCH_NOT_ALLOWED` 拦下并写进日志）✅ |
 | P4-4 ✅ | Secret 加密与脱敏 | `lib/secrets.js` 重写：AES-256-GCM（每条独立 IV + auth tag，记录 `v:2`），密钥来自 `DSH_CICD_SECRET_KEY` / `DSH_CICD_SECRET_KEY_FILE` / 配置 `secrets.key` / 自动生成的 `<workDir>/secrets.key`(0600)，`backend` 报得出是哪一种；显式指定的密钥文件内容非法时**抛错而不是换一把新钥**（换钥等于既有密文全解不开）。v1 明文记录仍可读；解不开的条目在插值时跳过而不是带进命令。新增 `stats()`（entries/encrypted/undecryptable/backend）与 `rotate()`。运行时 `cicd_secrets` 增 `action=stats`（READ）/`action=rotate`（MANAGE_SECRET + confirm） | 落盘 grep 不到原文（`P4-4 secrets` 用例：库里只有 `ct`/`iv`/`tag`）✅ · reveal 走 `REVEAL_SECRET` 且留审计（P0-5/P4-2 既有用例）✅ · 换钥后旧条目解不开时不会把密文当明文插进命令（`undecryptable` 计数）✅ |
-| P4-5 | 审计 UI | 筛选、导出、链校验 | 允许与拒绝都可查 |
-| P4-6 | Runner 安全 | 一次性 join token、吊销、心跳过期 | 吊销后不再被调度 |
+| P4-5 ✅ | 审计 UI | `client.js` 审计视图（筛选 actor/project/result、导出、`校验哈希链` 按钮）+ `GET /audit` 与 `action=verify` 逐条重算 `prev_hash/hash` | 允许与拒绝都可查：viewer 触发部署的 `policy.deny` 在 UI/API 里都看得到（`验收①`）✅ · 改库一行即报链断并给出断点（`验收⑦`）✅ |
+| P4-6 ✅ | Runner 安全 | `lib/runners.js`：join token 只存 `sha256`、`revoke()` 落库 `status='revoked'`、`isRunnable()` 直接拒、在线态由 `last_seen_at`（`OFFLINE_MULTIPLIER` 倍心跳）推出 | 吊销后不再被调度：3× 心跳周期内没有再派给它（`验收⑧`）✅ |
 
 ---
 

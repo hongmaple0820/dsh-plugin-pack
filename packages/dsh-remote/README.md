@@ -1,11 +1,11 @@
 # @local/dsh-remote
 
 DSH bundle：把 SSH / SFTP / 本地端口转发 / 交互式 PTY 能力做成 **DSH 原生工具**，并附带一个
-`远程主机` 页面（会话顶部 View 切换里的整页视图）。文本优先；v2.0 不内嵌 RDP/VNC 画面，只负责在本机拉起对应客户端。
+`远程主机` 页面（左侧栏全局面板里的整页视图）。文本优先；v2.0 不内嵌 RDP/VNC 画面，只负责在本机拉起对应客户端。
 
 - 包名：`@local/dsh-remote`（bundle 行 id：`dsh-remote`）
 - 工具：13 个 `remote_*`（11 个单机能力 + `remote_cluster_exec` 多机并发）
-- 页面：`conversation.view`，`id: remote`，`order: 30`，标签「远程主机」。能力按主机协议（ssh/telnet/rdp/vnc）显示：
+- 页面：左侧栏全局面板行（`sidebar.panellist`）+ 中心列 `main`（`key: 'remote'`）。能力按主机协议（ssh/telnet/rdp/vnc）显示：
   - 主机：新建/编辑/删除（v1.4；v2.0 可选协议），来源为 `config.hosts` 时只读；v2.7 起可标 `env`/`group`/`tags`，行内显示徽标与分组。
   - 文件（仅 ssh/sftp）：浏览/预览/下载/8KB 分块上传（v1.3、v1.8.1），v2.0 起右键菜单支持新建文件/目录、重命名、复制路径、chmod/chown、删除（目录需递归确认）、名称搜索、排序与显示隐藏文件，双击文本就地编辑（≤256KB）。
   - 执行（ssh）：命令模式带超时与 exitCode；v1.5 起可切到交互终端，v1.6 括号粘贴/尺寸跟随，v1.7 清屏/复制输出/本地历史，v1.8 刷新恢复与 2000 行窗口/日志下载，v2.0 多标签保活。
@@ -278,7 +278,9 @@ RDP/VNC 的「打开桌面」失败时（v2.1），若 Host 回的是 `GUI_CLIEN
   `label: () => '远程主机'`；行框/label/高亮/折叠 rail 由宿主 shell 拥有，本包只贡献一个
   `viewBox 0 0 16 16` 的 `currentColor` SVG 字形（根 svg 带 `data-dsh-panel-entry="remote"`）。
   点开后的中心列页面注册在 `main`，`key: 'remote'`，外层是撑满高度、可滚动的容器。
-- **会话内 View（v1，保留）**：`conversation.view`，`id: remote`、`order: 30`、同名 label。
+- **会话内 View（已移除，v2.8）**：v1 曾注册 `conversation.view`；它和宿主 composer 同属
+  `conversation.content`，整页应用放在那里，底部永远跟着聊天输入框。宿主没有「隐藏 composer」的开关，
+  所以独立页面只保留全局面板这一个入口（同 `dsh-aihot` 与 `docs/SPEC.md` §4 v2 的结论）。
 
 - 布局：左侧主机列表（点击选中，绿/黄/灰点表示可用性；顶部「＋ 新建」，每行「编辑」「删除」；删除需二次
   确认，3 秒无操作复原；主机来自 `config` 时按钮置灰并提示去改 patch）｜中间命令输入 + 执行（Ctrl+Enter，
@@ -308,7 +310,7 @@ packages/dsh-remote/
   package.json         # exports / files / dsh.bundle.patch / dsh.client
   cordis.patch.yml     # insert id: dsh-remote
   index.js             # Host 半边：13 个工具 + 36 条 HTTP 路由 + 资源生命周期
-  client.js            # Client 半边：左侧栏全局面板 + conversation.view 页面
+  client.js            # Client 半边：左侧栏全局面板（sidebar.panellist + main）
   lib/hosts.js         # 主机解析（优先级、凭据、脱敏列表、默认私钥探测）+ 原子写 hosts 文件
   lib/ssh.js           # ssh2 懒加载 + 连接池 + connect options
   lib/exec.js          # 超时规范化、输出预算、exec 流收集

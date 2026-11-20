@@ -528,18 +528,19 @@ check('index.js 导出 inject/apply 并注册 13 个 remote_* 工具', () => {
   assert.ok(renderBlocks >= 13, 'render 数量不足')
 })
 
-check('client.js 语法可解析且注册会话 View + 左侧栏面板 + main 页', () => {
+check('client.js 语法可解析，只注册左侧栏面板 + keyed main（不注册会话内 View）', () => {
   assert.doesNotThrow(() => new Function(clientSource), 'client.js 语法错误')
-  assert.match(clientSource, /conversation\.view/)
+  // v2.8：会话内 View 与宿主 composer 同属 conversation.content —— 整页应用放进去，底部永远跟着聊天输入框，
+  // 宿主也没有隐藏 composer 的开关，所以只能走全局面板（同 dsh-aihot / docs/SPEC.md §4 的 v2 结论）。
+  assert.equal(/name:\s*'conversation\.view'/.test(clientSource), false, '不应再注册 conversation.view')
   assert.match(clientSource, /id:\s*'remote'/)
-  assert.match(clientSource, /order:\s*30/)
   assert.match(clientSource, /label:\s*\(\)\s*=>\s*'远程主机'/)
   assert.match(clientSource, /sidebar\.panellist/)
   assert.match(clientSource, /order:\s*60/)
   assert.match(clientSource, /name:\s*'main',\s*\n\s*key:\s*'remote'/)
   assert.match(clientSource, /data-dsh-panel-entry':\s*'remote'/)
   assert.match(clientSource, /viewBox:\s*'0 0 16 16'/)
-  assert.equal((clientSource.match(/ctx\.slots\.inject/g) || []).length, 3, '三个 slot 注册都应走 ctx.slots.inject')
+  assert.equal((clientSource.match(/ctx\.slots\.inject/g) || []).length, 2, '两个 slot 注册都应走 ctx.slots.inject')
   assert.match(clientSource, /require\('react'\)/)
   assert.equal(clientSource.includes('iframe'), false)
   assert.equal(clientSource.includes('document.body'), false)

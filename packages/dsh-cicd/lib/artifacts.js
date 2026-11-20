@@ -174,8 +174,23 @@ export function createArtifactStore({ dir, meta = null, pinned = [], refsReader 
     const target = digestPath(dir, digest)
     mkdirSync(join(target, '..'), { recursive: true })
     const existed = existsSync(target)
+    let repaired = false
     if (existed) {
-      try { unlinkSync(tmp) } catch { /* nothing to clean */ }
+      // 已存在不等于已完好：旧 blob 可能被人绕过 API 改过。新字节的 digest 刚算过，
+      // 所以旧字节对不上就拿它覆盖——否则「重新上传一份好的」永远修不好这份制品。
+      if (await hashOf(target) === digest) {
+        try { unlinkSync(tmp) } catch { /* nothing to clean */ }
+      } else {
+        // Windows 的 rename 不能覆盖已存在文件：先删坏的，再落新的，坏字节不留在 blob 目录里。
+        try { unlinkSync(target) } catch { /* already gone */ }
+        try {
+          renameSync(tmp, target)
+          repaired = true
+        } catch (error) {
+          try { unlinkSync(tmp) } catch { /* nothing to clean */ }
+          throw artifactError('ARTIFACT_WRITE_FAILED', `修复 ${digest} 失败：${error.message}`)
+        }
+      }
     } else {
       try {
         // rename 在同一文件系统内是原子的：`blobs/` 下永远不会出现半截文件。
@@ -188,7 +203,7 @@ export function createArtifactStore({ dir, meta = null, pinned = [], refsReader 
     if (meta) {
       try { meta.put({ digest, bytes, ...(extra || {}) }) } catch { /* 元数据是索引，不是事实来源 */ }
     }
-    return { digest, bytes, deduped: existed }
+    return { digest, bytes, deduped: existed, ...(repaired ? { repaired } : {}) }
   }
 
   /** 从目录/文件打包上传：调用方给出路径，这里负责算 digest。 */
@@ -197,7 +212,7 @@ export function createArtifactStore({ dir, meta = null, pinned = [], refsReader 
     return put(createReadStream(filePath), options)
   }
 
-  /** 流式读出。读之前重新验一遍 size，防止有人绕过 API 直接改磁盘。 */
+  /** 流式读出。完整性由 verify / assertIntact 负责；这里只确认字节还在，给出 size 与路径。 */
   function open(digest) {
     const stat = statOf(digest)
     if (!stat) throw artifactError('ARTIFACT_NOT_FOUND', `制品不存在：${digest}`)
@@ -222,14 +237,34 @@ export function createArtifactStore({ dir, meta = null, pinned = [], refsReader 
     }
   }
 
+  /** 把一整份字节读一遍算 sha256 —— verify / assertIntact / 去重前复核共用同一条路径。 */
+  async function hashOf(path) {
+    const hash = createHash(DIGEST_ALGORITHM)
+    for await (const chunk of createReadStream(path)) hash.update(chunk)
+    return `${DIGEST_ALGORITHM}:${hash.digest('hex')}`
+  }
+
   /** 全量重算一遍 sha256 —— GC 前的最后一道确认，代价 O(size)，只在人工巡检时用。 */
   async function verify(digest) {
     const stat = statOf(digest)
     if (!stat) return { digest: normalizeDigest(digest), ok: false, reason: 'missing' }
-    const hash = createHash(DIGEST_ALGORITHM)
-    for await (const chunk of createReadStream(stat.path)) hash.update(chunk)
-    const actual = `${DIGEST_ALGORITHM}:${hash.digest('hex')}`
+    let actual = ''
+    try { actual = await hashOf(stat.path) } catch { return { digest: stat.digest, ok: false, bytes: stat.bytes, actual, reason: 'unreadable' } }
     return { digest: stat.digest, ok: actual === stat.digest, bytes: stat.bytes, actual }
+  }
+
+  /**
+   * 下载前的完整性门：全量重算 sha256，对不上就拒绝发送。
+   * 只比 size 挡不住同长度篡改；digest 是内容地址，字节一变它就不再是「这份制品」。
+   */
+  async function assertIntact(digest) {
+    const stat = statOf(digest)
+    if (!stat) throw artifactError('ARTIFACT_NOT_FOUND', `制品不存在：${digest}`)
+    const actual = await hashOf(stat.path)
+    if (actual !== stat.digest) {
+      throw artifactError('ARTIFACT_CORRUPTED', `制品 ${stat.digest} 校验失败：磁盘上的字节是 ${actual}`, { digest: stat.digest, actual })
+    }
+    return stat
   }
 
   // ---- 指针（tag） --------------------------------------------------------------------------
@@ -390,7 +425,7 @@ export function createArtifactStore({ dir, meta = null, pinned = [], refsReader 
     return digestPath(dir, digest)
   }
 
-  return { dir, put, putFile, has, stat: statOf, open, createReadable, readRange, verify, putRef, readRef, removeRef, listRefs, listBlobs, references, gc, restore, listTrash, stats, pathOf, dispose }
+  return { dir, put, putFile, has, stat: statOf, open, createReadable, readRange, verify, assertIntact, putRef, readRef, removeRef, listRefs, listBlobs, references, gc, restore, listTrash, stats, pathOf, dispose }
 }
 
 /** `bytes=100-199` / `bytes=100-` / `bytes=-100`，越界或格式错返回 null（调用方按 200 全量返回）。 */

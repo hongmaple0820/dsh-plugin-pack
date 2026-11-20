@@ -851,6 +851,102 @@ check('apply：注册 37 个工具、49 条路由（45 exact + 4 prefix）、1 �
   assert.equal(typeof ctx.upgrades[0].handler, 'function')
 })
 
+/**
+ * DSH 里工具输出要过一遍 JSON Schema（子集：type / oneOf / properties / required / additionalProperties / items / enum）。
+ * 测试里自己做一遍同样的检查，否则「schema 写错」只有真实调用时才炸，而且炸在模型面前。
+ */
+function schemaViolations(schema, value, path = 'value') {
+  if (!schema || typeof schema !== 'object') return []
+  if (Array.isArray(schema.oneOf)) {
+    const matched = schema.oneOf.filter((branch) => schemaViolations(branch, value, path).length === 0)
+    return matched.length === 1 ? [] : [`${path} 必须恰好匹配一个 oneOf 分支（命中 ${matched.length} 个）`]
+  }
+  const type = schema.type
+  if (!type) return []
+  if (type === 'null') return value === null ? [] : [`${path} 必须是 null`]
+  if (type === 'object') {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return [`${path} 必须是对象`]
+    const violations = []
+    for (const key of schema.required || []) if (!Object.hasOwn(value, key)) violations.push(`${path}.${key} 缺失`)
+    for (const [key, sub] of Object.entries(schema.properties || {})) {
+      if (Object.hasOwn(value, key)) violations.push(...schemaViolations(sub, value[key], `${path}.${key}`))
+    }
+    return violations
+  }
+  if (type === 'array') {
+    if (!Array.isArray(value)) return [`${path} 必须是数组`]
+    const violations = []
+    value.forEach((item, index) => violations.push(...schemaViolations(schema.items, item, `${path}[${index}]`)))
+    return violations
+  }
+  if (type === 'number') return typeof value === 'number' && Number.isFinite(value) ? [] : [`${path} 必须是数字（实际 ${JSON.stringify(value)}）`]
+  if (type === 'integer') return Number.isInteger(value) ? [] : [`${path} 必须是整数（实际 ${JSON.stringify(value)}）`]
+  if (type === 'string') return typeof value === 'string' ? [] : [`${path} 必须是字符串（实际 ${JSON.stringify(value)}）`]
+  if (type === 'boolean') return typeof value === 'boolean' ? [] : [`${path} 必须是布尔（实际 ${JSON.stringify(value)}）`]
+  return []
+}
+
+checkAsync('P6-S1：只读工具的 schema 接受刚装好（空库、无样本）时的真实返回', async () => {
+  // 全新工作目录 = 第一次装完插件的样子：没有运行、没有样本、缓存目录还没建。
+  // 这些 null 是"没有数据"的诚实表达，schema 必须允许它，否则安装后第一次点开面板就是 INVALID_TOOL_OUTPUT。
+  const blankRoot = mkdtempSync(join(tmpdir(), 'cicd-blank-'))
+  const blankCtx = fakeContext()
+  apply(blankCtx, {
+    projects: [{ id: 'demo', name: 'Demo', path: projectDir, pipe: join(projectDir, 'pipe.yml') }],
+    workDir: join(blankRoot, 'state'),
+    remoteBase: 'http://127.0.0.1:1',
+    scheduler: { enabled: false },
+  })
+  ctx.effects.push(...blankCtx.effects.splice(0))
+  const readOnly = [
+    ['cicd_projects', {}],
+    ['cicd_project_meta', { project: 'demo' }],
+    ['cicd_onboarding', {}],
+    ['cicd_templates', { action: 'list' }],
+    ['cicd_validate', { project: 'demo' }],
+    ['cicd_plan', { project: 'demo' }],
+    ['cicd_targets', { project: 'demo' }],
+    ['cicd_environments', { project: 'demo' }],
+    ['cicd_releases', {}],
+    ['cicd_status', {}],
+    ['cicd_metrics', {}],
+    ['cicd_dora', {}],
+    ['cicd_audit', { action: 'list', limit: 3 }],
+    ['cicd_storage', {}],
+    ['cicd_database', {}],
+    ['cicd_cache_stats', {}],
+    ['cicd_secrets', {}],
+    ['cicd_locks', { action: 'list' }],
+    ['cicd_runners', { action: 'list' }],
+    ['cicd_triggers', { project: 'demo' }],
+    ['cicd_artifacts', { action: 'list' }],
+    ['cicd_artifacts', { action: 'catalog' }],
+    ['cicd_registry', { action: 'catalog' }],
+    ['cicd_toolchain', { action: 'list' }],
+    ['cicd_promotions', { action: 'list' }],
+    ['cicd_users', { action: 'list' }],
+    ['cicd_tokens', { action: 'list' }],
+    ['cicd_rbac', {}],
+    ['cicd_auth', { action: 'me' }],
+    ['cicd_notify_ledger', {}],
+  ]
+  const failures = []
+  for (const [name, args] of readOnly) {
+    const tool = blankCtx.toolsList.find((item) => item.name === name)
+    assert.ok(tool, `${name} 已注册`)
+    let value
+    try {
+      value = await tool.execute(args)
+    } catch (error) {
+      failures.push(`${name} ${JSON.stringify(args)} 执行抛错：${error.code || ''} ${error.message}`)
+      continue
+    }
+    const violations = schemaViolations(tool.output.schema, value)
+    if (violations.length) failures.push(`${name} ${JSON.stringify(args)}：${violations.slice(0, 3).join('; ')}`)
+  }
+  assert.deepEqual(failures, [])
+})
+
 check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补注册 45+4 条；remote() 惰性取 port', () => {
   const coldRoutes = []
   const coldUpgrades = []
@@ -3508,6 +3604,39 @@ checkAsync('验收①：Viewer 调 /run → 403 POLICY_DENY，且审计里留下
   }
 })
 
+checkAsync('P4-1：只有 owner 能授予角色 —— admin 建人/改角色 403 POLICY_DENY，owner 照常，且 deny 进审计', async () => {
+  // 这条钉的是 P4-1 的验收："Owner 才能授予"。admin 是能跑部署的角色，
+  // 所以一旦它也能建人提权，prod 审批与护栏就都可以被自己人绕过。
+  const escalate = await accCall('/users', `?action=create&email=escalate%40acc.test&password=${encodeURIComponent(ACC_PASSWORD)}&role=owner&confirm=1`, {
+    headers: { authorization: `Bearer ${accIds.approverToken}` },
+  })
+  assert.equal(escalate.status, 403, 'admin 不能建人')
+  assert.equal((await escalate.json()).code, 'POLICY_DENY')
+
+  const selfPromote = await accCall('/users', `?action=set-role&id=${encodeURIComponent(accIds.approver)}&role=owner&confirm=1`, {
+    headers: { authorization: `Bearer ${accIds.approverToken}` },
+  })
+  assert.equal(selfPromote.status, 403, 'admin 不能改角色（更别说给自己升 owner）')
+  assert.equal((await selfPromote.json()).code, 'POLICY_DENY')
+
+  const ownerAuth = { authorization: `Bearer ${accIds.adminToken}` }
+  const granted = await accCall('/users', `?action=create&email=p41%40acc.test&password=${encodeURIComponent(ACC_PASSWORD)}&role=viewer&confirm=1`, { headers: ownerAuth })
+  assert.equal(granted.status, 200, 'owner 能建人')
+  const newId = (await granted.json()).user.id
+  const promote = await accCall('/users', `?action=set-role&id=${encodeURIComponent(newId)}&role=operator&confirm=1`, { headers: ownerAuth })
+  assert.equal(promote.status, 200, 'owner 能授予项目级角色')
+  assert.equal((await promote.json()).membership.role, 'operator')
+
+  // 被拒的提权也要留痕：审计只记成功的高危操作等于没审计。
+  const audit = await accCall('/audit?name=policy.deny', '', { headers: ownerAuth })
+  assert.equal(audit.status, 200)
+  const rows = (await audit.json()).events
+  assert.ok(
+    rows.some((item) => item.result === 'deny' && item.actorId === accIds.approver),
+    'admin 被拒的那次必须进审计',
+  )
+})
+
 checkAsync('验收②：Admin 部署 prod 无审批 → APPROVAL_REQUIRED；到期收成 failed(approval_timeout)', async () => {
   const originalFetch = globalThis.fetch
   globalThis.fetch = envFetch
@@ -5578,6 +5707,45 @@ checkAsync('P5-S9：/artifacts 路由 —— 下载字节一致、Range 返回 2
   }
 })
 
+checkAsync('P5-S12：下载只发校验过的字节 —— 篡改后 GET 409，重新上传好字节把坏 blob 修回来', async () => {
+  const runtime = internals.createRuntime(fakeContext(), {
+    projects: [{ id: 'demo', path: projectDir }],
+    workDir: join(root, 'state'),
+    scheduler: { enabled: false },
+  })
+  try {
+    const uploaded = await runtime.artifacts({ action: 'upload', path: casFile('intact.bin', 'intact-bytes'), project: 'demo' })
+    const fresh = fakeContext()
+    internals.registerHttpRoutes(fresh, runtime)
+    const route = fresh.routes.find((item) => item.path === `${internals.ROUTE_PREFIX}/artifacts`)
+    const blobPath = internals.digestPath(join(root, 'state', 'artifacts'), uploaded.digest)
+    const bytes = readFileSync(blobPath)
+    bytes[0] = bytes[0] ^ 0xff
+    writeFileSync(blobPath, bytes)
+
+    // 下载路径自己挡住：坏字节不能发出去，且要说明是内容不符（409），不是 404/500。
+    const corrupted = await route.resource(
+      new Request(`http://x/api/plugins/cicd/artifacts?digest=${uploaded.digest}`, { headers: { 'x-dsh-cicd': '1' } }),
+    )
+    assert.equal(corrupted.status, 409)
+    assert.equal((await corrupted.json()).code, 'ARTIFACT_CORRUPTED')
+
+    // 重新上传同一份好字节：digest 命中已有 blob，但坏字节必须被换掉（repaired），否则这份制品永远修不好。
+    const repaired = await runtime.artifacts({ action: 'upload', path: casFile('intact-again.bin', 'intact-bytes'), project: 'demo' })
+    assert.equal(repaired.digest, uploaded.digest)
+    assert.equal(repaired.repaired, true)
+    assert.equal((await runtime.artifacts({ action: 'verify', digest: uploaded.digest })).ok, true)
+
+    const fixed = await route.resource(
+      new Request(`http://x/api/plugins/cicd/artifacts?digest=${uploaded.digest}`, { headers: { 'x-dsh-cicd': '1' } }),
+    )
+    assert.equal(fixed.status, 200)
+    assert.equal(Buffer.from(await fixed.arrayBuffer()).toString(), 'intact-bytes')
+  } finally {
+    runtime.dispose()
+  }
+})
+
 checkAsync('P5-S10：写操作一律要 confirm 与 x-dsh-cicd 头，缺一即拒', async () => {
   const runtime = internals.createRuntime(fakeContext(), {
     projects: [{ id: 'demo', path: projectDir }],
@@ -5957,6 +6125,47 @@ check('P5-S11：DB —— 制品表随 v10 迁出、晋级表随 v12 迁出，ar
     ])
     assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE name = 'idx_promotions_digest'").get())
   } finally { db.close() }
+})
+
+// 前端没有浏览器用例，但有一个只能靠肉眼发现的失败模式：渲染期就抛 ReferenceError 会被 DSH 的
+// slot 错误边界吞掉，面板直接一片空白（v3.0 曾因此「点流水线什么都没」）。这里钉住可静态判定的
+// 那一类：useEffect/useCallback 的依赖数组在渲染期求值，引用更后面才声明的 const 就是 TDZ。
+check('client.js：依赖数组不引用「本文件更后面才声明的 const」（首帧 TDZ → 面板静默空白）', () => {
+  const raw = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
+  // 注释按等长空格抹掉，避免被注释掉的声明伪造「唯一声明」。
+  const source = raw.replace(/\/\*[\s\S]*?\*\//g, (match) => ' '.repeat(match.length))
+    .replace(/(^|[^:])\/\/[^\n]*/g, (match, lead) => lead + ' '.repeat(match.length - lead.length))
+  const declarations = new Map()
+  for (const match of source.matchAll(/(?:^|[^\w$.])(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=/g)) {
+    const name = match[1]
+    const offset = match.index + match[0].length - match[1].length - 1
+    declarations.set(name, [...(declarations.get(name) || []), offset])
+  }
+  const offenders = []
+  for (const match of source.matchAll(/\[\s*([A-Za-z_$][\w$]*(?:\s*,\s*[A-Za-z_$][\w$]*)*)\s*\]\s*\)/g)) {
+    const base = match.index + 1
+    for (const name of match[1].split(',').map((item) => item.trim())) {
+      const declared = declarations.get(name)
+      // 只认「全文件唯一声明且在其后」——多处同名就要做作用域分析，宁可漏报也不误报。
+      if (declared && declared.length === 1 && declared[0] > base) {
+        const line = source.slice(0, base).split('\n').length
+        offenders.push(`line ${line}: ${name} 声明在 line ${source.slice(0, declared[0]).split('\n').length}`)
+      }
+    }
+  }
+  assert.deepEqual(offenders, [], '依赖数组引用更后声明的 const，渲染期必抛 ReferenceError：\n' + offenders.join('\n'))
+})
+
+// 冒烟测不到「页面长什么样」，但能钉住入口契约：整页应用只能挂 keyed 'main'。
+// conversation.view 和宿主 composer 同属 conversation.content，注册它 = 页面底部永远跟着聊天输入框
+// （用户 v3.0 报的「独立页面怎么有输入框」，同 dsh-aihot / docs/SPEC.md §4 的 v2 结论）。
+check('client.js：只注册全局面板（panellist + keyed main），不注册会话内 View', () => {
+  const raw = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
+  const source = raw.replace(/\/\*[\s\S]*?\*\//g, (match) => ' '.repeat(match.length))
+    .replace(/(^|[^:])\/\/[^\n]*/g, (match, lead) => lead + ' '.repeat(match.length - lead.length))
+  assert.equal(/'conversation\.view'/.test(source), false, '不应再注册 conversation.view（会连带渲染宿主 composer）')
+  assert.match(source, /slots\.inject\('sidebar\.panellist'/)
+  assert.match(source, /name:\s*'main',\s*\n\s*key:\s*PANEL_ID/)
 })
 
 let passed = 0

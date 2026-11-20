@@ -1654,59 +1654,149 @@ window.__ModuleLoader__.load({
             : null))
     }
 
-    /** v0.6 C：审计时间线（整页视图）：时间 / 动作 / 目标 / 主机 / 版本 / 状态。 */
-    function AuditView({ state, limit, onLimit, onRefresh }) {
+
+    /**
+     * v3.0-P4-5：审计页读的是哈希链本身（/audit），不是旧的 /operations 时间线。
+     * 旧的 operations 只有「发生了什么」一列，出事时最需要的三件事它一件都答不上：
+     * 谁干的（actorId + 认证方式）、允许还是拒绝（result）、这条记录被动过吗（哈希链）。
+     * 所以筛选落在 action / actor / result 上，并配「校验哈希链」与 CSV 导出 ——
+     * 审计页的意义在于出事之后能拿去对质，只能看不能导的日志留不住证据。
+     */
+    const AUDIT_RESULTS = ['', 'allow', 'deny']
+    const AUDIT_RESULT_LABELS = { allow: '允许', deny: '拒绝', error: '出错' }
+    /** 动作名取最后一段匹配（deploy.prod → prod），未命中退回 operations 的小表，再不行原样显示。 */
+    const AUDIT_ACTION_LABELS = {
+      run: '运行',
+      deploy: '部署',
+      rollback: '回滚',
+      approve: '审批',
+      login: '登录',
+      logout: '登出',
+      user: '用户',
+      member: '成员',
+      token: 'Token',
+      secret: 'Secret',
+      lock: '部署锁',
+      runner: '构建主机',
+      policy: '权限',
+      db: '数据库',
+      artifact: '制品',
+      env: '环境',
+      config: '配置',
+    }
+    function auditLabel(action) {
+      const text = String(action || '')
+      if (!text) return '未知动作'
+      const tail = text.includes('.') ? text.slice(text.lastIndexOf('.') + 1) : text
+      return AUDIT_ACTION_LABELS[tail] || operationLabel(text)
+    }
+
+    function AuditView({ state, filters, onFilter, onRefresh, onVerify, onExport }) {
       const items = Array.isArray(state.items) ? state.items : []
-      const unsupported = Boolean(state.unsupported)
+      const stats = state.stats || null
+      const verify = state.verify || null
       const loading = state.status === 'loading'
+      const unsupported = Boolean(state.unsupported)
+      const current = filters || {}
+      const bind = (key) => (event) => onFilter(key, event.currentTarget.value)
       return h('div', { className: 'cicd-audit' },
         h('div', { className: 'cicd-audit-head' },
-          h('span', { className: 'cicd-col-title' }, '操作审计' + (items.length > 0 ? '（' + items.length + '）' : '')),
-          h('select', {
-            className: 'cicd-select cicd-audit-limit',
-            value: String(limit),
-            onChange: (event) => onLimit(Number(event.currentTarget.value) || AUDIT_DEFAULT_LIMIT),
-            'aria-label': '审计条数',
-          }, AUDIT_LIMITS.map((value) => h('option', { key: value, value: String(value) }, '最近 ' + value + ' 条'))),
+          h('span', { className: 'cicd-col-title' }, '操作审计'
+            + (stats && typeof stats.events === 'number'
+              ? '（链上共 ' + stats.events + ' 条' + (stats.denied ? '，被拒 ' + stats.denied + ' 条' : '') + '）'
+              : (items.length > 0 ? '（' + items.length + '）' : ''))),
+          h('button', {
+            className: 'cicd-button cicd-audit-verify',
+            type: 'button',
+            onClick: onVerify,
+            disabled: loading || Boolean(state.verifying) || unsupported,
+            title: '逐条重算哈希链：任何一条被改过都会指出断在第几条',
+          }, state.verifying ? '校链…中' : (verify ? '重新校链' : '校验哈希链')),
+          h('button', {
+            className: 'cicd-button cicd-audit-export',
+            type: 'button',
+            onClick: onExport,
+            disabled: items.length === 0,
+            title: '把当前筛出的记录导成 CSV（含每条哈希）',
+          }, '导出 CSV'),
           h('button', {
             className: 'cicd-button cicd-audit-refresh',
             type: 'button',
             onClick: onRefresh,
-            disabled: loading,
+            disabled: loading || unsupported,
           }, loading ? '刷新…中' : '刷新')),
-        // 旧 Host 没有 /operations：这不是错误，只是还没升级。
-        unsupported ? h(EmptyState, { tone: 'unavailable', title: '审计不可用', text: '当前 Host 版本没有 /audit 路由。', hint: '升级到 v0.6 之后可用；升级后刷新本页。' }) : null,
-        !unsupported && loading ? h(LoadingState, { text: '正在读取操作记录…', rows: 3 }) : null,
+        verify && verify.status === 'ok'
+          ? h('p', { className: 'cicd-audit-verify-ok' }, '哈希链完整：重算 ' + verify.count + ' 条，末条哈希 '
+            + String(verify.tail || '').slice(0, 12) + '…')
+          : null,
+        verify && verify.status === 'broken'
+          ? h('div', { className: 'cicd-audit-verify-broken', role: 'alert' },
+              h('span', { className: 'cicd-audit-verify-title' }, '哈希链在第 ' + verify.brokenSeq + ' 条断裂（'
+                + (verify.kind === 'prev_hash' ? '上一条哈希对不上' : '本条哈希对不上') + '）'),
+              h('span', { className: 'cicd-audit-verify-detail' }, '期望 ' + String(verify.expected || '').slice(0, 12)
+                + '…，实际 ' + String(verify.actual || '').slice(0, 12)
+                + '… —— 这一条之后的内容都不能再当证据。'))
+          : null,
+        verify && verify.status === 'error' ? h(ErrorState, { title: '校链失败', error: verify.error, onRetry: onVerify }) : null,
+        // 旧 Host 没有 /audit：这不是错误，只是还没升级。
+        unsupported ? h(EmptyState, { tone: 'unavailable', title: '审计不可用', text: '当前 Host 版本没有 /audit 路由。', hint: '升级 dsh-cicd 到 v3.0 之后可用；升级后刷新本页。' }) : null,
+        !unsupported && loading && items.length === 0 ? h(LoadingState, { text: '正在读取操作记录…', rows: 3 }) : null,
         !unsupported && state.status === 'error' ? h(ErrorState, { title: '读取操作记录失败', error: state.error, onRetry: onRefresh }) : null,
         !unsupported && !loading && state.status !== 'error' && items.length === 0
-          ? h(EmptyState, { text: '还没有操作记录。', hint: '运行、部署、回滚、审批都会在这里留一条带哈希的记录。' })
+          ? h(EmptyState, { text: '没有符合条件的记录。', hint: '换个筛选条件，或把动作名留空再试。' })
           : null,
         items.length > 0
           ? h('div', { className: 'cicd-table-wrap' },
-            h('table', { className: 'cicd-table cicd-audit-table' },
-              h('thead', null, h('tr', null,
-                ['时间', '动作', '目标', '主机', '版本', '状态'].map((label) => h('th', { key: label }, label)))),
-              h('tbody', null, items.map((operation, index) => {
-                const action = (operation && operation.action) || ''
-                const tone = OPERATION_TONES[action] || ''
-                const status = operation && operation.status ? String(operation.status) : ''
-                const detail = operation && operation.detail ? String(operation.detail) : ''
-                return h('tr', {
-                  key: (operation && operation.id !== undefined ? 'op-' + operation.id : 'op-' + index),
-                  className: 'cicd-audit-row' + (tone ? ' is-' + action : ''),
-                  title: [operation && operation.runId ? 'run ' + operation.runId : '', detail].filter(Boolean).join(' · '),
-                  'data-dsh-cicd-action': action,
-                },
-                h('td', { className: 'cicd-audit-cell cicd-audit-time cicd-mono' }, formatTime(operation && operation.at)),
-                h('td', { className: 'cicd-audit-cell' },
-                  h('span', { className: 'cicd-audit-action' + (tone ? ' is-' + action : '') }, operationLabel(action))),
-                h('td', { className: 'cicd-audit-cell cicd-audit-target' }, (operation && operation.target) || '—'),
-                h('td', { className: 'cicd-audit-cell cicd-audit-host' }, (operation && operation.host) || '—'),
-                h('td', { className: 'cicd-audit-cell cicd-audit-release cicd-mono' }, operation && operation.releaseId ? shortId(operation.releaseId, 20) : '—'),
-                h('td', { className: 'cicd-audit-cell' }, status
-                  ? h('span', { className: 'cicd-status is-' + (STATUS_LABELS[status] ? status : 'queued') }, STATUS_LABELS[status] || status)
-                  : '—'))
-              }))))
+              h('table', { className: 'cicd-table cicd-audit-table' },
+                h('thead', null, h('tr', null,
+                  ['#', '时间', '动作', '是谁', '结果', '对象', '项目', '原因'].map((label) => h('th', { key: label }, label)))),
+                h('tbody', null, items.map((row) => {
+                  const action = String(row.action || '')
+                  const result = String(row.result || '')
+                  const who = [row.actorId, row.authMethod ? '(' + row.authMethod + ')' : ''].filter(Boolean).join(' ')
+                  return h('tr', {
+                    key: 'audit-' + row.seq,
+                    className: 'cicd-audit-row' + (result === 'deny' ? ' is-deny' : ''),
+                    title: 'seq ' + row.seq + ' · hash ' + String(row.hash || '') + ' · prev ' + String(row.prevHash || ''),
+                    'data-dsh-cicd-action': action,
+                  },
+                    h('td', { className: 'cicd-audit-cell cicd-audit-seq cicd-mono' }, String(row.seq)),
+                    h('td', { className: 'cicd-audit-cell cicd-audit-time cicd-mono' }, formatTime(row.ts)),
+                    h('td', { className: 'cicd-audit-cell' },
+                      h('span', { className: 'cicd-audit-action' + (result === 'deny' ? ' is-deny' : '') }, auditLabel(action))),
+                    h('td', { className: 'cicd-audit-cell cicd-audit-actor' }, who || '匿名'),
+                    h('td', { className: 'cicd-audit-cell' }, result
+                      ? h('span', { className: 'cicd-status is-' + result }, AUDIT_RESULT_LABELS[result] || result)
+                      : '—'),
+                    h('td', { className: 'cicd-audit-cell cicd-audit-resource' }, [row.resourceType, row.resourceId].filter(Boolean).join(' ') || '—'),
+                    h('td', { className: 'cicd-audit-cell cicd-audit-project' }, row.projectId || '—'),
+                    h('td', { className: 'cicd-audit-cell cicd-audit-reason' }, row.reason || '—'))
+                }))))
+          : null,
+        !unsupported && items.length > 0
+          ? h('div', { className: 'cicd-audit-filters' },
+              h('input', {
+                className: 'cicd-form-input cicd-audit-filter',
+                value: current.action || '',
+                onChange: bind('action'),
+                placeholder: '动作前缀，如 deploy / policy',
+                'aria-label': '按动作筛选',
+              }),
+              h('input', {
+                className: 'cicd-form-input cicd-audit-filter',
+                value: current.actor || '',
+                onChange: bind('actor'),
+                placeholder: '操作人 id / 邮箱',
+                'aria-label': '按操作人筛选',
+              }),
+              h('select', {
+                className: 'cicd-select cicd-audit-filter cicd-audit-result',
+                value: current.result || '',
+                onChange: bind('result'),
+                'aria-label': '按结果筛选',
+              }, AUDIT_RESULTS.map((value) => h('option', { key: value || 'all', value: value },
+                value === '' ? '允许与拒绝' : (AUDIT_RESULT_LABELS[value] || value)))),
+              h('span', { className: 'cicd-audit-filter-hint' }, '筛选后最多显示 200 条；「校验哈希链」会重算最后 ' + (state.verifyLimit || 1000) + ' 条。'))
           : null)
     }
 
@@ -2892,9 +2982,11 @@ window.__ModuleLoader__.load({
         if (view === 'secrets') void loadSecrets(projectId)
         if (view === 'runners') void loadRunners()
         if (view === 'environments') void loadEnvironments(projectId)
-        if (view === 'create') void loadTemplates()
         if (view === 'guide') void loadGuide(projectId)
-      }, [clearArmed, clearRollback, loadProjects, loadTargets, loadRuns, loadReleases, projectId, targetName, view, loadAudit, auditLimit, loadTemplates, loadApprovals, loadRbac, loadSecrets, loadRunners, loadEnvironments])
+        // `loadTemplates` 在下面才声明，放进这个 effect 的依赖数组会在首帧就读到未初始化的 const
+        // （ReferenceError: Cannot access 'loadTemplates' before initialization，整块面板随之渲染空白）；
+        // 模板清单由下面单独的 `view === 'create'` effect 负责，这里不重复拉取。
+      }, [clearArmed, clearRollback, loadProjects, loadTargets, loadRuns, loadReleases, projectId, targetName, view, loadAudit, auditLimit, loadApprovals, loadRbac, loadSecrets, loadRunners, loadEnvironments])
 
       /**
        * v3.0-P0：进入各视图时按需拉自己的数据。
@@ -3715,13 +3807,9 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         ctx.effect(() => installStyles(), 'dsh-cicd: page styles')
 
-        // 会话内视图：沿用 remote / aihot 的既有入口形态。
-        ctx.effect(() => ctx.slots.inject('conversation.view', () => ctx.slots.register({
-          name: 'conversation.view',
-          id: PANEL_ID,
-          order: 70,
-          label: () => '流水线',
-        }, CicdPage)), 'dsh-cicd: conversation view')
+        // 不再注册 conversation.view（与 dsh-aihot / SPEC.md §4 一致）：会话内 View 与宿主 composer
+        // 同属 conversation.content，整页应用放进去下面永远跟着聊天输入框；keyed 'main' 槽才是独立页面。
+        // 顺带避开 shell 按会话持久化「当前 View」的坑：曾点进来的会话不会每次都被带回本页。
 
         // 左侧栏全局面板行：只提供字形，行框 / label / 高亮 / 折叠都属于 shell。
         ctx.effect(() => ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
