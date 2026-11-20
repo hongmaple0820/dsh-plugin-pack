@@ -42,6 +42,7 @@ import { cronMatches, minuteKey } from './lib/cron.js'
 import { createScheduler } from './lib/scheduler.js'
 import { summarizeDora, summarizeRunQuality } from './lib/dora.js'
 import { createTaskBroker, createRemoteExecutor, joinTokenMatches } from './lib/executors.js'
+import { createRunnerV2Service, RUNNER_V2_PATH } from './lib/runner-v2.js'
 import { createSecretStore } from './lib/secrets.js'
 import { createArtifactStore, normalizeDigest, digestPath, parseRange, artifactError } from './lib/artifacts.js'
 import {
@@ -580,6 +581,10 @@ function createRuntime(ctx, config) {
   // heartbeatSec 不在这里传：库里的 runner 行存的是注册那一刻的 intervalSec，
   // 换配置只影响之后的注册，不去改已有机器的心跳约定（否则改一次间隔，所有在线机器同时被判死）。
   const runners = createRunnerRegistry({ db: store.db, now: options.runners?.now })
+  // 云流水线 M1：协议 v2 服务（register/heartbeat/claim/logs/complete，Bearer token 认证）。
+  // 纯调度层挂在 runtime 上，HTTP 适配器由 registerHttpRoutes 注册成 handler 路由——
+  // resource 路由只答 GET，v2 的 POST/JSON body/长轮询必须走 handler 路由。
+  const runnerV2 = createRunnerV2Service({ runners, broker, options, audit, store })
   // v3.0-P2：工具链托管（JDK/Node/Python/Maven…）。store 在 workDir 下，所以同一台机器上
   // 所有项目共享一份下载与解包结果；锁文件放项目的 pipe.lock，跟着仓库走。
   const toolchainRoot = options.toolchain?.storeDir || join(options.workDir, 'toolchains')
@@ -2882,6 +2887,25 @@ function createRuntime(ctx, config) {
       try { store.appendOperation({ action: 'runner-deregister', project: runnerId, status: 'ok', detail: '' }) } catch { /* best effort */ }
       try { audit.record({ action: 'runner.deregister', actorId: '', authMethod: 'runner-token', resourceType: 'runner', resourceId: runnerId, result: 'allow', reason: 'self-deregister' }) } catch { /* best effort */ }
       return { ok: true, runnerId }
+    },
+    /**
+     * 云流水线 M1：v2 协议调度入口（纯函数，不碰 socket）。
+     * path 是去掉 /runner/v2 前缀后的子路径；token 是 Bearer 里的明文，只在这里与摘要比对。
+     */
+    runnerProtocol({ method = 'POST', path = '', token = '', body = null } = {}) {
+      return runnerV2.dispatch({ method, path, token, body })
+    },
+    /** HTTP 适配器（handler 路由直接挂它）。 */
+    get runnerV2() { return runnerV2 },
+    /** 任务队列（v2 服务与远端 executor 共用同一个实例；测试用它对上真实入队路径）。 */
+    get runnerV2Broker() { return broker },
+    /** 给远端机器签发一次性 join token（M1 简化：与全局 joinToken 二选一，同样落 sha256）。 */
+    runnerV2Info() {
+      return {
+        path: `${ROUTE_PREFIX}${RUNNER_V2_PATH}`,
+        joinTokenConfigured: Boolean(options.runners?.joinToken),
+        runners: runners.list().filter((row) => row.protocol === 2).map((row) => ({ runnerId: row.runnerId, status: row.status, lastSeenAt: row.lastSeenAt, version: row.version })),
+      }
     },
     /** 管理员吊销：立即生效（不能等心跳超时），并取消它正在跑的任务。 */
     runnerRevoke({ runnerId, by = '', reason = '' } = {}) {
@@ -7617,6 +7641,23 @@ function registerHttpRoutes(ctx, runtime) {
       if (dispose) ctx.effect(() => dispose)
     } catch { /* the tools still work without a page host */ }
   }
+  // 云流水线 M1：Runner 协议 v2 必须挂 handler 路由——resource 路由只答 GET/HEAD
+  // （DSH webserver 对非 GET 直接 405 且不读 body），v2 的 POST + JSON body + 长轮询 claim
+  // 全部靠 handler 拿到原始 IncomingMessage/ServerResponse。
+  // auth 用 'anonymous' + handler 内自验 Bearer token：跨机构建机没有浏览器同源身份，
+  // 与 v1 的 /runner-* 同一个模型（鉴权在协议层，不在连接层）。
+  try {
+    const handle = web.register({
+      kind: 'prefix',
+      path: `${ROUTE_PREFIX}${RUNNER_V2_PATH}`,
+      auth: 'anonymous',
+      // 经过 runtime 拿服务，而不是闭包捕获模块内的 runnerV2：registerHttpRoutes 是独立导出，
+      // 测试与冷启动补注册都直接调它，闭包会让它引用一个不存在的变量。
+      handler: (req, res) => { runtime.runnerV2.httpHandler(req, res) },
+    })
+    const dispose = typeof handle === 'function' ? handle : handle?.dispose ? () => handle.dispose() : null
+    if (dispose) ctx.effect(() => dispose)
+  } catch { /* 老 Host 不支持 handler 路由时 v2 不可用，v1 仍工作 */ }
   // V2-M1：实时日志走 WebSocket upgrade（同源浏览器直连，不需要第二个端口）。
   if (typeof web.registerUpgrade === 'function') {
     try {
@@ -7688,6 +7729,9 @@ export const internals = {
   createTaskBroker,
   createRemoteExecutor,
   joinTokenMatches,
+  // 云流水线 M1：Runner 协议 v2（handler 路由 + Bearer token + 长轮询 claim）
+  createRunnerV2Service,
+  RUNNER_V2_PATH,
   createApprovalGate,
   createSecretStore,
   normalizeEnvironments,

@@ -345,6 +345,31 @@ export function createTaskBroker({ onTaskForRunner = null, log = () => {} } = {}
     return null
   }
 
+  /**
+   * 协议 v2：批量回报日志，带全局递增 seq，按 (taskId, seq) 去重。
+   * 链路会丢包重发（日志 HTTP 失败重试、complete 幂等重放），同一条行重复到达是常态；
+   * 去重靠每个 task 自身的 seqSeen 集合，重启后丢集合只是极小概率的重复行，可接受。
+   * 返回 { accepted, dropped }，调用方原样透出给 runner 当回执。
+   */
+  function reportLogBatch(taskId, entries) {
+    const task = tasks.get(taskId)
+    if (!task) return { accepted: 0, dropped: 0, unknown: true }
+    if (!task.seqSeen) task.seqSeen = new Set()
+    let accepted = 0
+    let dropped = 0
+    const sorted = (Array.isArray(entries) ? entries : [])
+      .filter((entry) => entry && Number.isFinite(entry.seq))
+      .map((entry) => ({ seq: Number(entry.seq), text: String(entry.text ?? '') }))
+      .sort((a, b) => a.seq - b.seq)
+    for (const entry of sorted) {
+      if (task.seqSeen.has(entry.seq)) { dropped += 1; continue }
+      task.seqSeen.add(entry.seq)
+      accepted += 1
+      reportLog(taskId, entry.text)
+    }
+    return { accepted, dropped }
+  }
+
   /** runner 端逐行回报日志。 */
   function reportLog(taskId, line) {
     const task = tasks.get(taskId)
@@ -477,6 +502,7 @@ export function createTaskBroker({ onTaskForRunner = null, log = () => {} } = {}
     task: (taskId) => tasks.get(taskId) || null,
     taskForRunner,
     reportLog,
+    reportLogBatch,
     resolve,
     cancelAll,
     activeFor,

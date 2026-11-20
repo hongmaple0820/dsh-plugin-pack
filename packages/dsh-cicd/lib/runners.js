@@ -59,13 +59,14 @@ export function createRunnerRegistry({ db, heartbeatSec = DEFAULT_HEARTBEAT_SEC,
 
   const stmts = {
     upsert: db.prepare(`
-      INSERT INTO runners (runner_id, labels, version, capacity, status, registered_at, last_seen_at, revoked_at, revoked_by)
-      VALUES (?, ?, ?, ?, 'active', ?, ?, '', '')
+      INSERT INTO runners (runner_id, labels, version, capacity, status, registered_at, last_seen_at, revoked_at, revoked_by, protocol)
+      VALUES (?, ?, ?, ?, 'active', ?, ?, '', '', ?)
       ON CONFLICT(runner_id) DO UPDATE SET
         labels = excluded.labels,
         version = excluded.version,
         capacity = excluded.capacity,
         last_seen_at = excluded.last_seen_at,
+        protocol = excluded.protocol,
         status = CASE WHEN runners.status = 'revoked' THEN 'revoked' ELSE 'active' END
     `),
     touch: db.prepare(`UPDATE runners SET last_seen_at = ? WHERE runner_id = ?`),
@@ -73,6 +74,9 @@ export function createRunnerRegistry({ db, heartbeatSec = DEFAULT_HEARTBEAT_SEC,
     selectAll: db.prepare(`SELECT * FROM runners ORDER BY runner_id`),
     revoke: db.prepare(`UPDATE runners SET status = 'revoked', revoked_at = ?, revoked_by = ? WHERE runner_id = ?`),
     remove: db.prepare(`DELETE FROM runners WHERE runner_id = ?`),
+    // 协议 v2：runner token 只存 sha256 摘要，明文只在注册响应里出现一次。
+    setToken: db.prepare(`UPDATE runners SET token_sha256 = ?, joined_at = ?, protocol = 2 WHERE runner_id = ?`),
+    tokenSha: db.prepare(`SELECT token_sha256 AS sha FROM runners WHERE runner_id = ?`),
   }
 
   let cache = null
@@ -109,6 +113,8 @@ export function createRunnerRegistry({ db, heartbeatSec = DEFAULT_HEARTBEAT_SEC,
       revokedBy: String(row.revoked_by || ''),
       heartbeatSec: intervalSec,
       offlineAfterSec: intervalSec * OFFLINE_MULTIPLIER,
+      // 协议版本：1 = 旧 GET 轮询，2 = 云流水线 POST+token。老库行默认 1。
+      protocol: Number(row.protocol || 1),
     }
   }
 
@@ -125,13 +131,13 @@ export function createRunnerRegistry({ db, heartbeatSec = DEFAULT_HEARTBEAT_SEC,
   }
 
   /** 注册（幂等）：吊销过的 runner 重新注册**不会**复活，必须先 unrevoke（手工改库或重新加入）。 */
-  function register(runnerId, { labels = [], version = '', capacity = 1 } = {}) {
+  function register(runnerId, { labels = [], version = '', capacity = 1, protocol = 1 } = {}) {
     const id = String(runnerId || '').trim()
     if (!id) throw Object.assign(new Error('runnerId 不能为空'), { code: 'RUNNER_NOT_FOUND' })
     const labelText = Array.isArray(labels) ? labels.join(',') : String(labels || '').split(',').map((s) => s.trim()).filter(Boolean).join(',')
     const cap = Number.isInteger(capacity) && capacity > 0 ? capacity : 1
     const stamp = nowIso(now)
-    stmts.upsert.run(id, labelText, String(version || ''), cap, stamp, stamp)
+    stmts.upsert.run(id, labelText, String(version || ''), cap, stamp, stamp, protocol === 2 ? 2 : 1)
     invalidate()
     const row = shape(stmts.selectOne.get(id))
     if (row && row.revoked) {
@@ -171,6 +177,26 @@ export function createRunnerRegistry({ db, heartbeatSec = DEFAULT_HEARTBEAT_SEC,
     stmts.revoke.run(nowIso(now), String(by || ''), id)
     invalidate()
     return { ...describe(id), reason: String(reason || '') }
+  }
+
+  /**
+   * 协议 v2：写入 runner token 的 sha256 摘要并标记协议版本。
+   * 重复注册（重装机器、token 轮换）直接覆盖——旧摘要随之失效，旧 token 立刻作废。
+   */
+  function setToken(runnerId, sha) {
+    const id = String(runnerId || '').trim()
+    if (!id) throw Object.assign(new Error('runnerId 不能为空'), { code: 'RUNNER_NOT_FOUND' })
+    stmts.setToken.run(String(sha || ''), nowIso(now), id)
+    invalidate()
+    return { ok: true, runnerId: id }
+  }
+
+  /** 读取 runner token 摘要；没领过 v2 token 的（老 v1 机器）返回空串。 */
+  function tokenSha(runnerId) {
+    const id = String(runnerId || '').trim()
+    if (!id) return ''
+    const row = stmts.tokenSha.get(id)
+    return String(row?.sha || '')
   }
 
   /** 永久删除（用于测试与清理误注册）。 */
@@ -213,6 +239,8 @@ export function createRunnerRegistry({ db, heartbeatSec = DEFAULT_HEARTBEAT_SEC,
     isRunnable,
     sweep,
     invalidate,
+    setToken,
+    tokenSha,
     heartbeatSec: intervalSec,
     offlineAfterSec: intervalSec * OFFLINE_MULTIPLIER,
   }

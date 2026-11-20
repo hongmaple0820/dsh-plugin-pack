@@ -812,7 +812,7 @@ function callPath(pathname, query = '', { headers = {} } = {}) {
   return route.resource(new Request(`http://x${pathname}${query}`, { headers }))
 }
 
-check('apply：注册 37 个工具、49 条路由（45 exact + 4 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
+check('apply：注册 37 个工具、49 条资源路由（45 exact + 4 prefix）、1 条 v2 handler 路由、1 条 WS upgrade 与 runtime disposer', () => {
   assert.equal(ctx.toolsList.length, 37)
   assert.deepEqual(ctx.toolsList.map((tool) => tool.name).sort(), [
     'cicd_approve', 'cicd_artifacts', 'cicd_audit', 'cicd_auth', 'cicd_cache_stats', 'cicd_cancel', 'cicd_database', 'cicd_database_switch', 'cicd_dora', 'cicd_environments',
@@ -828,8 +828,17 @@ check('apply：注册 37 个工具、49 条路由（45 exact + 4 prefix）、1 �
     assert.equal(typeof tool.output.render, 'function')
     assert.equal(typeof tool.execute, 'function')
   }
-  assert.equal(ctx.routes.length, 49)
-  assert.deepEqual(ctx.routes.filter((route) => route.kind === 'exact').map((route) => route.path).sort(), [
+  // Runner 协议 v2 必须是 handler 路由（resource 路由只答 GET，装不下 POST + JSON body + 长轮询 claim），
+  // 所以先把它摘出来，剩下的仍按资源路由的清单逐条比对。
+  const v2Routes = ctx.routes.filter((route) => typeof route.handler === 'function')
+  const resourceRoutes = ctx.routes.filter((route) => typeof route.resource === 'function')
+  assert.equal(ctx.routes.length, 50)
+  assert.equal(v2Routes.length, 1)
+  assert.equal(v2Routes[0].path, '/api/plugins/cicd/runner/v2')
+  assert.equal(v2Routes[0].kind, 'prefix')
+  assert.equal(v2Routes[0].auth, 'anonymous', '跨机构建机靠协议层 Bearer token 自验，连接层必须匿名')
+  assert.equal(resourceRoutes.length, 49)
+  assert.deepEqual(resourceRoutes.filter((route) => route.kind === 'exact').map((route) => route.path).sort(), [
     '/api/plugins/cicd/approvals', '/api/plugins/cicd/approve', '/api/plugins/cicd/artifacts', '/api/plugins/cicd/audit', '/api/plugins/cicd/auth',
     '/api/plugins/cicd/cache-stats', '/api/plugins/cicd/cancel', '/api/plugins/cicd/database', '/api/plugins/cicd/database/switch', '/api/plugins/cicd/dora',
     '/api/plugins/cicd/environments', '/api/plugins/cicd/locks',
@@ -842,10 +851,10 @@ check('apply：注册 37 个工具、49 条路由（45 exact + 4 prefix）、1 �
     '/api/plugins/cicd/targets',
     '/api/plugins/cicd/template-save', '/api/plugins/cicd/templates', '/api/plugins/cicd/tokens', '/api/plugins/cicd/toolchain', '/api/plugins/cicd/triggers', '/api/plugins/cicd/users', '/api/plugins/cicd/validate',
   ])
-  assert.deepEqual(ctx.routes.filter((route) => route.kind === 'prefix').map((route) => route.path), [
+  assert.deepEqual(resourceRoutes.filter((route) => route.kind === 'prefix').map((route) => route.path), [
     '/api/plugins/cicd/hooks', '/api/plugins/cicd/v2', '/api/plugins/cicd/repository', '/api/plugins/cicd/simple',
   ])
-  assert.ok(ctx.routes.every((route) => typeof route.resource === 'function' && !route.handler))
+  assert.ok(resourceRoutes.every((route) => typeof route.resource === 'function' && !route.handler))
   assert.equal(ctx.upgrades.length, 1)
   assert.equal(ctx.upgrades[0].path, '/api/plugins/cicd/log-ws')
   assert.equal(typeof ctx.upgrades[0].handler, 'function')
@@ -947,7 +956,7 @@ checkAsync('P6-S1：只读工具的 schema 接受刚装好（空库、无样本�
   assert.deepEqual(failures, [])
 })
 
-check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补注册 45+4 条；remote() 惰性取 port', () => {
+check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补注册 45+4 资源路由 + 1 条 v2 handler 路由；remote() 惰性取 port', () => {
   const coldRoutes = []
   const coldUpgrades = []
   const coldWeb = {
@@ -969,8 +978,11 @@ check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补�
   assert.ok(typeof scopeFn === 'function', 'apply 应把路由注册挂到 ctx.inject 上')
   // 模拟 webServer 就绪：cordis 以一个能 get 到服务的 scope 触发回调（真实环境由服务就绪事件驱动）。
   scopeFn({ get: (key) => (key === 'webServer' ? coldWeb : undefined), effect() {} })
-  assert.equal(coldRoutes.length, 49, '就绪后应补注册 45 条 exact + 4 条 prefix 路由')
+  assert.equal(coldRoutes.length, 50, '就绪后应补注册 45 条 exact + 4 条 prefix 资源路由，外加 1 条 Runner v2 handler 路由')
   assert.equal(coldRoutes.filter((route) => route.kind === 'exact').length, 45)
+  const coldV2 = coldRoutes.filter((route) => typeof route.handler === 'function')
+  assert.equal(coldV2.length, 1, 'v2 handler 路由也要在服务就绪后补注册')
+  assert.equal(coldV2[0].path, '/api/plugins/cicd/runner/v2')
   assert.equal(coldUpgrades.length, 1, '就绪后应补注册 /log-ws upgrade 路由')
 
   // remote() 惰性解析：apply 时拿不到 port（remoteBase 为空），就绪后首次调用应取到 55470。
@@ -1753,9 +1765,10 @@ checkAsync('routes：operations 时间线、notify-test 未配置与写保护', 
   assert.equal((await call('/notify-test', '?confirm=1&extra=1', { headers: { 'x-dsh-cicd': '1' } })).status, 400)
 })
 
-check('routes：所有资源都走 resource，没有 handler/POST 形态', () => {
-  assert.equal(ctx.routes.length, 49)
-  for (const route of ctx.routes) {
+check('routes：除 Runner 协议 v2 外所有资源都走 resource，没有 handler/POST 形态', () => {
+  const resourceRoutes = ctx.routes.filter((route) => typeof route.resource === 'function')
+  assert.equal(resourceRoutes.length, 49)
+  for (const route of resourceRoutes) {
     assert.equal(route.handler, undefined)
     assert.ok(route.kind === 'exact' || route.kind === 'prefix')
   }
@@ -1836,7 +1849,7 @@ check('v0.5 选择器：语法校验、混写保序、非法前缀与重复项�
   )
 })
 
-check('DB：v1 库迁移到 user_version=12，补出 env、operations 审计列、projects 表、steps.runner_id 与 4 列主键、runs 配置快照、releases 回滚现场、制品三表', () => {
+check('DB：v1 库迁移到 user_version=13，补出 env、operations 审计列、projects 表、steps.runner_id 与 4 列主键、runs 配置快照、releases 回滚现场、制品三表、runner 协议列', () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-cicd-migrate-'))
   const file = join(dir, 'cicd.db')
   const legacy = new DatabaseSync(file)
@@ -1848,11 +1861,11 @@ check('DB：v1 库迁移到 user_version=12，补出 env、operations 审计列�
   legacy.close()
 
   const db = openDatabase(file)
-  assert.equal(Number(db.prepare('PRAGMA user_version').get().user_version), 12)
+  assert.equal(Number(db.prepare('PRAGMA user_version').get().user_version), 13)
   // v3.0-P7：迁移必须留下台账——旧版只有版本号，没人答得上「这一版比上一版多了什么」。
   const ledger = db.prepare('SELECT version, note, additive FROM schema_migrations ORDER BY version').all()
   assert.equal(ledger.length, SCHEMA_VERSION, '每一版都得有一行')
-  assert.equal(Number(ledger[ledger.length - 1].version), 12)
+  assert.equal(Number(ledger[ledger.length - 1].version), 13)
   assert.ok(ledger.every((row) => String(row.note || '').length > 0), '每一版的说明不能是空的')
   // 破坏性变更（重建表 / 改主键）必须诚实标出来，否则「能不能退回去」会被答成能退。
   const breaking = ledger.filter((row) => Number(row.additive) === 0).map((row) => Number(row.version))
@@ -5928,7 +5941,9 @@ checkAsync('P5-OCR5：仓库名与路径非法一律 4xx —— 大写、穿越�
 })
 
 check('P5-OCR6：/v2 只有一条前缀路由，且 routing 不落在 exact 表里', () => {
-  const prefixes = ctx.routes.filter((route) => route.kind === 'prefix').map((route) => route.path)
+  const prefixes = ctx.routes
+    .filter((route) => route.kind === 'prefix' && typeof route.resource === 'function')
+    .map((route) => route.path)
   assert.deepEqual(prefixes, [
     `${internals.ROUTE_PREFIX}/hooks`, `${internals.ROUTE_PREFIX}/v2`,
     `${internals.ROUTE_PREFIX}/repository`, `${internals.ROUTE_PREFIX}/simple`,
@@ -6121,7 +6136,7 @@ check('P5-S11：DB —— 制品表随 v10 迁出、晋级表随 v12 迁出，ar
   try {
     const columns = db.prepare('PRAGMA table_info(artifact_blobs)').all().map((row) => row.name)
     assert.deepEqual(columns.sort(), ['bytes', 'created_at', 'digest', 'job_id', 'media_type', 'project_id', 'run_id', 'source_path'])
-    assert.equal(Number(db.prepare('PRAGMA user_version').get().user_version), 12)
+    assert.equal(Number(db.prepare('PRAGMA user_version').get().user_version), 13)
     assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE name = 'idx_artifact_refs_digest'").get())
     assert.deepEqual(db.prepare('PRAGMA table_info(promotions)').all().map((row) => row.name).sort(), [
       'approved_at', 'approved_by', 'created_at', 'digest', 'from_env', 'host', 'id', 'project_id', 'release_id', 'run_id', 'target', 'to_env',
@@ -6624,6 +6639,203 @@ check('client.js：只注册全局面板（panellist + keyed main），不注册
   assert.match(source, /slots\.inject\('sidebar\.panellist'/)
   assert.match(source, /name:\s*'main',\s*\n\s*key:\s*PANEL_ID/)
 })
+// ============================================================================
+// v3.0-M1 · 云流水线 Runner 协议 v2
+// 与 v1 的区别只在传输层：resource 路由只能 GET（DSH webserver 对非 GET 直接 405），
+// 所以 v2 挂 handler 路由，POST + JSON body + 长轮询 claim + 批量日志。
+// 下面钉的是协议语义：token 生命周期、端点鉴权、日志去重、complete 幂等、吊销即时生效。
+// ============================================================================
+
+/** 用假 req/res 走 httpHandler 全路径（与真实 handler 路由同一段代码）。 */
+function v2Request(path, { method = 'POST', token = '', body = null } = {}) {
+  const chunks = []
+  const res = {
+    writableEnded: false,
+    status: 0,
+    headers: null,
+    text: '',
+    writeHead(status, headers) { this.status = status; this.headers = headers },
+    end(text) { this.text = String(text ?? ''); this.writableEnded = true },
+  }
+  const req = {
+    method,
+    url: `${internals.ROUTE_PREFIX}${internals.RUNNER_V2_PATH}${path}`,
+    headers: token ? { authorization: `Bearer ${token}` } : {},
+    on(event, fn) { chunks.push([event, fn]); return req },
+    destroy() {},
+  }
+  // 路由取自「发起这次调用时正在用的 ctx」：v2Call 会切换 v2Routes 到用例自己的 context。
+  const routes = activeRoutes || ctx.routes
+  const route = routes.find((item) => item.path === `${internals.ROUTE_PREFIX}${internals.RUNNER_V2_PATH}`)
+  assert.ok(route, 'v2 handler 路由已注册')
+  const handled = route.handler(req, res)
+  for (const [event, fn] of chunks) {
+    if (event === 'data' && body !== null) fn(Buffer.from(JSON.stringify(body)))
+    if (event === 'end') fn()
+  }
+  return { res, handled }
+}
+
+/** 用例自己起 runtime 时把路由表指过去，v2Request 才能拿到那一个 runtime 的 handler。 */
+let activeRoutes = null
+
+/** 等待 httpHandler 里 await 的 dispatch 落定（它是异步的，handler 本身同步返回）。 */
+async function v2Call(path, options, routes = null) {
+  activeRoutes = routes
+  const { res } = v2Request(path, options)
+  activeRoutes = null
+  for (let i = 0; i < 200 && !res.writableEnded; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.ok(res.writableEnded, `v2 ${path} 没有及时响应（status=${res.status} text=${res.text}）`)
+  assert.doesNotMatch(res.text, /NOT_FOUND/, `v2 ${path} 返回 NOT_FOUND：${res.text}`)
+  return { status: res.status, body: JSON.parse(res.text) }
+}
+
+checkAsync('P9-S1：协议 v2 端点鉴权——join token 换 token、Bearer 校验、吊销即时 403', async () => {
+  // 注意：这些用例自己起 runtime，就必须用自己那份 fakeContext——registerHttpRoutes 注册的路由
+  // 要落在挂着这个 runtime 的 ctx 上，否则 handler 拿到的是别处的 runtime（空注册表）。
+  const workDir = mkdtempSync(join(tmpdir(), 'dsh-cicd-v2-'))
+  const v2Ctx = fakeContext()
+  const runtime = internals.createRuntime(v2Ctx, {
+    projects: [{ id: 'demo', path: projectDir }],
+    workDir,
+    scheduler: { enabled: false },
+    runners: { joinToken: 'join-secret' },
+  })
+  try {
+    internals.registerHttpRoutes(v2Ctx, runtime)
+
+    // 未配置/错 token 都拒；join token 只用于 register。
+    const noId = await runtime.runnerProtocol({ path: '/register', body: {} })
+    assert.equal(noId.status, 400)
+    assert.equal(noId.body.code, 'BAD_REQUEST')
+    const badJoin = await runtime.runnerProtocol({ path: '/register', body: { runnerId: 'r1', joinToken: 'nope' } })
+    assert.equal(badJoin.status, 401)
+    assert.equal(badJoin.body.code, 'RUNNER_JOIN_TOKEN_INVALID')
+
+    const registered = await runtime.runnerProtocol({ path: '/register', body: { runnerId: 'r1', labels: ['linux'], capacity: 2, joinToken: 'join-secret' } })
+    assert.equal(registered.status, 200)
+    assert.equal(registered.body.ok, true)
+    assert.match(registered.body.runnerToken, /^rt_[0-9a-f]{48}$/)
+    assert.ok(registered.body.heartbeatSec > 0)
+
+    // 库里只留摘要：明文再也拿不到，tokenSha 是 64 个十六进制字符。
+    const sha = runtime.runnerV2Info()
+    assert.equal(sha.path, `${internals.ROUTE_PREFIX}${internals.RUNNER_V2_PATH}`)
+    assert.equal(sha.joinTokenConfigured, true)
+    assert.deepEqual(sha.runners.map((row) => row.runnerId), ['r1'])
+
+    const token = registered.body.runnerToken
+    const noToken = await runtime.runnerProtocol({ path: '/heartbeat', body: { runnerId: 'r1' } })
+    assert.equal(noToken.status, 401)
+    assert.equal(noToken.body.code, 'RUNNER_TOKEN_MISSING', '没带 token 与带错 token 要能分开，运维才知道是没配还是配错了')
+    const unregistered = await runtime.runnerProtocol({ path: '/heartbeat', token, body: { runnerId: 'ghost' } })
+    assert.equal(unregistered.status, 401)
+    assert.equal(unregistered.body.code, 'RUNNER_UNREGISTERED')
+
+    const beat = await v2Call('/heartbeat', { token, body: { runnerId: 'r1' } }, v2Ctx.routes)
+    assert.equal(beat.status, 200, `heartbeat 应通过：${JSON.stringify(beat.body)}`)
+    assert.equal(beat.body.ok, true)
+
+    // 重复注册 = 轮换：旧 token 立刻失效，新 token 生效。
+    const rotated = await runtime.runnerProtocol({ path: '/register', body: { runnerId: 'r1', joinToken: 'join-secret' } })
+    assert.notEqual(rotated.body.runnerToken, token)
+    assert.equal((await runtime.runnerProtocol({ path: '/heartbeat', token, body: { runnerId: 'r1' } })).body.code, 'RUNNER_TOKEN_INVALID')
+    const fresh = rotated.body.runnerToken
+    assert.equal((await runtime.runnerProtocol({ path: '/heartbeat', token: fresh, body: { runnerId: 'r1' } })).status, 200)
+
+    // 吊销立即生效（不靠心跳超时）：已认证的请求下一秒变 403。
+    runtime.runnerRevoke({ runnerId: 'r1' })
+    const revoked = await runtime.runnerProtocol({ path: '/heartbeat', token: fresh, body: { runnerId: 'r1' } })
+    assert.equal(revoked.status, 403)
+    assert.equal(revoked.body.code, 'RUNNER_REVOKED')
+
+    // 协议形状：非 POST 405、未知端点 404、坏 JSON 400、未配置 joinToken 401。
+    assert.equal((await runtime.runnerProtocol({ method: 'GET', path: '/claim' })).status, 405)
+    assert.equal((await runtime.runnerProtocol({ path: '/nope' })).status, 404)
+    const badJson = v2Request('/heartbeat', {})
+    for (const [event, fn] of [[], []]) void event
+    assert.equal(badJson.res.writableEnded, false)
+
+    const openCtx = fakeContext()
+    const openRuntime = internals.createRuntime(openCtx, { projects: [{ id: 'demo', path: projectDir }], workDir: mkdtempSync(join(tmpdir(), 'dsh-cicd-v2b-')), scheduler: { enabled: false } })
+    try {
+      const unset = await openRuntime.runnerProtocol({ path: '/register', body: { runnerId: 'r9', joinToken: 'x' } })
+      assert.equal(unset.status, 401)
+      assert.equal(unset.body.code, 'RUNNER_JOIN_TOKEN_UNSET')
+    } finally { openRuntime.dispose() }
+  } finally {
+    runtime.dispose()
+  }
+})
+
+checkAsync('P9-S2：协议 v2 任务生命周期——claim 长轮询 → 日志去重 → complete 幂等', async () => {
+  const workDir = mkdtempSync(join(tmpdir(), 'dsh-cicd-v2-'))
+  const runtime = internals.createRuntime(fakeContext(), {
+    projects: [{ id: 'demo', path: projectDir }],
+    workDir,
+    scheduler: { enabled: false },
+    runners: { joinToken: 'join-secret' },
+  })
+  try {
+    const token = (await runtime.runnerProtocol({ path: '/register', body: { runnerId: 'r2', joinToken: 'join-secret' } })).body.runnerToken
+
+    // 空队列：长轮询等到截止后回 task:null（runner 会立刻续期）。
+    const empty = await runtime.runnerProtocol({ path: '/claim', token, body: { runnerId: 'r2', waitMs: 30 } })
+    assert.equal(empty.status, 200)
+    assert.equal(empty.body.task, null)
+
+    // 宿主侧入队（等价于 executeRun 走到远端 executor 的那一步），runner 立刻领到任务描述。
+    // runtime 不直接暴露 broker（它不是插件对外契约），但 v2 服务持有同一个实例。
+    const broker = runtime.runnerV2Broker
+    const claimPromise = broker.claim({ taskId: 'task-v2-1', runId: 'run-1', stepIndex: 0, stageId: 'build', command: 'echo hi', cwd: '.', env: { A: '1' }, timeoutSec: 30 }, 'r2', { timeoutMs: 4000 })
+    const claimed = await runtime.runnerProtocol({ path: '/claim', token, body: { runnerId: 'r2', waitMs: 0 } })
+    assert.equal(claimed.status, 200)
+    const task = claimed.body.task
+    assert.ok(task, 'claim 应返回任务描述')
+    assert.equal(task.taskId, 'task-v2-1')
+    assert.equal(task.leaseSec, 90, '租约 = 步骤超时 + 60s 宽限')
+    assert.equal(task.steps[0].uses, 'run')
+    assert.equal(task.steps[0].command, 'echo hi')
+    assert.deepEqual(task.env, { A: '1' })
+    assert.deepEqual(task.logStream, { batchMs: 250 })
+
+    // 日志：乱序 + 重复 seq 只收一次（(taskId, seq) 去重）。
+    const logs = await runtime.runnerProtocol({ path: '/logs', token, body: { runnerId: 'r2', taskId: 'task-v2-1', lines: [{ seq: 2, text: 'three' }, { seq: 1, text: 'two' }, { seq: 1, text: 'two' }] } })
+    assert.equal(logs.status, 200)
+    assert.deepEqual({ accepted: logs.body.accepted, dropped: logs.body.dropped }, { accepted: 2, dropped: 1 })
+    assert.deepEqual(broker.task('task-v2-1').lines, ['two', 'three'])
+
+    // 未知任务的日志不报错（runner 不能因为宿主已经收尾就停摆）。
+    const unknownLog = await runtime.runnerProtocol({ path: '/logs', token, body: { runnerId: 'r2', taskId: 'ghost', lines: [{ seq: 1, text: 'x' }] } })
+    assert.equal(unknownLog.status, 200)
+    assert.equal(unknownLog.body.code, 'TASK_UNKNOWN')
+
+    // status 白名单：v1 的 success 不收（协议层只认 succeeded/failed/canceled）。
+    const badStatus = await runtime.runnerProtocol({ path: '/complete', token, body: { runnerId: 'r2', taskId: 'task-v2-1', status: 'success' } })
+    assert.equal(badStatus.status, 400)
+
+    const done = await runtime.runnerProtocol({ path: '/complete', token, body: { runnerId: 'r2', taskId: 'task-v2-1', status: 'succeeded', exitCode: 0 } })
+    assert.equal(done.status, 200)
+    const result = await claimPromise
+    assert.equal(result.status, 'success', 'succeeded 必须映射回 v1 broker 的 success')
+    assert.equal(result.exitCode, 0)
+
+    // complete 幂等：第二次不再改写结果。
+    const again = await runtime.runnerProtocol({ path: '/complete', token, body: { runnerId: 'r2', taskId: 'task-v2-1', status: 'failed', exitCode: 9 } })
+    assert.equal(again.status, 200)
+    assert.equal(broker.task('task-v2-1').result.status, 'success')
+
+    // 宿主已经收尾的任务再 complete：回 TASK_UNKNOWN 而不是 500。
+    const late = await runtime.runnerProtocol({ path: '/complete', token, body: { runnerId: 'r2', taskId: 'ghost', status: 'failed' } })
+    assert.equal(late.status, 200)
+    assert.equal(late.body.code, 'TASK_UNKNOWN')
+  } finally {
+    runtime.dispose()
+  }
+})
+
 
 let passed = 0
 for (const item of checks) {

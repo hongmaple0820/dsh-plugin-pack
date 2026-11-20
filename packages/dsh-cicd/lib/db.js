@@ -33,7 +33,7 @@ export const DB_FILE_NAME = 'cicd.db'
  *     它是 prod 部署闸门的唯一凭据，也是环境指针（某个 to_env 的最新一行），所以不可能从 releases 反推：
  *     releases 只记「哪台机器上现在跑着什么」，记不了「谁批准了这份字节去生产」。
  */
-export const SCHEMA_VERSION = 12
+export const SCHEMA_VERSION = 13
 
 const DDL = [
   `CREATE TABLE IF NOT EXISTS runs (
@@ -232,7 +232,10 @@ const DDL = [
     registered_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
     revoked_at TEXT NOT NULL DEFAULT '',
-    revoked_by TEXT NOT NULL DEFAULT ''
+    revoked_by TEXT NOT NULL DEFAULT '',
+    token_sha256 TEXT NOT NULL DEFAULT '',
+    protocol INTEGER NOT NULL DEFAULT 1,
+    joined_at TEXT NOT NULL DEFAULT ''
   )`,
   `CREATE INDEX IF NOT EXISTS idx_runners_status ON runners (status, last_seen_at DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals (status, requested_at DESC)`,
@@ -415,6 +418,7 @@ const MIGRATION_NOTES = {
   10: { note: '制品表（artifact_blobs / artifact_refs）', additive: true },
   11: { note: '指针表改成 WITHOUT ROWID', additive: false },
   12: { note: '晋级表 promotions + releases 增加 version', additive: true },
+  13: { note: 'runners 增加协议 v2 的 token 摘要 / 协议号 / 加入时间', additive: true },
 }
 
 function migrationNote(version) {
@@ -491,6 +495,17 @@ function migrate(db) {
       if (!hasColumn(db, 'releases', name)) {
         db.exec(`ALTER TABLE releases ADD COLUMN ${name} TEXT NOT NULL DEFAULT ''`)
       }
+    }
+    // v12 → v13：runners 增加协议 v2 三列。token_sha256 存的是 runner token 的 sha256 摘要，
+    // 永远不存明文；老行（v1 协议的机器）为空串，等于「没领过 v2 token」。
+    if (!hasColumn(db, 'runners', 'token_sha256')) {
+      db.exec(`ALTER TABLE runners ADD COLUMN token_sha256 TEXT NOT NULL DEFAULT ''`)
+    }
+    if (!hasColumn(db, 'runners', 'protocol')) {
+      db.exec(`ALTER TABLE runners ADD COLUMN protocol INTEGER NOT NULL DEFAULT 1`)
+    }
+    if (!hasColumn(db, 'runners', 'joined_at')) {
+      db.exec(`ALTER TABLE runners ADD COLUMN joined_at TEXT NOT NULL DEFAULT ''`)
     }
     // v10 → v11：指针表改成 WITHOUT ROWID。v10 的迁移脚本先建过一次普通表（带 rowid），
     // 这里按「有没有 rowid」判新旧——PRAGMA index_list 看不出这个，只能问 sqlite_master 的原始 DDL。

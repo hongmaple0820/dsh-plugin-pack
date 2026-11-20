@@ -1,0 +1,25 @@
+[package]
+name = "dsh-cicd-runner"
+version = "0.1.0"
+edition = "2021"
+description = "dsh-cicd remote build runner (Runner Protocol v2)"
+license = "MIT"
+
+[lib]
+name = "dsh_cicd_runner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dsh-cicd-runner"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "time", "process", "io-util", "net", "signal"] }
+
+[profile.release]
+opt-level = 2
