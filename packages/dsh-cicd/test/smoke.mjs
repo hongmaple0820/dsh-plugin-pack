@@ -1217,6 +1217,89 @@ checkAsync('v3.0-P7 混沌：runner 掉线后派出去的任务当场判失败�
   }
 })
 
+checkAsync('v3.0-P7 混沌：库被锁住时部署锁失败关闭，孤儿锁与孤儿运行都要说得出口', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cicd-lock-chaos-'))
+  const app = join(dir, 'app')
+  mkdirSync(app, { recursive: true })
+  // 最小可跑的 pipe：只有 echo，不落部署 —— 这条用例只关心「锁拿不拿得到」。
+  writeFileSync(join(app, 'pipe.yml'), [
+    'version: 1',
+    'name: lock-chaos',
+    'targets:',
+    '  local:',
+    '    hosts: [h1]',
+    '    path: /tmp/never-deployed',
+    'stages:',
+    '  - id: build',
+    '    steps:',
+    '      - name: say',
+    '        run: echo lock-chaos',
+    '',
+  ].join('\n'))
+  // busyTimeoutMs: 0 —— 默认的 5 秒会让「库被锁住」变成「等 5 秒然后照常成功」，测不到失败关闭。
+  const repo = await repoTool(join(dir, 'state'), { projects: [{ id: 'demo', path: app, busyTimeoutMs: 0 }] })
+  const dbFile = join(dir, 'state', 'cicd.db')
+  let locker = null
+  try {
+    // ---- ① 库被另一个连接独占：部署锁读不出来 → 必须失败关闭，而不是当「没上锁」放行 ----
+    locker = new DatabaseSync(dbFile)
+    locker.exec('BEGIN IMMEDIATE')
+    const denied = await repo.runtime.run({ projectId: 'demo', targetName: 'local', confirmProd: true }).then(
+      () => null,
+      (error) => error,
+    )
+    assert.ok(denied, '库被锁住时必须拒绝这次运行，而不是往下跑')
+    assert.equal(denied.code, 'LOCK_UNAVAILABLE', '锁读不出来要如实报 LOCK_UNAVAILABLE，不能伪装成 DEPLOY_IN_PROGRESS：实际 ' + denied.code)
+    assert.match(denied.message, /部署锁读不出来/)
+    // WAL 下读不会被写事务挡住：锁列表此刻还能读，且必须如实读出「没有锁」——
+    // 这正是失败关闭的另一半：readable 时不能谎报 unavailable。
+    const blind = repo.runtime.lockList()
+    assert.equal(blind.ok, true, '读不受影响时不许谎报「锁表读不出来」')
+    assert.equal(blind.unavailable, null)
+    assert.equal(blind.database.ok, true)
+    locker.exec('ROLLBACK')
+
+    // ---- ② 解锁之后必须能正常跑：失败关闭不能变成永远关闭 ----
+    const ran = await repo.runtime.run({ projectId: 'demo', targetName: 'local', confirmProd: true })
+    assert.equal(ran.status, 'success', '库恢复之后要能继续跑：' + JSON.stringify(ran).slice(0, 200))
+    assert.deepEqual(repo.runtime.lockList().locks, [], '跑完之后锁必须放掉，否则下一次永远被挡')
+
+    // ---- ③ 孤儿锁：持有者早就不在 activeRuns 里，列表要点名，清理要签字 ----
+    repo.runtime.store.db.prepare('INSERT INTO deploy_locks (target, project_id, run_id, owner, acquired_at, expires_at, heartbeat_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run('ghosted', 'demo', 'run-that-died', 'admin', new Date().toISOString(), new Date(Date.now() + 600000).toISOString(), new Date().toISOString())
+    const listed = repo.runtime.lockList()
+    assert.equal(listed.ok, true)
+    const ghost = listed.locks.find((row) => row.target === 'ghosted')
+    assert.ok(ghost, '锁列表里应该有这把锁')
+    assert.equal(ghost.orphan, true, '持有者的 runId 不在 activeRuns 里，就是孤儿锁')
+    assert.deepEqual(listed.orphans, ['ghosted'])
+    const noConfirm = await repo.call('/locks?action=reset')
+    assert.ok(noConfirm.status >= 400 || noConfirm.body.confirm === undefined, '清锁必须有人在，不能是 GET 一下就把锁清了')
+    const reset = repo.runtime.lockResetOrphans({ reason: 'test' })
+    assert.deepEqual(reset.cleared.map((item) => item.target), ['ghosted'])
+    assert.deepEqual(repo.runtime.lockList().locks, [], '清完之后锁表应该是空的')
+    const auditEvents = repo.runtime.auditList({ limit: 20 }).events
+    assert.ok(auditEvents.some((event) => event.action === 'deploy.lock_orphan_cleared'), '清锁必须留痕')
+
+    // ---- ④ 孤儿运行：进程被 kill 后留下的 running 行会一直转圈，宽限期内不许误伤 ----
+    const insertRun = repo.runtime.store.db.prepare('INSERT INTO runs (id, project_id, pipeline_name, trigger, branch, commit_sha, target, status, dry_run, error, started_at, finished_at, updated_at, config_snapshot, config_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    const nowIso = new Date().toISOString()
+    const freshAt = new Date(Date.now() - 5 * 1000).toISOString()
+    insertRun.run('ghost-old', 'demo', 'ghost', 'manual', '', '', 'local', 'running', 0, '', new Date(Date.now() - 5 * 60 * 1000).toISOString(), '', nowIso, '', '')
+    insertRun.run('ghost-fresh', 'demo', 'ghost', 'manual', '', '', 'local', 'running', 0, '', freshAt, '', nowIso, '', '')
+    const swept = repo.runtime.reconcileRuns()
+    assert.ok(swept.marked >= 1, '5 分钟前就在 running 的行必须被收尾：实际 ' + swept.marked)
+    const oldRow = repo.runtime.store.run('ghost-old')
+    const freshRow = repo.runtime.store.run('ghost-fresh')
+    assert.equal(oldRow.status, 'failed', '孤儿运行不收尾，面板会永远转圈、MTTR 也算不出来')
+    assert.match(oldRow.error, /ghost/)
+    assert.equal(freshRow.status, 'running', '刚建几秒的行可能是另一个副本在写，宽限期（60s）内不许判死')
+  } finally {
+    try { locker?.close() } catch { /* 可能已经关了 */ }
+    try { repo?.close() } catch { /* 可能没起 */ }
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
 checkAsync('v3.0-P7 缓存命中率：构建缓存与工具链分两本账，从不命中的 key 族要指名道姓', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'cicd-cache-stats-'))
   const tick = { t: Date.parse('2026-05-01T00:00:00Z') }

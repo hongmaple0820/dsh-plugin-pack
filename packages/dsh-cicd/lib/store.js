@@ -72,12 +72,12 @@ function sliceTail(content, tail = 0) {
   return lines.slice(-tail).join('\n')
 }
 
-export function createStore({ dir = DEFAULT_WORK_DIR, file = '' } = {}) {
+export function createStore({ dir = DEFAULT_WORK_DIR, file = '', busyTimeoutMs = 5000 } = {}) {
   const root = dir
   const dbFile = file || join(root, DB_FILE_NAME)
   const logsDir = join(root, 'logs')
   mkdirSync(logsDir, { recursive: true })
-  const db = openDatabase(dbFile)
+  const db = openDatabase(dbFile, { busyTimeoutMs })
   let closed = false
 
   const statements = {

@@ -303,16 +303,38 @@ export async function runPipeline({
   }
 
   const logFile = store?.dir ? join(store.dir, 'logs', `${runId}.log`) : ''
+  /**
+   * v3.0-P7 混沌：日志写不进去时（磁盘满、卷被卸载、文件被换）**只喊一次**。
+   * 以前这里是裸 appendFileSync 用 try/catch 吞掉：磁盘满之后面板上一个字都不动，
+   * 用户看到的就是「设备卡住了」，而真实原因是这条日志根本没落盘。
+   * 只喊一次是因为每一行都喊会把同一个事故刷成几十条，反而盖住真正的第一现场。
+   */
+  let logWriteFailed = false
+  const noteLogWriteFailure = (error) => {
+    if (logWriteFailed) return false
+    logWriteFailed = true
+    return error?.message || String(error || 'unknown')
+  }
   if (logFile) {
-    mkdirSync(join(store.dir, 'logs'), { recursive: true })
-    appendFileSync(logFile, '', 'utf8')
+    try {
+      mkdirSync(join(store.dir, 'logs'), { recursive: true })
+      appendFileSync(logFile, '', 'utf8')
+    } catch (error) {
+      const detail = noteLogWriteFailure(error)
+      if (detail) onLog({ runId, stageId: '', index: -1, line: `⚠ 日志无法写入磁盘（${detail}）：这次运行仍会继续，但下面的输出只存在于内存与面板里。` })
+    }
   }
   const log = (entry, rawLine) => {
     // 脱敏必须在写文件/推 hub/回调之前——四个出口共用这一行。
     const line = redactLine(rawLine, secrets)
     const lineJobId = entry.jobId || ''
-    if (logFile) {
-      try { appendFileSync(logFile, `${line}\n`, 'utf8') } catch { /* logging must not kill the run */ }
+    if (logFile && !logWriteFailed) {
+      try {
+        appendFileSync(logFile, `${line}\n`, 'utf8')
+      } catch (error) {
+        const detail = noteLogWriteFailure(error)
+        if (detail) onLog({ runId, stageId: '', index: -1, line: `⚠ 日志写入失败（${detail}）：之后的输出不再落盘，只能在本面板看。` })
+      }
     }
     // v3.0-P1：并行 job 共享一条主日志必然交错，另存一份按 job 分片的文件，
     // 「这个 job 到底输出了什么」才能单独读。写失败只是少一份副本，不影响运行。
@@ -356,7 +378,9 @@ export async function runPipeline({
   const secretMap = extraVars || {}
   // runnerLiveness：远端步骤在等结果期间用来判断「那台机器还在不在」的探针（本地执行为 null）。
   // 没有它，派出去的任务只能在超时后失败，而超时原因会把人的注意力引向命令而不是机器。
-  const stepContext = { runId, log, store, logFile, activeExecutor, project, vars, signal, executeDeploy, secrets: secretMap, toolchainEnv: null, actions, runnerLiveness }
+  // v3.0-P7：步骤级的认领超时。远端 executor 的任务先入队再等某台机器来接，
+  // 没有上限的话「没有机器来领」这件事只能靠进程重启收场。本地 spawn 不看这个字段。
+  const stepContext = { runId, log, store, logFile, activeExecutor, project, vars, signal, executeDeploy, secrets: secretMap, toolchainEnv: null, actions, runnerLiveness, claimTimeoutMs: stepTimeoutSec || 0 }
 
   // 工具链在这里装、在这里断言：放到 runPipeline 之外会让安装失败的构建没有 run 记录，
   // 用户只看到一条 500 和空日志；放进来则失败也是一次可见的、可回看的运行。

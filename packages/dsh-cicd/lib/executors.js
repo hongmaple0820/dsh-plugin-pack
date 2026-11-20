@@ -295,6 +295,8 @@ export function createTaskBroker({ onTaskForRunner = null, log = () => {} } = {}
       spec: { ...spec, taskId },
       runnerId,
       status: 'queued',
+      // v3.0-P7：第一次被 runner 取走的时刻（runner-poll 里写）。null 表示一直没人接。
+      claimedAt: 0,
       result: null,
       lines: [],
       onLine: null,
@@ -335,6 +337,9 @@ export function createTaskBroker({ onTaskForRunner = null, log = () => {} } = {}
         queue.shift()
         continue
       }
+      // v3.0-P7：被取走过一次就不再是「没人接」——超时报错要靠这个字段区分
+      // 「机器领了但没跑完」和「根本没有机器来领」。
+      if (!task.claimedAt) task.claimedAt = Date.now()
       return task
     }
     return null
@@ -424,7 +429,11 @@ export function createTaskBroker({ onTaskForRunner = null, log = () => {} } = {}
         }
         if (effectiveTimeout > 0 && Date.now() - startedAt > effectiveTimeout) {
           task.status = 'finished'
-          task.result = { status: 'failed', exitCode: -1, error: `远端 runner 未在 ${Math.round(effectiveTimeout / 1000)}s 内响应` }
+          // v3.0-P7：超时窗口里一直没被认领的，原因不是「命令慢」，而是「没有机器来接这个活」。
+          // 两者在面板上必须说得不一样，否则运维会去查构建脚本。
+          task.result = task.claimedAt
+            ? { status: 'failed', exitCode: -1, error: `远端 runner 未在 ${Math.round(effectiveTimeout / 1000)}s 内响应` }
+            : { status: 'failed', exitCode: -1, error: `没有机器在 ${Math.round(effectiveTimeout / 1000)}s 内认领这个任务（runner 可能全忙或没上线）`, code: 'RUNNER_CLAIM_TIMEOUT' }
           resolveWaiter(task.result)
           return
         }

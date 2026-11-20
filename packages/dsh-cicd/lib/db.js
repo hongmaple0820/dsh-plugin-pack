@@ -503,12 +503,12 @@ function migrate(db) {
   return version
 }
 
-export function openDatabase(file) {
+export function openDatabase(file, { busyTimeoutMs = 5000 } = {}) {
   mkdirSync(dirname(file), { recursive: true })
   const db = new DatabaseSync(file)
   db.exec('PRAGMA journal_mode = WAL')
   db.exec('PRAGMA synchronous = NORMAL')
-  db.exec('PRAGMA busy_timeout = 5000')
+  db.exec('PRAGMA busy_timeout = ' + Math.max(0, Math.trunc(busyTimeoutMs)))
   migrate(db)
   return db
 }

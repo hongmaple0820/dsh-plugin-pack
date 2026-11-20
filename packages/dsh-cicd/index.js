@@ -87,6 +87,8 @@ const WRITE_HEADER = 'x-dsh-remote-exec'
 // v3.0-P7：runner 掉线时门禁的轮询间隔。1 秒足够让「等它回来」这句话在面板上看起来是实时的，
 // 又不会把库读成热点——判死本身只读一次 all，不写盘。
 const RUNNER_WAIT_POLL_MS = 1000
+// v3.0-P7 混沌：孤儿运行的宽限期。刚建出来几秒的行可能是另一个副本正在写，不能判死。
+const GHOST_RUN_GRACE_MS = 60 * 1000
 
 const textBlocks = (text) => [{ type: 'text', text }]
 
@@ -205,6 +207,9 @@ function normalizeConfig(config = {}, ctx) {
       path: project.path,
       pipe: project.pipe || join(project.path, 'pipe.yml'),
       env: project.env || {},
+      // P7 混沌用例需要把 busy_timeout 压到 0 来复现「库被另一个进程锁住」；
+      // 不在这里透传的话 store 会退回 5 秒默认值，测试只能干等。
+      ...(project.busyTimeoutMs !== undefined ? { busyTimeoutMs: project.busyTimeoutMs } : {}),
     })),
     workDir,
     remoteBase,
@@ -446,7 +451,7 @@ function uniqueProjectId(projects, base) {
 
 function createRuntime(ctx, config) {
   const options = normalizeConfig(config, ctx)
-  let store = createStore({ dir: options.workDir })
+  let store = createStore({ dir: options.workDir, busyTimeoutMs: options.projects[0]?.busyTimeoutMs })
   // 数据库文件的实际路径：storage() 要按字节报它，而不是按目录。
   // switchStore（P7 备份恢复）会在运行时换库，早于它定义的那些函数必须看见新路径，
   // 所以真实路径装在这个盒子里，而不是让每个调用点都去读一个会被替换的局部变量。
@@ -890,6 +895,56 @@ function createRuntime(ctx, config) {
     const error = new Error(`这次${action}会改动生产环境（${prodHosts.join('、')}），请带 confirm=prod`)
     error.code = 'PROD_CONFIRM_REQUIRED'
     error.hosts = prodHosts
+    return error
+  }
+
+  /**
+   * v3.0-P7 混沌：库还能不能用。
+   *
+   * 「读一次」是唯一诚实的探针：SQLITE_BUSY（另一个进程握着写锁）、磁盘满（写不进去）、
+   * 文件被搬走（句柄还开着，但新连接打不开）都会在这里当场暴露。
+   * 注意这是**连接级**的健康，不是磁盘余量——磁盘满时读可能还是好的，写才会炸。
+   */
+  /**
+   * v3.0-P7 混沌：把「这次进程里已经没人管了」的运行标成失败。
+   *
+   * 只有在**一次运行收尾之后**调用（run() 的 finally），此刻本进程没有任何在跑的运行，
+   * 所以库里所有还是 queued/running 的行都是上一次进程留下的残骸：断电、被 kill、换库。
+   * 它们不会自己变成终态，面板上会一直转圈，DORA 的 MTTR 也永远算不出来。
+   *
+   * 加超时下限是防误伤：另一个进程（或另一个副本）可能正写到一半，
+   * 刚建出来几秒的行不该被判死。
+   */
+  function markGhostRuns() {
+    const cutoff = new Date(Date.now() - GHOST_RUN_GRACE_MS).toISOString()
+    const live = new Set(hub.activeRunIds())
+    let marked = 0
+    let rows = []
+    try {
+      rows = store.db.prepare("SELECT * FROM runs WHERE status IN ('queued', 'running') AND started_at <= ? ORDER BY started_at ASC LIMIT 200").all(cutoff)
+    } catch { return 0 }
+    for (const row of rows) {
+      if (live.has(row.id)) continue
+      try {
+        store.appendRun({ ...row, status: 'failed', finished_at: new Date().toISOString(), error: row.error || 'ghost: 孤儿运行（进程重启或换库时留下的）' })
+        marked += 1
+      } catch { /* 单行写失败不影响其它行 */ }
+    }
+    return marked
+  }
+
+  function databaseHealth() {
+    try {
+      store.db.prepare('SELECT 1 AS ok').get()
+      return { ok: true }
+    } catch (error) {
+      return { ok: false, message: String(error?.message || error || 'unknown'), code: String(error?.code || error?.errno || '') }
+    }
+  }
+
+  function lockUnavailableError(targetName, detail) {
+    const error = new Error(`部署锁读不出来（${detail.message}），这次运行没有开始：不确定是否已有部署在写 ${targetName}`)
+    error.code = 'LOCK_UNAVAILABLE'
     return error
   }
 
@@ -1543,7 +1598,10 @@ function createRuntime(ctx, config) {
             sourceIp: actor?.sourceIp || '', requestId: actor?.requestId || '',
           })
         } catch { /* 审计写失败不能掩盖真正的锁冲突 */ }
-        throw lockError(resolvedTarget, attempt.holder)
+        // v3.0-P7 混沌：锁表本身出故障（SQLITE_BUSY / 磁盘满 / 文件被换）时不能伪装成
+        // 「target 被占着」——那会把人的注意力引向另一个部署，而真实原因是库不可用。
+        // 也不能因为读不出来就放行：那等于两个部署同时写同一批主机。
+        throw attempt.unavailable ? lockUnavailableError(resolvedTarget, attempt.unavailable) : lockError(resolvedTarget, attempt.holder)
       }
       heldLock = attempt.lock
     }
@@ -1830,6 +1888,7 @@ function createRuntime(ctx, config) {
         try { locks.release({ target: resolvedTarget, runId: runIdValue }) } catch { /* 释放失败留给 TTL 过期 */ }
       }
       if (active) activeRuns.delete(runIdValue)
+      if (!dryRun) markGhostRuns()
     }
   }
 
@@ -2207,8 +2266,49 @@ function createRuntime(ctx, config) {
     auditVerify({ limit = 5000 } = {}) {
       return { ok: true, ...audit.verify({ limit }) }
     },
+    /**
+     * v3.0-P7 混沌：锁列表顺带体检——「有锁、但持有者早就不在了」是磁盘/DB 故障之后最典型
+     * 的残留（进程被 kill 时 finally 没跑成），它不会自己消失，只会让 target 眼睁睁卡到 TTL 到期。
+     * 单独一个字段而不是直接清掉：清锁是写操作，得有人签字。
+     */
     lockList() {
-      return { ok: true, locks: locks.list() }
+      const listed = locks.listGuarded()
+      const active = new Set(hub.activeRunIds())
+      const rows = listed.locks
+      const health = databaseHealth()
+      return {
+        // 不做抢占（prune）：本进程此刻没有在跑的运行，抢占只会让另一个副本正在用的锁看起来「已死」。
+        // 库读不出来时 ok:false：空锁列表 + ok:true 会被读成「根本没锁着」，那是错的结论。
+        ok: !listed.unavailable,
+        locks: rows.map((row) => ({ ...row, orphan: Boolean(row.runId) && !active.has(row.runId) })),
+        orphans: rows.filter((row) => Boolean(row.runId) && !active.has(row.runId)).map((row) => row.target),
+        unavailable: listed.unavailable,
+        database: health.ok ? health : (listed.unavailable ? { ok: false, message: listed.unavailable.message, code: listed.unavailable.code } : health),
+      }
+    },
+    /**
+     * v3.0-P7 混沌：清理孤儿锁（持有者已经不在 activeRuns 里）。
+     * 一把一把点太慢，而它们的共同点是「谁都不该再等」。返回清单便于事后核对。
+     */
+    lockResetOrphans({ reason = '' } = {}) {
+      const active = new Set(hub.activeRunIds())
+      const cleared = []
+      const kept = []
+      for (const row of locks.listGuarded().locks) {
+        if (row.runId && active.has(row.runId)) { kept.push(row.target); continue }
+        if (!row.runId) { kept.push(row.target); continue }
+        try { locks.forceRelease(row.target) } catch { kept.push(row.target); continue }
+        cleared.push({ target: row.target, runId: row.runId, owner: row.owner })
+        try {
+          audit.record({ action: 'deploy.lock_orphan_cleared', actorId: 'admin', authMethod: 'local', resourceType: 'target', resourceId: row.target, result: 'allow', reason: reason || 'orphan_reset', sourceIp: '', requestId: '' })
+        } catch { /* best effort */ }
+      }
+      return { ok: true, cleared, kept }
+    },
+    /** v3.0-P7 chaos: manually sweep ghost runs. */
+    reconcileRuns() {
+      const marked = markGhostRuns()
+      return { ok: true, marked, database: databaseHealth() }
     },
     lockForceRelease({ target = '', reason = '' } = {}) {
       const result = locks.forceRelease({ target, reason })
@@ -3864,7 +3964,7 @@ function createRuntime(ctx, config) {
       // 同一时刻只该有一个句柄：先停定时器与在跑的运行已经在上层做过了（/database/switch 会先确认没有活跃运行）。
       try { scheduler?.stop() } catch { /* 定时器尽力而为 */ }
       store.close()
-      const next = createStore({ dir: options.workDir, file: target })
+      const next = createStore({ dir: options.workDir, file: target, busyTimeoutMs: options.projects[0]?.busyTimeoutMs })
       store = next
       options.storeFile = target
       storeFileRef.file = target
@@ -5175,7 +5275,7 @@ function registerTools(ctx, runtime) {
     parameters: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['list', 'release'], description: '默认 list' },
+        action: { type: 'string', enum: ['list', 'release', 'reset', 'reconcile'], description: '默认 list；reset=清掉孤儿锁（持有者进程已不在）；reconcile=把上次进程留下的 queued/running 运行收尾' },
         target: { type: 'string', description: 'action=release 时必填' },
         reason: { type: 'string', description: '强制释放的原因（会写审计）' },
       },
@@ -5185,19 +5285,30 @@ function registerTools(ctx, runtime) {
         type: 'object',
         properties: {
           ok: { type: 'boolean' },
-          locks: { type: 'array', items: { type: 'object', properties: { target: { type: 'string' }, projectId: { type: 'string' }, runId: { type: 'string' }, owner: { type: 'string' }, acquiredAt: { type: 'string' }, expiresAt: { type: 'string' }, heartbeatAt: { type: 'string' } } } },
+          locks: { type: 'array', items: { type: 'object', properties: { target: { type: 'string' }, projectId: { type: 'string' }, runId: { type: 'string' }, owner: { type: 'string' }, acquiredAt: { type: 'string' }, expiresAt: { type: 'string' }, heartbeatAt: { type: 'string' }, orphan: { type: 'boolean' } } } },
+          orphans: { type: 'array', items: { type: 'string' } },
+          cleared: { type: 'array', items: { type: 'object', properties: { target: { type: 'string' }, runId: { type: 'string' } } } },
+          marked: { type: 'number' },
+          unavailable: { type: 'object', properties: { message: { type: 'string' }, code: { type: 'string' } } },
+          database: { type: 'object', properties: { ok: { type: 'boolean' }, message: { type: 'string' } } },
           released: { type: 'boolean' },
         },
       },
       render(_args, value) {
         if (value.released !== undefined) return textBlocks(value.released ? '已强制释放锁' : '该 target 没有锁')
+        if (value.marked !== undefined) return textBlocks(value.marked > 0 ? `已把 ${value.marked} 条孤儿运行收尾为失败（进程重启/换库留下的）` : '没有孤儿运行')
+        if (value.cleared) return textBlocks(value.cleared.length === 0 ? '没有孤儿锁' : value.cleared.map((item) => `已清 ${item.target}（run=${item.runId}）`).join('\n'))
         const rows = value.locks || []
+        // 先报「读不出来」再报「没有」：库出错时列表是空的，但结论完全不同。
+        if (value.unavailable) return textBlocks(`锁表读不出来（${value.unavailable.message}）：现在无法确认是否有部署在写，发布会被拒绝`)
         if (rows.length === 0) return textBlocks('（没有部署锁）')
         return textBlocks(rows.map((item) => `${item.target}  run=${item.runId}  owner=${item.owner}  取得 ${item.acquiredAt}  到期 ${item.expiresAt}`).join('\n'))
       },
     },
     async execute(args = {}) {
       if ((args.action || '') === 'release') return runtime.lockForceRelease({ target: args.target || '', reason: args.reason || 'manual release' })
+      if ((args.action || '') === 'reset') return runtime.lockResetOrphans({ reason: args.reason || 'manual reset' })
+      if ((args.action || '') === 'reconcile') return runtime.reconcileRuns()
       return runtime.lockList()
     },
   })
@@ -5521,6 +5632,8 @@ function errorStatus(error) {
   if (code === 'HEALTH_FAILED') return 502
   if (code === 'PIPE_NOT_FOUND') return 404
   if (code === 'PROD_CONFIRM_REQUIRED' || code === 'DEPLOY_IN_PROGRESS' || code === 'DEPLOY_LOCKED') return 409
+  // v3.0-P7：锁表读不出来是「服务端此刻不敢放行」，不是客户端的错，也不是 5xx —— 重试即可。
+  if (code === 'LOCK_UNAVAILABLE') return 503
   // v3.0-P0：身份与授权。401 = 没身份/身份失效；403 = 有身份但没权限。
   if (code === 'AUTH_REQUIRED' || code === 'AUTH_INVALID' || code === 'AUTH_DISABLED') return 401
   if (code === 'SESSION_INVALID' || code === 'SESSION_EXPIRED' || code === 'SESSION_REVOKED') return 401
@@ -7072,6 +7185,12 @@ async function locksResource(request, runtime) {
     if ((params.get('action') || 'list') === 'release') {
       if (!params.get('confirm')) return json({ ok: false, error: '强制释放需要 confirm=1', code: 'CONFIRM_REQUIRED' }, 400)
       return json(runtime.lockForceRelease({ target: params.get('target') || '', reason: params.get('reason') || '' }))
+    }
+    // v3.0-P7：批量清掉「持有者已经不在了」的锁。逐把确认太慢，而它们的共同点是
+    // 谁都不该再等：清空之后仍会逐个留审计，出事能查回去。
+    if ((params.get('action') || '') === 'reset') {
+      if (!params.get('confirm')) return json({ ok: false, error: '清理孤儿锁需要 confirm=1', code: 'CONFIRM_REQUIRED' }, 400)
+      return json(runtime.lockResetOrphans({ reason: params.get('reason') || '' }))
     }
     return json(runtime.lockList())
   } catch (error) { return errorJson(error) }

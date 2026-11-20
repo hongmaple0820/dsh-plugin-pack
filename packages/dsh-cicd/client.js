@@ -449,6 +449,9 @@ window.__ModuleLoader__.load({
       APPROVAL_REQUIRED: '这次发布在等审批：让另一位成员到「审批」页通过它，之后会继续。',
       ARTIFACT_NOT_FOUND: '找不到这个制品：它可能已被 GC；先在有这个制品的机器上重新上传。',
       SERVER_ERROR: 'Host 内部出错：看 Host 日志里同一时间点的堆栈，再重试。',
+      // v3.0-P7 混沌：以前这两个码只会显示英文码本身，用户读不出「现在该做什么」。
+      LOCK_UNAVAILABLE: '部署锁读不出来（数据库忙或磁盘满），这次运行没有开始：等几秒重试，仍然不行就看 Host 日志里的 SQLite 报错。',
+      RUNNER_CLAIM_TIMEOUT: '没有构建机来接这个任务：确认 runner 在线、且没有全部在忙（或调大 runnerWaitSec）。',
     }
 
     /** v0.6 C：审计动作 → 中文标签（Host 的 action 取值见契约）。 */
