@@ -205,6 +205,10 @@ P1+P2+P3 ─→ P5 制品库(3w) ─→ P6 体验(4w) ─→ P7 加固(持续)
 - 压测：1000 并发 run、10 万行日志、50 台主机。
 - 混沌：runner 掉线、DB 锁、磁盘满、网络分区。
 - 兼容：v1 pipe.yml 长期支持；DB 迁移可回滚。
+  - ✅ **迁移台账**：`lib/db.js:MIGRATION_NOTES` + `schema_migrations` 表，每版一行人话说明，并诚实标出破坏性变更（v1 建表、v7 重建 steps 主键、v11 指针表改 WITHOUT ROWID）——只有 `PRAGMA user_version` 时，「退回去会怎样」没人答得上。
+  - ✅ **迁移是一次事务**：`runInTransaction` 把 DDL 与 ALTER 一起包进 `BEGIN IMMEDIATE`。以前每步各自提交，中途断电会留下半个版本（runs 已有 config_snapshot 但 user_version 还停在 7）。
+  - ✅ **备份可换回去**：`runtime.switchStore({file})` + `POST /database/switch?confirm=1` + `cicd_database_switch`。目标库比插件新（`user_version > SCHEMA_VERSION`）拒开，有运行在跑时拒换，换完 auth/audit/locks/approvalGate 全部重建——只换 store 会让审计与锁继续写进旧文件。
+  - ✅ **只读盘不崩**：写请求必须给出可读的 HTTP 错误，读请求继续工作（`test/smoke.mjs` 的「P7 混沌与兼容」用例把 workDir 置 0o555 后验证）。
 - 可观测：run 耗时 P50/P95、排队时长、缓存命中率、部署成功率（DORA 已有基础）。
   - ✅ **run 耗时 / 排队 / 拥堵 / 阶段占比 / 重跑**：`lib/dora.js:summarizeRunQuality`（P50/P95 用最近秩法，取真实观测值而不是插值）+ `/metrics` + `cicd_metrics`。
   - ✅ **磁盘占用**：`/storage` 递归统计 logs / artifacts / cache / 数据库各自的字节数与文件数（制品无上限增长，运维要能回答「离满还有多远」）。

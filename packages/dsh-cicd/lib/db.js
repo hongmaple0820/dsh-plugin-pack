@@ -325,41 +325,40 @@ function hasColumn(db, table, column) {
  * 老库的 steps 主键是 (run_id, stage_id, idx)，v7 要的是 4 列主键。
  * SQLite 不能改主键，只能建新表搬数据——搬的语法在 3.25+ 可用 `RENAME`，但更稳的做法是
  * 建新表 → INSERT SELECT → 删旧表 → 改名，这样在任何版本都一样。
+ *
+ * 事务由调用方（migrate 的 runInTransaction）负责：自己再 BEGIN 一次会报
+ * "cannot start a transaction within a transaction"，而且嵌套事务一旦中途失败，
+ * 外层已经写进去的步骤就回不去了。
  */
 function rebuildStepsWithJobId(db) {
   const columns = db.prepare('PRAGMA table_info(steps)').all().map((row) => String(row?.name || ''))
   if (columns.includes('job_id')) return false
   db.exec('PRAGMA foreign_keys = OFF')
   try {
-    db.exec('BEGIN')
     db.exec(`CREATE TABLE steps_v7 (
-      run_id TEXT NOT NULL,
-      stage_id TEXT NOT NULL DEFAULT '',
-      job_id TEXT NOT NULL DEFAULT '',
-      idx INTEGER NOT NULL DEFAULT 0,
-      name TEXT NOT NULL DEFAULT '',
-      command TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL DEFAULT '',
-      exit_code INTEGER NOT NULL DEFAULT 0,
-      duration_ms INTEGER NOT NULL DEFAULT 0,
-      attempts INTEGER NOT NULL DEFAULT 1,
-      timeout_s INTEGER NOT NULL DEFAULT 0,
-      log_path TEXT NOT NULL DEFAULT '',
-      started_at TEXT NOT NULL DEFAULT '',
-      finished_at TEXT NOT NULL DEFAULT '',
-      runner_id TEXT NOT NULL DEFAULT '',
-      PRIMARY KEY (run_id, stage_id, job_id, idx)
+    run_id TEXT NOT NULL,
+    stage_id TEXT NOT NULL DEFAULT '',
+    job_id TEXT NOT NULL DEFAULT '',
+    idx INTEGER NOT NULL DEFAULT 0,
+    name TEXT NOT NULL DEFAULT '',
+    command TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT '',
+    exit_code INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 1,
+    timeout_s INTEGER NOT NULL DEFAULT 0,
+    log_path TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL DEFAULT '',
+    finished_at TEXT NOT NULL DEFAULT '',
+    runner_id TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (run_id, stage_id, job_id, idx)
     )`)
     const hasRunner = columns.includes('runner_id')
     db.exec(`INSERT INTO steps_v7 (run_id, stage_id, job_id, idx, name, command, status, exit_code, duration_ms, attempts, timeout_s, log_path, started_at, finished_at, runner_id)
-      SELECT run_id, stage_id, '', idx, name, command, status, exit_code, duration_ms, attempts, timeout_s, log_path, started_at, finished_at, ${hasRunner ? 'runner_id' : "''"}
-      FROM steps`)
+    SELECT run_id, stage_id, '', idx, name, command, status, exit_code, duration_ms, attempts, timeout_s, log_path, started_at, finished_at, ${hasRunner ? 'runner_id' : "''"}
+    FROM steps`)
     db.exec('DROP TABLE steps')
     db.exec('ALTER TABLE steps_v7 RENAME TO steps')
-    db.exec('COMMIT')
-  } catch (error) {
-    try { db.exec('ROLLBACK') } catch { /* 回滚失败就让错误继续抛 */ }
-    throw error
   } finally {
     db.exec('PRAGMA foreign_keys = ON')
   }
@@ -375,9 +374,8 @@ function ensureRefsWithoutRowid(db) {
   const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'artifact_refs'").get()
   const sql = String(row?.sql || '')
   if (!sql || /WITHOUT\s+ROWID/i.test(sql)) return false
-  db.exec('BEGIN')
-  try {
-    db.exec(`CREATE TABLE artifact_refs_v11 (
+  // 事务由 migrate 的 runInTransaction 负责（见 rebuildStepsWithJobId 的注释）。
+  db.exec(`CREATE TABLE artifact_refs_v11 (
       owner TEXT NOT NULL,
       name TEXT NOT NULL,
       digest TEXT NOT NULL,
@@ -386,61 +384,122 @@ function ensureRefsWithoutRowid(db) {
       updated_at TEXT NOT NULL DEFAULT '',
       PRIMARY KEY (owner, name)
     ) WITHOUT ROWID`)
-    db.exec(`INSERT INTO artifact_refs_v11 (owner, name, digest, previous, project_id, updated_at)
+  db.exec(`INSERT INTO artifact_refs_v11 (owner, name, digest, previous, project_id, updated_at)
       SELECT owner, name, digest, previous, project_id, updated_at FROM artifact_refs`)
-    db.exec('DROP TABLE artifact_refs')
-    db.exec('ALTER TABLE artifact_refs_v11 RENAME TO artifact_refs')
+  db.exec('DROP TABLE artifact_refs')
+  db.exec('ALTER TABLE artifact_refs_v11 RENAME TO artifact_refs')
+  return true
+}
+
+/**
+ * v3.0-P7：迁移说明表。
+ *
+ * 旧版只有一个 `PRAGMA user_version` 表示「最后是哪一版」，但它没有任何文字说明：
+ * 用户备份出一个 v9 的库，第二天想退回 v3.0-P4 的插件版本时，没有任何地方能回答
+ * 「v9 到底比 v8 多了什么、能不能回去」。所以除了版本号还写一张 schema_migrations：
+ * 每一版一行，带一句人话描述。
+ *
+ * 注意它记的是**已到过**的版本，不记时点（同一个文件在 WAL 下随进程变化），
+ * 所以它是「这批表结构经历过什么」的台账，不是迁移的审计日志。
+ */
+const MIGRATION_NOTES = {
+  1: { note: '初始表：runs / steps / releases / operations', additive: false },
+  2: { note: 'releases 增加 env 列', additive: true },
+  3: { note: 'operations 补审计列（action / actor / result / reason…）', additive: true },
+  4: { note: '审计与身份相关表', additive: true },
+  5: { note: 'steps 增加 runner_id', additive: true },
+  6: { note: 'approvals / runners / tokens 等', additive: true },
+  7: { note: 'steps 主键从 3 列扩到 4 列（加 job_id）——重建表', additive: false },
+  8: { note: 'runs 增加 config_snapshot / config_hash', additive: true },
+  9: { note: 'releases 增加回滚现场（artifact_digest / mode / strategy / instances / operator）', additive: true },
+  10: { note: '制品表（artifact_blobs / artifact_refs）', additive: true },
+  11: { note: '指针表改成 WITHOUT ROWID', additive: false },
+  12: { note: '晋级表 promotions + releases 增加 version', additive: true },
+}
+
+function migrationNote(version) {
+  return MIGRATION_NOTES[version] || { note: '未登记的一版', additive: true }
+}
+
+/**
+ * 迁移是**一次事务**。
+ *
+ * 以前每一步 ALTER 各自提交，中途断电就会留下半个版本：例如 runs 已经有了
+ * config_snapshot 但 user_version 还停在 7，下一次启动又从头跑一遍这些 ALTER ——
+ * 靠 hasColumn 之流能侥幸跑通，但只要有一步不是幂等的，库就再也打不开了。
+ * 现在 DDL 与 ALTER 一起包在 BEGIN IMMEDIATE / COMMIT 里：全成或全不成。
+ */
+function runInTransaction(db, work) {
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const result = work()
     db.exec('COMMIT')
+    return result
   } catch (error) {
-    try { db.exec('ROLLBACK') } catch { /* 回滚失败就让错误继续抛 */ }
+    try { db.exec('ROLLBACK') } catch { /* 事务已经没了，别再遮住原始错误 */ }
     throw error
   }
-  return true
+}
+
+function recordMigration(db, version) {
+  db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    note TEXT NOT NULL DEFAULT '',
+    additive INTEGER NOT NULL DEFAULT 1,
+    applied_at TEXT NOT NULL
+  )`)
+  const info = migrationNote(version)
+  db.prepare('INSERT OR REPLACE INTO schema_migrations (version, note, additive, applied_at) VALUES (?, ?, ?, ?)')
+    .run(version, info.note, info.additive ? 1 : 0, new Date().toISOString())
 }
 
 function migrate(db) {
   const row = db.prepare('PRAGMA user_version').get()
   const version = Number(row?.user_version ?? 0)
-  for (const sql of DDL) db.exec(sql)
-  // v1 → v2：老库的 releases 没有 env 列，CREATE TABLE IF NOT EXISTS 不会补，这里显式加。
-  if (!hasColumn(db, 'releases', 'env')) {
-    db.exec(`ALTER TABLE releases ADD COLUMN env TEXT NOT NULL DEFAULT ''`)
-  }
-  // v2 → v3：老库的 operations 只有 run_id/kind/detail/at，按需补审计列。
-  for (const [name, definition] of OPERATION_COLUMNS) {
-    if (!hasColumn(db, 'operations', name)) {
-      db.exec(`ALTER TABLE operations ADD COLUMN ${name} ${definition}`)
+  if (version >= SCHEMA_VERSION) return version
+  runInTransaction(db, () => {
+    for (const sql of DDL) db.exec(sql)
+    // v1 → v2：老库的 releases 没有 env 列，CREATE TABLE IF NOT EXISTS 不会补，这里显式加。
+    if (!hasColumn(db, 'releases', 'env')) {
+      db.exec(`ALTER TABLE releases ADD COLUMN env TEXT NOT NULL DEFAULT ''`)
     }
-  }
-  // v4 → v5：老库的 steps 没有 runner_id 列，CREATE TABLE IF NOT EXISTS 不会补，这里显式加。
-  if (!hasColumn(db, 'steps', 'runner_id')) {
-    db.exec(`ALTER TABLE steps ADD COLUMN runner_id TEXT NOT NULL DEFAULT ''`)
-  }
-  // v6 → v7：steps 主键从 3 列扩到 4 列（加 job_id）。主键改不了，只能重建表搬数据；
-  // v1 的旧行 job_id 一律为空串（v1 没有 job 概念），语义与原来完全等价。
-  // 注意必须在 DDL 之后做：DDL 里的 CREATE TABLE IF NOT EXISTS 对老库是空操作，不会帮上忙。
-  rebuildStepsWithJobId(db)
-  // v7 → v8：runs 增加配置快照两列。重跑必须跑「当时那份配置」，所以快照存原始 YAML 全文，
-  // hash 只用来判断「今天的 pipe.yml 和那次运行的是不是同一份」。
-  for (const name of ['config_snapshot', 'config_hash']) {
-    if (!hasColumn(db, 'runs', name)) {
-      db.exec(`ALTER TABLE runs ADD COLUMN ${name} TEXT NOT NULL DEFAULT ''`)
+    // v2 → v3：老库的 operations 只有 run_id/kind/detail/at，按需补审计列。
+    for (const [name, definition] of OPERATION_COLUMNS) {
+      if (!hasColumn(db, 'operations', name)) {
+        db.exec(`ALTER TABLE operations ADD COLUMN ${name} ${definition}`)
+      }
     }
-  }
-  // v8 → v9：releases 增加回滚现场五列。老行留空串——它们确实没有这些信息，
-  // 编一个默认值（比如 mode='native'）会让「这条记录到底有没有实例信息」变得不可判断。
-  // v11 → v12：再加 version —— 制品自己的版本号（pip 版本化发布据此排序），与 commit 无关。
-  for (const name of ['artifact_digest', 'mode', 'strategy', 'instances', 'operator', 'version']) {
-    if (!hasColumn(db, 'releases', name)) {
-      db.exec(`ALTER TABLE releases ADD COLUMN ${name} TEXT NOT NULL DEFAULT ''`)
+    // v4 → v5：老库的 steps 没有 runner_id 列，CREATE TABLE IF NOT EXISTS 不会补，这里显式加。
+    if (!hasColumn(db, 'steps', 'runner_id')) {
+      db.exec(`ALTER TABLE steps ADD COLUMN runner_id TEXT NOT NULL DEFAULT ''`)
     }
-  }
-  // v10 → v11：指针表改成 WITHOUT ROWID。v10 的迁移脚本先建过一次普通表（带 rowid），
-  // 这里按「有没有 rowid」判新旧——PRAGMA index_list 看不出这个，只能问 sqlite_master 的原始 DDL。
-  ensureRefsWithoutRowid(db)
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_operations_at ON operations (at DESC)`)
-  db.exec(`UPDATE operations SET action = kind WHERE action = '' AND kind <> ''`)
-  if (version < SCHEMA_VERSION) db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+    // v6 → v7：steps 主键从 3 列扩到 4 列（加 job_id）。主键改不了，只能重建表搬数据；
+    // v1 的旧行 job_id 一律为空串（v1 没有 job 概念），语义与原来完全等价。
+    // 注意必须在 DDL 之后做：DDL 里的 CREATE TABLE IF NOT EXISTS 对老库是空操作，不会帮上忙。
+    rebuildStepsWithJobId(db)
+    // v7 → v8：runs 增加配置快照两列。重跑必须跑「当时那份配置」，所以快照存原始 YAML 全文，
+    // hash 只用来判断「今天的 pipe.yml 和那次运行的是不是同一份」。
+    for (const name of ['config_snapshot', 'config_hash']) {
+      if (!hasColumn(db, 'runs', name)) {
+        db.exec(`ALTER TABLE runs ADD COLUMN ${name} TEXT NOT NULL DEFAULT ''`)
+      }
+    }
+    // v8 → v9：releases 增加回滚现场五列。老行留空串——它们确实没有这些信息，
+    // 编一个默认值（比如 mode='native'）会让「这条记录到底有没有实例信息」变得不可判断。
+    // v11 → v12：再加 version —— 制品自己的版本号（pip 版本化发布据此排序），与 commit 无关。
+    for (const name of ['artifact_digest', 'mode', 'strategy', 'instances', 'operator', 'version']) {
+      if (!hasColumn(db, 'releases', name)) {
+        db.exec(`ALTER TABLE releases ADD COLUMN ${name} TEXT NOT NULL DEFAULT ''`)
+      }
+    }
+    // v10 → v11：指针表改成 WITHOUT ROWID。v10 的迁移脚本先建过一次普通表（带 rowid），
+    // 这里按「有没有 rowid」判新旧——PRAGMA index_list 看不出这个，只能问 sqlite_master 的原始 DDL。
+    ensureRefsWithoutRowid(db)
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_operations_at ON operations (at DESC)`)
+    db.exec(`UPDATE operations SET action = kind WHERE action = '' AND kind <> ''`)
+    for (let step = 1; step <= SCHEMA_VERSION; step += 1) recordMigration(db, step)
+    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+  })
   return version
 }
 

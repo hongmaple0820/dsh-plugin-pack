@@ -16,7 +16,7 @@ import {
 import { parsePipe, planPipeline, interpolate, matchArtifacts, PipeError, defaultRestartCommand, isHostSelector, parseHostSelector, splitTargetHosts } from '../lib/pipe.js'
 import { createStore } from '../lib/store.js'
 import { PROMOTION_ERRORS, promotionError, envRequiresPromotion, findSourceRelease, currentPointer, reachablePointer, isPromoted, listPromotions, recordPromotion, promotionView } from '../lib/promotions.js'
-import { openDatabase } from '../lib/db.js'
+import { openDatabase, SCHEMA_VERSION } from '../lib/db.js'
 import { DatabaseSync } from 'node:sqlite'
 import { runPipeline, makeRunId } from '../lib/runner.js'
 import { createRemote, remoteUnavailable } from '../lib/remote.js'
@@ -782,10 +782,10 @@ function callPath(pathname, query = '', { headers = {} } = {}) {
   return route.resource(new Request(`http://x${pathname}${query}`, { headers }))
 }
 
-check('apply：注册 34 个工具、46 条路由（42 exact + 4 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
-  assert.equal(ctx.toolsList.length, 34)
+check('apply：注册 36 个工具、48 条路由（44 exact + 4 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
+  assert.equal(ctx.toolsList.length, 36)
   assert.deepEqual(ctx.toolsList.map((tool) => tool.name).sort(), [
-    'cicd_approve', 'cicd_artifacts', 'cicd_audit', 'cicd_auth', 'cicd_cancel', 'cicd_dora', 'cicd_environments', 'cicd_locks',
+    'cicd_approve', 'cicd_artifacts', 'cicd_audit', 'cicd_auth', 'cicd_cancel', 'cicd_database', 'cicd_database_switch', 'cicd_dora', 'cicd_environments', 'cicd_locks',
     'cicd_logs', 'cicd_metrics', 'cicd_notify_ledger', 'cicd_onboarding', 'cicd_pipe_save', 'cicd_plan', 'cicd_project_create', 'cicd_project_meta',
     'cicd_projects', 'cicd_promotions',
     'cicd_rbac', 'cicd_registry', 'cicd_releases', 'cicd_rollback', 'cicd_run', 'cicd_runners', 'cicd_secrets', 'cicd_status',
@@ -798,10 +798,10 @@ check('apply：注册 34 个工具、46 条路由（42 exact + 4 prefix）、1 �
     assert.equal(typeof tool.output.render, 'function')
     assert.equal(typeof tool.execute, 'function')
   }
-  assert.equal(ctx.routes.length, 46)
+  assert.equal(ctx.routes.length, 48)
   assert.deepEqual(ctx.routes.filter((route) => route.kind === 'exact').map((route) => route.path).sort(), [
     '/api/plugins/cicd/approvals', '/api/plugins/cicd/approve', '/api/plugins/cicd/artifacts', '/api/plugins/cicd/audit', '/api/plugins/cicd/auth',
-    '/api/plugins/cicd/cancel', '/api/plugins/cicd/dora', '/api/plugins/cicd/environments', '/api/plugins/cicd/locks',
+    '/api/plugins/cicd/cancel', '/api/plugins/cicd/database', '/api/plugins/cicd/database/switch', '/api/plugins/cicd/dora', '/api/plugins/cicd/environments', '/api/plugins/cicd/locks',
     '/api/plugins/cicd/log', '/api/plugins/cicd/metrics', '/api/plugins/cicd/notify-ledger', '/api/plugins/cicd/notify-test', '/api/plugins/cicd/onboarding',
     '/api/plugins/cicd/operations', '/api/plugins/cicd/pipe-save',
     '/api/plugins/cicd/plan', '/api/plugins/cicd/preview', '/api/plugins/cicd/project-create', '/api/plugins/cicd/project-meta', '/api/plugins/cicd/projects',
@@ -820,7 +820,7 @@ check('apply：注册 34 个工具、46 条路由（42 exact + 4 prefix）、1 �
   assert.equal(typeof ctx.upgrades[0].handler, 'function')
 })
 
-check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补注册 42+4 条；remote() 惰性取 port', () => {
+check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补注册 44+4 条；remote() 惰性取 port', () => {
   const coldRoutes = []
   const coldUpgrades = []
   const coldWeb = {
@@ -842,8 +842,8 @@ check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补�
   assert.ok(typeof scopeFn === 'function', 'apply 应把路由注册挂到 ctx.inject 上')
   // 模拟 webServer 就绪：cordis 以一个能 get 到服务的 scope 触发回调（真实环境由服务就绪事件驱动）。
   scopeFn({ get: (key) => (key === 'webServer' ? coldWeb : undefined), effect() {} })
-  assert.equal(coldRoutes.length, 46, '就绪后应补注册 42 条 exact + 4 条 prefix 路由')
-  assert.equal(coldRoutes.filter((route) => route.kind === 'exact').length, 42)
+  assert.equal(coldRoutes.length, 48, '就绪后应补注册 44 条 exact + 4 条 prefix 路由')
+  assert.equal(coldRoutes.filter((route) => route.kind === 'exact').length, 44)
   assert.equal(coldUpgrades.length, 1, '就绪后应补注册 /log-ws upgrade 路由')
 
   // remote() 惰性解析：apply 时拿不到 port（remoteBase 为空），就绪后首次调用应取到 55470。
@@ -1041,6 +1041,87 @@ checkAsync('v3.0-P6-2 模板中心：内置 9 种 + 自定义模板 + 另存为�
     } finally { repo.close() }
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
+checkAsync('v3.0-P7 混沌与兼容：只读盘不写库、备份可换回去、迁移台账说得出退得回', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cicd-p7-chaos-'))
+  let repo = null
+  try {
+    // ---- ① 只读磁盘：库都在，但一个字节也写不进去 ----
+    const work = join(dir, 'work')
+    mkdirSync(work, { recursive: true })
+    repo = await repoTool(work)
+    const first = await repo.call('/projects')
+    assert.equal(first.status, 200, '盘还好的时候应该能读')
+    // workDir 置只读，模拟「盘满了 / 挂载成 ro」：读必须继续工作，写必须明确失败，
+    // 而不是把进程打挂。注意 SQLite 已经预先建好了 -wal/-shm，纯读不一定碰盘，
+    // 所以这里断言的是「接口没崩、错误是可读的 HTTP 错误」，不是「一定抛 EACCES」。
+    chmodSync(work, 0o555)
+    let readOnly = null
+    try {
+      const again = await repo.call('/projects')
+      assert.equal(again.status, 200, '盘坏了也不能连读都读不了：' + JSON.stringify(again.body).slice(0, 120))
+      // 只读盘上唯一必须成立的是「接口还在正常回话」，具体形状由别的用例钉住。
+      assert.equal(again.body.ok !== false, true, '只读盘上读请求不该报错：' + JSON.stringify(again.body).slice(0, 140))
+      // 写会失败——失败必须是一个正常的 HTTP 错误，而不是未捕获异常
+      const created = await repo.call('/project-create?confirm=1&name=blocked&path=' + encodeURIComponent(join(dir, 'blocked')))
+      readOnly = created.status
+      assert.ok(created.status >= 400, '写不进去时必须明确失败，实际 ' + created.status)
+    } finally {
+      chmodSync(work, 0o755)
+    }
+    assert.ok(readOnly !== null, '必须真的试过一次写')
+
+    // ---- ② 备份 → 换库 → 换回去 ----
+    const info = repo.runtime.database()
+    assert.equal(info.userVersion, info.schemaVersion, '刚建好的库应该就是当前版本')
+    assert.ok(info.migrations.length >= 1, '迁移台账不能是空的')
+    const top = info.migrations[info.migrations.length - 1]
+    assert.equal(top.version, info.schemaVersion)
+    assert.ok(top.note.length > 0, '每一版都得有一句人话说明，否则「退回去会怎样」没人答得上')
+    const backup = join(dir, 'backup.db')
+    // 用 SQLite 自己的备份语法，而不是复制文件：WAL 模式下直接拷 .db 会丢掉还没 checkpoint 的部分。
+    repo.runtime.store.db.exec("VACUUM INTO '" + backup.replace(/'/g, "''") + "'")
+    assert.ok(existsSync(backup), '备份文件应该落盘')
+    const original = repo.runtime.dbFilePath()
+    const switched = await repo.runtime.switchStore({ file: backup })
+    assert.equal(switched.switched, true)
+    assert.equal(repo.runtime.dbFilePath(), backup, '换完之后读库路径必须是新的那条')
+    assert.equal((await repo.runtime.switchStore({ file: backup })).switched, false, '同一个文件不该重复换')
+    const restored = await repo.runtime.switchStore({ file: original })
+    assert.equal(restored.switched, true)
+    assert.equal(repo.runtime.dbFilePath(), original)
+    // 换库最容易漏掉的一步：审计与锁必须跟着换，否则它们继续往旧文件里写，看起来一切正常。
+    repo.runtime.auditRecord({ action: 'test.after_switch', actorId: 'tester', resourceType: 'db', resourceId: 'switch', result: 'allow', reason: '' })
+    const events = repo.runtime.auditList({ limit: 5 }).events
+    assert.ok(events.some((event) => event.action === 'test.after_switch'), '换库之后审计要写进新库')
+
+    // ---- ③ 迁移台账与版本边界 ----
+    const tooNew = join(dir, 'toonew.db')
+    const raw = openDatabase(tooNew)
+    raw.exec('PRAGMA user_version = ' + (repo.runtime.database().schemaVersion + 1))
+    raw.close()
+    await assert.rejects(() => repo.runtime.switchStore({ file: tooNew }), (error) => error.code === 'DB_VERSION_TOO_NEW',
+      '比插件还新的库必须拒开：旧代码读新表结构等于当场损坏数据')
+    await assert.rejects(() => repo.runtime.switchStore({ file: join(dir, 'nope.db') }), (error) => error.code === 'DB_SWITCH_MISSING')
+    await assert.rejects(() => repo.runtime.switchStore({ file: '' }), (error) => error.code === 'DB_SWITCH_INVALID')
+    // /database 与 /database/switch 都要能走 HTTP：换库不是一个只能在代码里调的函数。
+    const dbInfo = await repo.call('/database')
+    assert.equal(dbInfo.status, 200)
+    assert.equal(dbInfo.body.userVersion, dbInfo.body.schemaVersion)
+    // 没身份时先被身份挡住（403），这是对的——普通用例里没有 cookie；
+    // 所以这里断言的是「一定拒」，具体挡在哪一层不写死。
+    const noConfirm = await repo.call('/database/switch?file=' + encodeURIComponent(backup))
+    assert.ok(noConfirm.status >= 400, '换库不给 confirm 必须拒绝，实际 ' + noConfirm.status)
+    assert.ok(noConfirm.body.ok !== true)
+    const switchedHttp = await repo.call('/database/switch?confirm=1&file=' + encodeURIComponent(backup))
+    assert.ok(switchedHttp.status >= 400, '无身份时换库也必须被拒，实际 ' + switchedHttp.status)
+    assert.equal(repo.runtime.dbFilePath(), original, '被拒的换库不能把库换掉')
+  } finally {
+    try { repo?.close() } catch { /* runner 可能没起 */ }
+    try { chmodSync(join(dir, 'work'), 0o755) } catch { /* 已经是可写 */ }
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 checkAsync('v3.0-P6-6 引导：四步全由库现算，做完才打勾，项目换一个不会假装已完成', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'cicd-p6-6-'))
   try {
@@ -1260,7 +1341,7 @@ checkAsync('routes：operations 时间线、notify-test 未配置与写保护', 
 })
 
 check('routes：所有资源都走 resource，没有 handler/POST 形态', () => {
-  assert.equal(ctx.routes.length, 46)
+  assert.equal(ctx.routes.length, 48)
   for (const route of ctx.routes) {
     assert.equal(route.handler, undefined)
     assert.ok(route.kind === 'exact' || route.kind === 'prefix')
@@ -1355,6 +1436,14 @@ check('DB：v1 库迁移到 user_version=12，补出 env、operations 审计列�
 
   const db = openDatabase(file)
   assert.equal(Number(db.prepare('PRAGMA user_version').get().user_version), 12)
+  // v3.0-P7：迁移必须留下台账——旧版只有版本号，没人答得上「这一版比上一版多了什么」。
+  const ledger = db.prepare('SELECT version, note, additive FROM schema_migrations ORDER BY version').all()
+  assert.equal(ledger.length, SCHEMA_VERSION, '每一版都得有一行')
+  assert.equal(Number(ledger[ledger.length - 1].version), 12)
+  assert.ok(ledger.every((row) => String(row.note || '').length > 0), '每一版的说明不能是空的')
+  // 破坏性变更（重建表 / 改主键）必须诚实标出来，否则「能不能退回去」会被答成能退。
+  const breaking = ledger.filter((row) => Number(row.additive) === 0).map((row) => Number(row.version))
+  assert.deepEqual(breaking, [1, 7, 11])
   // v3.0-P5：制品 CAS 的两张表必须随迁移补出来，否则上传能落盘、列表却是空的。
   for (const table of ['artifact_blobs', 'artifact_refs']) {
     assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(table), `迁移后应有 ${table} 表`)

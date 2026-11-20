@@ -20,10 +20,11 @@ import { createHash, timingSafeEqual, randomBytes } from 'node:crypto'
 import { Readable } from 'node:stream'
 import fs, { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, isAbsolute, join, relative } from 'node:path'
+import { basename, isAbsolute, join, relative, resolve } from 'node:path'
 import { parsePipe, planPipeline, interpolate, matchArtifacts, isHostSelector, parseHostSelector, explainWhen, stageConditionOf } from './lib/pipe.js'
 import { createStore, DEFAULT_WORK_DIR } from './lib/store.js'
-import { DB_FILE_NAME } from './lib/db.js'
+import { DatabaseSync } from 'node:sqlite'
+import { SCHEMA_VERSION, DB_FILE_NAME } from './lib/db.js'
 import { runPipeline, makeRunId } from './lib/runner.js'
 import { createRemote } from './lib/remote.js'
 import { deployRelease, rollbackRelease, readReleaseDigest, verifyRemoteArtifact } from './lib/deploy.js'
@@ -442,9 +443,14 @@ function uniqueProjectId(projects, base) {
 
 function createRuntime(ctx, config) {
   const options = normalizeConfig(config, ctx)
-  const store = createStore({ dir: options.workDir })
+  let store = createStore({ dir: options.workDir })
   // 数据库文件的实际路径：storage() 要按字节报它，而不是按目录。
-  const storeFile = options.storeFile || join(options.workDir, DB_FILE_NAME);
+  // switchStore（P7 备份恢复）会在运行时换库，早于它定义的那些函数必须看见新路径，
+  // 所以真实路径装在这个盒子里，而不是让每个调用点都去读一个会被替换的局部变量。
+  const storeFileRef = { file: options.storeFile || join(options.workDir, DB_FILE_NAME) };
+  // 任何读库路径的地方都走这个 getter：switchStore 之后旧的那个 let 不会再更新
+  // （它只活在被替换前后的那一瞬间），用函数才能保证读到当前值。
+  const dbFile = () => storeFileRef.file;
   // v2.0-M0：把向导创建并持久化的项目并入启动配置里的项目（按 id 去重，配置里的优先）。
   const configuredIds = new Set(options.projects.map((project) => project.id))
   for (const row of store.projects()) {
@@ -464,7 +470,7 @@ function createRuntime(ctx, config) {
     },
   })
   // V2-M4：审批门（block gate）+ secrets 存储（DB 只存 ref，载荷落 workDir/.secrets.json）
-  const approvalGate = createApprovalGate({ db: store.db, ttlSec: options.approval?.ttlSec })
+  let approvalGate = createApprovalGate({ db: store.db, ttlSec: options.approval?.ttlSec })
   // 密钥来源按 env → config.keyFile → <workDir>/secrets.key 解析（见 lib/secrets.js）。
   // 密文落 .secrets.json，所以「备份带走」不再等于「明文带走」—— 这才是 P4-4 要修的那件事。
   const secrets = createSecretStore({
@@ -547,9 +553,9 @@ function createRuntime(ctx, config) {
   const rbac = createRbac({ dir: options.workDir })
   // v3.0-P0：身份、授权、审计、部署锁。四者都挂在同一个 DB 句柄上，
   // 保证「谁在什么时候对什么资源做了什么」和「锁」都是持久且可验证的。
-  const auth = createAuth({ db: store.db, sessionTtlSec: options.auth?.sessionTtlSec, bootstrapAllowAnonymous: options.auth?.bootstrapAllowAnonymous !== false })
-  const audit = createAudit({ db: store.db })
-  const locks = createDeployLocks({ db: store.db, ttlSec: options.deploy?.lockTtlSec })
+  let auth = createAuth({ db: store.db, sessionTtlSec: options.auth?.sessionTtlSec, bootstrapAllowAnonymous: options.auth?.bootstrapAllowAnonymous !== false })
+  let audit = createAudit({ db: store.db })
+  let locks = createDeployLocks({ db: store.db, ttlSec: options.deploy?.lockTtlSec })
   // v3.0-P0：远端构建机注册表落库（吊销持久生效，心跳超时按 3× 周期判死）。
   const runners = createRunnerRegistry({ db: store.db, heartbeatSec: options.runners?.heartbeatSec })
   // v3.0-P2：工具链托管（JDK/Node/Python/Maven…）。store 在 workDir 下，所以同一台机器上
@@ -1963,14 +1969,14 @@ function createRuntime(ctx, config) {
       return { path: target, bytes, files }
     }
     const database = (() => {
-      try { return statSync(storeFile).size } catch { return 0 }
+      try { return statSync(dbFile()).size } catch { return 0 }
     })()
     return {
       workDir: options.workDir,
       logs: dir(join(options.workDir, 'logs')),
       artifacts: dir(options.artifacts.dir || join(options.workDir, 'artifacts')),
       cache: options.cache?.dir ? dir(options.cache.dir) : null,
-      database: { path: storeFile, bytes: database },
+      database: { path: dbFile(), bytes: database },
       // 磁盘告警线：日志与制品是无上限增长的，这一条用来回答「现在离满还有多远」。
       total: dir(options.workDir),
     }
@@ -3725,11 +3731,85 @@ function createRuntime(ctx, config) {
       })
       return { ok: true, configured, webhooks: results }
     },
+    /** 当前在写的库文件（switchStore 之后会变，所以读它别缓存）。 */
+    dbFilePath() {
+      return dbFile()
+    },
+    /**
+     * v3.0-P7：库的状态与搬迁。只读——查一下当前是哪一版、这张库经历过哪些迁移。
+     */
+    database() {
+      const file = dbFile()
+      let bytes = 0
+      try { bytes = statSync(file).size } catch { bytes = 0 }
+      const version = Number(store.db.prepare('PRAGMA user_version').get()?.user_version ?? 0)
+      let migrations = []
+      try {
+        migrations = store.db.prepare('SELECT version, note, additive, applied_at FROM schema_migrations ORDER BY version').all()
+          .map((row) => ({ version: Number(row.version), note: String(row.note || ''), additive: Number(row.additive) === 1, appliedAt: String(row.applied_at || '') }))
+      } catch { migrations = [] }
+      return {
+        ok: true,
+        file,
+        bytes,
+        userVersion: version,
+        schemaVersion: SCHEMA_VERSION,
+        migrations,
+        // 「能不能退回旧插件版本」只看一条：这一版之后有没有过破坏性的表结构变化。
+        // 版本号本身回答不了这个问题——v8→v9 全是加列，v10→v11 却是改主键。
+        additiveSince: migrations.filter((item) => item.version > 0 && !item.additive).map((item) => item.version),
+      }
+    },
+    /**
+     * v3.0-P7：把库换成一个别的文件（恢复备份用）。
+     *
+     * 只有**先 dispose 再重建**这一条安全路径：审计、锁、审批门、调度器都各自握着
+     * 一个 DatabaseSync 句柄与准备好的语句，换掉 store 而留下那些，等于两个库同时活着，
+     * 一半读旧一半写新。所以这里只做最小心跳：先确认目标文件能打开且版本不超前，
+     * 再关掉旧库、开新库、把 options 的库路径改过去。
+     * 库路径立刻改成新的（同步完成）：拖到 await 之后再改，中间的窗口期会有人往旧库写。
+     */
+    async switchStore({ file = '' } = {}) {
+      const target = String(file || '')
+      if (!target) throw Object.assign(new Error('切换库需要 file'), { code: 'DB_SWITCH_INVALID' })
+      if (!existsSync(target)) throw Object.assign(new Error('目标库不存在：' + target), { code: 'DB_SWITCH_MISSING' })
+      if (resolve(target) === resolve(dbFile())) return { ok: true, switched: false, file: dbFile(), reason: 'already' }
+      let probe = null
+      let targetVersion = 0
+      try {
+        probe = new DatabaseSync(target)
+        targetVersion = Number(probe.prepare('PRAGMA user_version').get()?.user_version ?? 0)
+      } catch (error) {
+        throw Object.assign(new Error('目标库打不开：' + (error.message || error)), { code: 'DB_SWITCH_INVALID' })
+      } finally {
+        try { probe?.close() } catch { /* 探针关不掉不影响结论 */ }
+      }
+      // 比本插件还新的库不接：旧代码读新表结构，会把「不认识的列」当场变成数据损坏。
+      if (targetVersion > SCHEMA_VERSION) {
+        throw Object.assign(new Error(`目标库是 v${targetVersion}，比当前插件的 v${SCHEMA_VERSION} 还新，拒绝打开`), { code: 'DB_VERSION_TOO_NEW' })
+      }
+      const from = dbFile()
+      // 同一时刻只该有一个句柄：先停定时器与在跑的运行已经在上层做过了（/database/switch 会先确认没有活跃运行）。
+      try { scheduler?.stop() } catch { /* 定时器尽力而为 */ }
+      store.close()
+      const next = createStore({ dir: options.workDir, file: target })
+      store = next
+      options.storeFile = target
+      storeFileRef.file = target
+      // 这四个各自 prepare 了自己的语句，换库必须整体重建——只换 store 会让审计与锁
+      // 继续写进旧文件，看起来一切正常，实际记到了没人会再读的地方。
+      auth = createAuth({ db: next.db, sessionTtlSec: options.auth?.sessionTtlSec, bootstrapAllowAnonymous: options.auth?.bootstrapAllowAnonymous !== false })
+      audit = createAudit({ db: next.db })
+      locks = createDeployLocks({ db: next.db, ttlSec: options.deploy?.lockTtlSec })
+      approvalGate = createApprovalGate({ db: next.db, ttlSec: options.approval?.ttlSec })
+      return { ok: true, switched: true, from, file: target, userVersion: targetVersion }
+    },
     dispose() {
       try { scheduler?.stop() } catch { /* scheduler timers are best effort */ }
       try { hub.dispose() } catch { /* hub observers are best effort */ }
       try { approvalGate.dispose() } catch { /* approval gate is in-memory */ }
       activeRuns.clear()
+      // store 在 switchStore 之后会换掉，所以这里读的是当前那个（闭包捕获的是变量本身）。
       store.close()
     },
   }
@@ -4479,6 +4559,60 @@ function registerTools(ctx, runtime) {
       },
     },
     async execute() { return runtime.storage() },
+  })
+
+  register({
+    name: 'cicd_database_switch',
+    description: '把当前库换成一个备份文件（恢复备份）。有运行在跑时拒绝；目标库版本比插件新时拒绝。写操作，需要 confirm。',
+    parameters: {
+      type: 'object',
+      properties: {
+        file: { type: 'string', description: '备份库的绝对路径（可用 VACUUM INTO 生成）' },
+        confirm: { type: 'boolean', description: '必须为 true' },
+      },
+      required: ['file'],
+    },
+    output: {
+      schema: { type: 'object', properties: { switched: { type: 'boolean' }, from: { type: 'string' }, file: { type: 'string' }, reason: { type: 'string' } } },
+      render(_args, value) {
+        if (value.switched === false) return textBlocks(`没有换库：${value.reason || '已在目标库上'}（${value.file}）`)
+        return textBlocks(`已换到 ${value.file}` + (value.from ? `（原库 ${value.from}）` : ''))
+      },
+    },
+    async execute(args) {
+      if (!args.confirm) throw Object.assign(new Error('换库需要 confirm=true'), { code: 'CONFIRM_REQUIRED' })
+      const running = runtime.hub.activeRunIds()
+      if (running.length) throw Object.assign(new Error('还有 ' + running.length + ' 个运行在跑，等它们结束再换库'), { code: 'DB_SWITCH_BUSY', runs: running })
+      return runtime.switchStore({ file: String(args.file || '') })
+    },
+  })
+
+  register({
+    name: 'cicd_database',
+    description: '这张库是哪一版（user_version）、经历过哪些迁移、哪些版本退不回旧插件（破坏性结构变更）。恢复备份前先问它。',
+    parameters: { type: 'object', properties: {} },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          file: { type: 'string' },
+          bytes: { type: 'number' },
+          userVersion: { type: 'number' },
+          schemaVersion: { type: 'number' },
+          migrations: { type: 'array', items: { type: 'object', properties: { version: { type: 'number' }, note: { type: 'string' }, additive: { type: 'boolean' }, appliedAt: { type: 'string' } } } },
+          additiveSince: { type: 'array', items: { type: 'number' } },
+        },
+      },
+      render(_args, value) {
+        const rows = Array.isArray(value.migrations) ? value.migrations : []
+        const head = `库 ${value.file} · v${value.userVersion}/${value.schemaVersion} · ${Math.round((value.bytes || 0) / 1024)} KB`
+        const tail = Array.isArray(value.additiveSince) && value.additiveSince.length
+          ? `破坏性变更在 v${value.additiveSince.join(', v')}——回到更早的插件版本需要一份更早的备份`
+          : '全部迁移都是加列/加表，旧插件版本能打开这份库'
+        return textBlocks([head, '', ...rows.map((row) => `  v${row.version} ${row.additive ? '+' : '!'} ${row.note}`), '', tail])
+      },
+    },
+    async execute() { return runtime.database() },
   })
 
   register({
@@ -5312,6 +5446,8 @@ function errorJson(error) {
 }
 
 const WRITE_CONFIRMS = new Set(['1', 'prod'])
+// 换库只认 confirm=1：它不像部署那样有「prod」这种分级，错一次就是数据没了。
+const SWITCH_CONFIRMS = new Set(['1'])
 
 /** 读一个 JSON 请求体；空体或坏 JSON 都当「没给参数」，交给 query 兜底。 */
 async function jsonBodyOf(request) {
@@ -5870,6 +6006,48 @@ async function notifyLedgerResource(request, runtime) {
   const limit = intParam(params, 'limit', { fallback: 20, min: 1, max: 50 })
   if (limit.error) return json({ ok: false, error: limit.error }, 400)
   try { return json({ ok: true, ...runtime.notifyLedger({ limit: limit.value }) }) } catch (error) { return errorJson(error) }
+}
+
+/**
+ * v3.0-P7：`/database` —— 这张库是哪一版、经历过哪些迁移、哪些版本退不回去（只读）。
+ *
+ * 恢复备份之前必须先问清楚目标库的版本：把 v12 的插件指向 v13 的库，
+ * 不是「少几个字段」，是旧代码按旧语义读新结构。
+ */
+async function databaseResource(request, runtime) {
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
+  const params = queryOf(request)
+  const bad = unsupportedParams(params, new Set([]))
+  if (bad) return json({ ok: false, error: bad }, 400)
+  const guard = authorizeRead(request, params, { runtime, action: ACTIONS.AUDIT_READ, resource: { type: 'project', id: '' } })
+  if (guard) return guard
+  try { return json(runtime.database()) } catch (error) { return errorJson(error) }
+}
+
+/**
+ * v3.0-P7：`/database/switch` —— 把当前库换成一个别的文件（恢复备份）。
+ *
+ * 写操作，必须 confirm=1。**有运行在跑时一律拒绝**：换库会把 store 整体替换，
+ * 正在跑的那次部署会在下一次写日志时写进另一个库，事后没人能拼出它到底做了什么。
+ */
+async function databaseSwitchResource(request, runtime) {
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
+  const params = queryOf(request)
+  const body = await jsonBodyOf(request)
+  const merged = new Map(params)
+  for (const [key, value] of Object.entries(body || {})) merged.set(key, String(value))
+  const bad = unsupportedParams(merged, new Set(['file', 'confirm']))
+  if (bad) return json({ ok: false, error: bad }, 400)
+  const guard = authorize(request, merged, { runtime, action: ACTIONS.MANAGE_PROJECT, resource: { type: 'database', id: '' }, confirms: SWITCH_CONFIRMS })
+  if (guard) return guard
+  const file = String(merged.get('file') || '')
+  if (!file) return json({ ok: false, error: '需要 file（ backups 里的库文件绝对路径）', code: 'DB_SWITCH_INVALID' }, 400)
+  // 活跃运行是硬前提，不是建议：换库不会等它，它也不会知道自己被换走了。
+  const running = runtime.hub.activeRunIds()
+  if (running.length) {
+    return json({ ok: false, error: '还有 ' + running.length + ' 个运行在跑，等它们结束再换库', code: 'DB_SWITCH_BUSY', runs: running }, 409)
+  }
+  try { return json(await runtime.switchStore({ file })) } catch (error) { return errorJson(error) }
 }
 
 async function triggersResource(request, runtime) {
@@ -6805,7 +6983,10 @@ function registerHttpRoutes(ctx, runtime) {
     { kind: 'exact', path: `${ROUTE_PREFIX}/notify-test`, resource: (request) => notifyTestResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/cancel`, resource: (request) => cancelResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/dora`, resource: (request) => doraResource(request, runtime) },
-    // v3.0-P7：可观测（运行质量 / 磁盘占用 / 通知投递台账）
+    // v3.0-P7：可观测（运行质量 / 磁盘占用 / 通知投递台账）与库的版本台账
+    { kind: 'exact', path: `${ROUTE_PREFIX}/database`, resource: (request) => databaseResource(request, runtime) },
+    // 换库（恢复备份）：写操作，必须 confirm=1，且不能在有人跑的时候换。
+    { kind: 'exact', path: `${ROUTE_PREFIX}/database/switch`, resource: (request) => databaseSwitchResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/metrics`, resource: (request) => metricsResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/storage`, resource: (request) => storageResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/notify-ledger`, resource: (request) => notifyLedgerResource(request, runtime) },
