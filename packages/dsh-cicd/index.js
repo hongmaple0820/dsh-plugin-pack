@@ -751,7 +751,9 @@ function createRuntime(ctx, config) {
         failures: guards.invalid.map((item) => ({ condition: 'config', code: 'ENV_GUARD_MISCONFIGURED', message: item?.message || String(item), env: item?.env || '' })),
       }
     }
-    const guard = guards.byEnv.get(name) || null
+    // 名单里没有这个环境名时，约定名（prod）仍按"受保护且名单为空"判：漏配是拒绝的理由，
+    // 不是放行的理由。其它环境名没写进名单就等于不受保护（见 assertEnvironmentGuard 的 isProd）。
+    const guard = guards.byEnv.get(name) || fallbackGuardOf(name)
     return assertEnvironmentGuard({ env: name, guard, actor, branch, tag, digestPresent })
   }
 
@@ -783,9 +785,142 @@ function createRuntime(ctx, config) {
     return { id, role: String(project?.role || '') }
   }
 
+  /**
+   * 账本里「这台主机现在装着的是哪一版」。
+   * 回滚的默认语义是退回到**当前版本之前的上一版**，所以先得知道当前是谁：
+   * 调用方显式给了 releaseId 时一切都不猜；没给时用 active release 补齐，
+   * 否则 rollbackOne 只能拿着 current 去指回它自己（原地重放，还白跑一次重启）。
+   */
+  function currentReleaseId(targetName, host) {
+    try {
+      const active = store.activeRelease({ target: targetName, host })
+      return String(active?.id || '')
+    } catch {
+      return ''
+    }
+  }
+
+  /**
+   * 这个 target 归属哪个环境：护栏里写了同名环境就用它（名字对得上才叫同一个环境），
+   * 否则 target 名本身就是环境名。返回空串表示"未知"，调用方按 target 名兜底。
+   */
+  function deployEnvironmentOf(guards, targetName) {
+    const name = String(targetName || '')
+    if (!name) return ''
+    try {
+      if (guards?.byEnv?.has?.(name)) return name
+      const alias = guards?.byEnv?.get?.(name)
+      if (alias?.name) return String(alias.name)
+    } catch { /* 护栏读不出来就按 target 名算 */ }
+    return name
+  }
+
+  /**
+   * 约定名环境（prod 就是约定名，见 lib/environments.js:27）。没写名单时它依然受保护：
+   * 守卫缺省（null）和「显式关掉」是两回事，前者是漏配，后者才需要判 MISCONFIGURED。
+   */
+  function fallbackGuardOf(name) {
+    const text = String(name || '')
+    if (text.toLowerCase() !== 'prod') return null
+    return { name: text, protected: true, allowedActors: [], branchRule: '', approval: true }
+  }
+
+  /** 配置写错这一类码：审批批不过来，只能改 pipe.yml 或宿主配置。 */
+  const CONFIG_GUARD_CODES = new Set(['ENV_GUARD_NO_ALLOWLIST', 'ENV_GUARD_MISCONFIGURED'])
+
+  /**
+   * 这一次运行会不会走到发布步骤。没限定 stage 时整条流水线都会跑，所以算「会」。
+   * 判定失败一律按「会」处理：宁可在最前面多判一次，也不要让配置写死的护栏被绕过。
+   */
+  function stageTouchesDeploy(pipe, stage) {
+    try {
+      const wanted = String(stage || '')
+      const stages = Array.isArray(pipe.stages) ? pipe.stages : []
+      if (!wanted) return stages.some((item) => stageHasDeploy(item))
+      const hit = stages.find((item) => item.id === wanted)
+      return hit ? stageHasDeploy(hit) : true
+    } catch {
+      return true
+    }
+  }
+
+  function stageHasDeploy(stage) {
+    if (!stage) return false
+    if (stage.deploy) return true
+    return (stage.steps || []).some((step) => step && step.deploy)
+  }
+
+  /**
+   * 部署前的环境护栏预检（与 deployStep 里的那道是同一个判定单点）。
+   * 只看本项目视角能确定的环境：target 名本身、以及 target.protected；主机上的 env 标签要读远端，
+   * 那一步留在 deployStep —— 但配置写错这种"不发出去也能判"的拒绝必须发生在最前面。
+   * 返回 { ok:true } 或 { ok:false, error }（error.code 沿用护栏的 ENV_GUARD_*）。
+   */
+  function preflightEnvironmentGuard(project, pipe, targetName, actor, runId, { configOnly = false } = {}) {
+    let envs
+    try {
+      // 环境清单与守卫都由 normalizeEnvironments 一次算齐：宿主半边的护栏只有这一个入口，
+      // 手拼两份清单会让预检和 deployStep 对"哪些环境受保护"给出不同答案。
+      envs = normalizeEnvironments(pipe.targets || {}, options.environments)
+    } catch {
+      return { ok: true }
+    }
+    // 只判这次运行真正会部署到的环境：target 自己的环境名，加上同一条流水线里其它
+    // deploy 步骤声明的 target。别的项目/面板上写坏一个不相干的 prod 守卫，不该让
+    // 一条只有 dev target 的流水线发不出去。
+    const guards = guardsFor(targetProject(project, targetName))
+    const env = deployEnvironmentOf(guards, targetName)
+    const names = new Set(env ? [env] : [])
+    const steps = []
+    for (const stage of (Array.isArray(pipe.stages) ? pipe.stages : [])) {
+      if (stage && stage.deploy) steps.push(stage.deploy)
+      for (const step of (stage?.steps || [])) { if (step && step.deploy) steps.push(step.deploy) }
+    }
+    for (const step of steps) {
+      const declared = deployEnvironmentOf(guards, String(step.target || targetName))
+      if (declared) names.add(declared)
+    }
+    for (const name of names) {
+      if (!name) continue
+      const verdict = environmentGuard({
+        env: name,
+        actor,
+        branch: project.branch || '',
+        tag: project.tag || '',
+        digestPresent: null,
+        project,
+      })
+
+      if (verdict.ok) continue
+      // 只要配置类失败时（审批门之前的预检），主体/分支/digest 的结论不在这里下：
+      // 那几条要等 deployStep 拿到真实主机清单与本次运行的产物再判。
+      const failures = configOnly ? verdict.failures.filter((item) => CONFIG_GUARD_CODES.has(item.code)) : verdict.failures
+      if (failures.length === 0) continue
+      for (const failure of failures) {
+        try {
+          audit.record({
+            action: 'deploy.env_guard_deny', actorId: String(actor?.id || ''), authMethod: '',
+            resourceType: 'environment', resourceId: name, projectId: project.id, result: 'deny',
+            reason: failure.code + ': ' + failure.message, sourceIp: '', requestId: runId || '',
+          })
+        } catch { /* 审计失败不改变拒绝 */ }
+      }
+      const error = Object.assign(new Error(failures.map((item) => item.message).join('；')), {
+        code: failures[0]?.code || 'ENV_GUARD_DENIED',
+        env: name,
+        failures,
+      })
+      return { ok: false, error }
+    }
+    return { ok: true }
+  }
+
   function markPreviousSuperseded(targetName, host) {
     const previous = store.activeRelease({ target: targetName, host })
-    if (previous && previous.id) {
+    // 已经在同一台主机上活跃的同一份 release（典型场景：回滚到 current 指向的那一版）
+    // 不需要再写一条 superseded：那会把"当前装着的版本"在账本里注销掉，
+    // 让 releases() 一片空白、environments() 的 current 变空——状态机自相矛盾。
+    if (previous && previous.id && String(previous.status || '') === 'active') {
       store.appendRelease({ ...previous, status: 'superseded', deactivated_at: new Date().toISOString() })
     }
     return previous
@@ -1210,8 +1345,18 @@ function createRuntime(ctx, config) {
     return results
   }
 
-  async function deployStep({ project, step, runId, commit, log }) {
+  async function deployStep({ project, step, runId, commit, log, failFast = null }) {
     const { targetName, target } = resolveTargetForStep(project, step)
+    // 环境护栏里"配置写错"那一类在开跑之前就已经有答案了：带 failFast 进来时先把它说出来。
+    // （不在这里抛：deployStep 的返回体是部署结果的结构，抛异常会把整条运行变成"缺一条 step 结果"。）
+    if (failFast && !failFast.ok) {
+      // 与 deployStep 自己的那条拒绝保持同一措辞：日志里出现「环境护栏拦下 [env] CODE：原因」，
+      // 面板和 grep 才认得出这是护栏拒的，而不是构建脚本自己失败的。
+      for (const failure of failFast.error.failures || [{ code: failFast.error.code, message: failFast.error.message }]) {
+        try { log?.('环境护栏拦下 [' + (failFast.error.env || '') + '] ' + failure.code + '：' + failure.message) } catch { /* 日志失败不改变拒绝 */ }
+      }
+      throw failFast.error
+    }
     // 选择器在部署前展开成真实别名：deploy.js 只认别名清单，不认 env:/group:/tag:。
     // 用宽容版展开：护栏必须在任何主机被改动**之前**跑完，而 expandTarget 要读远端主机清单。
     // dsh-remote 没就绪时读不到清单，若在这里抛，护栏就永远轮不到判 —— 白名单/分支/digest
@@ -1415,9 +1560,16 @@ function createRuntime(ctx, config) {
     }
 
     if (!result.ok) {
-      const error = new Error(`部署失败：${result.error || '有主机未完成发布'}`)
+      // 「有主机未完成发布」这句等于把运维指回命令本身：真实原因（权限、磁盘满、健康检查没过）
+      // 只存在于每台主机的 error 里。主机多的时候还要说清是哪几台，所以逐台拼一句。
+      const failedHosts = result.hosts.filter((item) => !item.ok)
+      const detail = failedHosts
+        .map((item) => `[${item.host}] ${item.error || item.code || '未完成发布'}`)
+        .join('；')
+      const error = new Error(`部署失败：${detail || result.error || '有主机未完成发布'}`)
       error.code = 'HOST_FAILED'
       error.hosts = result.hosts
+      error.failedHosts = failedHosts
       throw error
     }
     return { status: 'success', deploy: result }
@@ -1528,9 +1680,15 @@ function createRuntime(ctx, config) {
     }
 
     if (!result.ok) {
-      const error = new Error(`部署失败：${result.error || '有主机未完成发布'}`)
+      // 事务路径同 native：失败原因在每台主机的 error/phase/layer 上，主机号只有拼出来才知道是哪台。
+      const failedHosts = result.hosts.filter((item) => !item.ok)
+      const detail = failedHosts
+        .map((item) => `[${item.host}] ${item.error || item.code || '未完成发布'}`)
+        .join('；')
+      const error = new Error(`部署失败：${detail || result.error || '有主机未完成发布'}`)
       error.code = 'HOST_FAILED'
       error.hosts = result.hosts
+      error.failedHosts = failedHosts
       throw error
     }
     return { status: 'success', deploy: result }
@@ -1621,6 +1779,17 @@ function createRuntime(ctx, config) {
     // 会把锁泄漏到 TTL 到期（默认 30 分钟）——期间 target 像被鬼占着，
     // 面板上没人能部署，也没人知道为什么。
     try {
+    // 重跑前先把过期审批收口：上一次那条 waiting_approval 若还没人批，它已经是终态了，
+    // 不该和这次的运行记录混在一起（状态机上两条运行不能同时"在等审批"）。
+    reapExpiredApprovals()
+    // 预检环境护栏必须排在审批门前：配置写错（受保护环境漏配 allowedActors、protected: false、
+    // approval: false、规则写坏）在这台机器上永远不可能通过审批来解锁 —— 先申请审批只会留下
+    // 一条无人能批的 waiting_approval，30 分钟后自己超时，用户还得回头去找"为什么没部署"。
+    // 「你是谁 / 分支对不对」那种要读运行主体与主机标签的判定仍留给 deployStep（那里才有主机清单）。
+    if (!dryRun && !runnerId && stageTouchesDeploy(pipe, stage)) {
+      const preflight = preflightEnvironmentGuard(project, pipe, resolvedTarget, actorForGuard(project), runIdValue, { configOnly: true })
+      if (!preflight.ok) throw preflight.error
+    }
     // v3.0-P0：审批门（block gate）。prod 环境默认 approvalRequired，
     // 闸门绑 target + artifact digest，而不是绑 run；审批通过后由 consume() 一次性消费。
     // 「要不要审批」= target 显式 approvalRequired / 名字叫 prod（见 lib/pipe.js:369）。
@@ -1773,8 +1942,9 @@ function createRuntime(ctx, config) {
       const extraVars = secrets.refsForInterpolate(project.id, {})
       // v3.0-P0：同一次运行取一份「明文值表」交给 runner 做日志脱敏——命令回显也不会漏。
       const secretValues = typeof secrets.valuesFor === 'function' ? secrets.valuesFor(project.id) : []
-      // v3.0-P0：长流水线要在跑的过程中给锁续期，否则 TTL 到了会被别的部署抢占。
-      const heartbeatHandleLocal = heldLock ? setInterval(() => {
+
+    // v3.0-P0：长流水线要在跑的过程中给锁续期，否则 TTL 到了会被别的部署抢占。
+    const heartbeatHandleLocal = heldLock ? setInterval(() => {
         try { locks.heartbeat({ target: resolvedTarget, runId: runIdValue }) } catch { /* 续期失败让 TTL 兜底 */ }
       }, Math.max(30_000, Math.floor((options.deploy.lockTtlSec * 1000) / 3))) : null
       heartbeatHandle = heartbeatHandleLocal
@@ -1802,7 +1972,9 @@ function createRuntime(ctx, config) {
         // 传工厂而不是实例：动作打印的每一行都必须经过 runner 的 log(where, line)，
         // 否则「哪个 job 的哪一步说了什么」就丢了，分片日志里也找不到。
         actions: dryRun ? null : (lineLog) => createActionRuntime({ project, runId: runIdValue, pipe, log: lineLog }),
-        executeDeploy: dryRun ? null : (context) => deployStep({ project, step: context.step, runId: context.runId, commit: project.commit || '', log: context.log }),
+        // 发布前先过环境护栏：名单写错、分支规则对不上，答案在 build 之前就定了，
+        // 留到 deployStep 里判会先给出一条成功的 build 和一条永远无人能批的待审批（死锁）。
+        executeDeploy: dryRun ? null : (context) => deployStep({ project, step: context.step, runId: context.runId, commit: project.commit || '', log: (line) => { try { context.log?.(line) } catch { /* 日志失败不改变结果 */ } }, failFast: preflightEnvironmentGuard(project, pipe, resolveTargetForStep(project, context.step).targetName, actorForGuard(project), context.runId) }),
       })
       if (!dryRun && run.runId) {
         for (const stageInfo of run.stages) {
@@ -1921,6 +2093,9 @@ function createRuntime(ctx, config) {
         settleStarted(info)
       },
     }).catch((error) => {
+      // started 与 promise 是两条线：executeRun 可能在 run 真正开始之前就失败（生产护栏、锁、
+      // runner 掉线）。只把错误交给 promise 的调用方，等 started 的那一边会永远挂着 ——
+      // webhook 的 runHook 正是这样在等，结果请求成功返回、运行记录却一条都没有。
       settleError(error)
       try {
         store.appendOperation({
@@ -2291,7 +2466,13 @@ function createRuntime(ctx, config) {
       return { ok: true, events, total: events.length, stats: audit.stats() }
     },
     auditVerify({ limit = 5000 } = {}) {
-      return { ok: true, ...audit.verify({ limit }) }
+      // 「链被改过」是这条路由的正常业务结论，不是请求失败：外层的 ok 表示「这次校验跑完了」，
+      // verify 自己的 ok 表示「链完整吗」。写反了（ok: true 在前、被 ...verify 覆盖）会让
+      // callApi 抛错并把 brokenSeq/expected/actual —— 按钮唯一要回答的三个值 —— 一起丢掉。
+      // 链断是业务结论，routeOk 才是「这次校验跑完了」：两个字段必须分开。
+      // 写成 { ...verify, ok: true } 会让断链的结论被 ok:true 覆盖，前端拿到 ok:true 就等于
+      // 宣布「链是完整的」—— 这是把篡改报成健康，比不校验更糟。
+      return { ok: true, routeOk: true, ...audit.verify({ limit }) }
     },
     /**
      * v3.0-P7 混沌：锁列表顺带体检——「有锁、但持有者早就不在了」是磁盘/DB 故障之后最典型
@@ -3447,6 +3628,9 @@ function createRuntime(ctx, config) {
       return { ok: true, users: rbac.users(), audit: rbac.exportAudit().slice(-20) }
     },
     status({ project: projectId, limit = 20 } = {}) {
+      // 懒扫描也要覆盖这里：面板/CI 轮询的是 status，如果只靠 approvals() 收口，
+      // 那么「没人打开审批列表」时这条运行会一直显示等待审批，而它其实早就超时了。
+      reapExpiredApprovals()
       return { runs: store.runs({ project: projectId, limit }).map(runSummary), running: activeRunList(projectId) }
     },
     logs({ runId, tail = 200, jobId = '' } = {}) {
@@ -3481,8 +3665,8 @@ function createRuntime(ctx, config) {
         text: clipped.text,
       }
     },
-    releases({ target, host = '', env = '', limit = 20 } = {}) {
-      const releases = store.releases({ target, host, env, limit })
+    releases({ target, host = '', env = '', project = '', limit = 20 } = {}) {
+      const releases = store.releases({ target, host, env, project, limit })
       return {
         target: target || '',
         host: host || '',
@@ -3514,12 +3698,18 @@ function createRuntime(ctx, config) {
         const rollbackDigest = normalizeDigest(targetRow?.artifactDigest || targetRow?.artifact_digest || '')
         if (rollbackDigest) await runtime.artifactGate({ projectId: found.project.id, env: rollbackEnv, digest: rollbackDigest, host })
       }
+      // releaseId 缺省时先把"当前装的是哪一版"从账本里补上：回滚的语义是**退回到上一版**，
+      // 只拿 current 去指回它自己等于原地重放，还白跑一次重启与健康检查。
+      // 账本里那条 active 只用来定位"当前版本"，真正退到哪一版由 rollbackOne 从 manifest 链上取；
+      // 链断了（老 release 没有 manifest）才原地重放，至少 current 与心跳一致。
+      const effectiveReleaseId = releaseId || currentReleaseId(found.targetName, host || resolution.hosts[0])
       const result = await rollbackRelease({
         remote: remote(),
         target: { ...found.target, hosts: resolution.hosts },
         targetName: found.targetName,
         host,
-        releaseId,
+        releaseId: effectiveReleaseId,
+        rollBackwards: !releaseId,
         commit: found.project.commit || '',
       })
       for (const item of result.hosts.filter((entry) => entry.ok)) {
@@ -3694,6 +3884,43 @@ function createRuntime(ctx, config) {
       if (!text) throw Object.assign(new Error('另存为模板需要给 source 文本或 project'), { code: 'TEMPLATE_SOURCE_REQUIRED' })
       return writeTemplate(options, { id: id || saveAs || name, name: name || saveAs || id, description, kind: derivedKind, source: text })
     },
+    /**
+     * 「这个项目现在发不出去，缺的是哪一行配置」——实时算，不落库。
+     *
+     * 建项目与 onboarding 都要回答它：模板给的起点里没有任何环境名单，而受保护环境
+     * （名字叫 prod，或 target.protected）没有 allowedActors 就等于谁都不许部署。
+     * 等到第一次点「运行」才发现这件事，体验上就是"新建完就废了"。
+     */
+    deploymentReadiness(project) {
+      let pipe = null
+      try { pipe = readPipe(project) } catch { return { ok: false, error: 'pipe.yml 读不出来', targetNames: [], requiredConfig: [] } }
+      const targetNames = Object.keys(pipe.targets || {})
+      // 名单可能写在 pipe 的 environments 里，也可能写在宿主配置里：和运行期走同一个
+      // guardsFor，才不会出现"引导说配好了、真跑却被拦"的分歧。
+      const guards = guardsFor(project)
+      // 写坏的条目在 parseEnvironmentGuards 里是"收进 invalid 并整体拒绝"，byEnv 里反而没有这个名字；
+      // 只按 byEnv 判会把它读成"没配"→ 误报成 NO_ALLOWLIST，用户照提示改完还是发不出去。
+      // 但不许因为别的项目/别处写坏的一条就整片报错：只认这个项目自己在用的环境名。
+      const brokenFor = (guards.invalid || []).filter((item) => item.env && targetNames.includes(item.env))
+      if (brokenFor.length > 0) {
+        const broken = brokenFor.map((item) => ({ env: item.env || '', reason: 'ENV_GUARD_MISCONFIGURED', message: item.message || '' }))
+        return { ok: false, targetNames, environments: targetNames, invalid: broken, requiredConfig: broken.map((item) => ({ env: item.env, key: `environments.${item.env || '<环境>'}.allowedActors`, reason: item.reason, message: item.message })) }
+      }
+      const environments = normalizeEnvironments(pipe.targets || {}, guards.byEnv)
+      const requiredConfig = []
+      for (const name of targetNames) {
+        const spec = environments[name]
+        if (!spec || !spec.protected) continue
+        // 名单挂在 spec.guard 上（normalizeEnvironments 只把护栏整条塞进来，不摊平），
+        // 别在 spec 顶层找 allowedActors —— 那里永远没有，会把配好的名单一直读成"没配"。
+        const actors = spec.guard?.allowedActors
+        // 名单为空（含"根本没配"）就是发不出去；显式 false 走 MISCONFIGURED，同样发不出去。
+        if (!Array.isArray(actors) || actors.length === 0) {
+          requiredConfig.push({ env: name, key: `environments.${name}.allowedActors`, reason: 'ENV_GUARD_NO_ALLOWLIST' })
+        }
+      }
+      return { ok: true, targetNames, environments: targetNames, requiredConfig }
+    },
     async createProject({ kind = 'static', name = '', path = '', repoUrl = '', branch = '', template = '' } = {}) {
       let dir
       if (repoUrl) {
@@ -3756,6 +3983,9 @@ function createRuntime(ctx, config) {
         branch: meta.branch,
         commit: meta.commit,
         pipeSource,
+        // 起点是模板给的，受保护环境还没名单：把「必须补哪一行」随建随带出来，
+        // 而不是等人第一次部署撞在 ENV_GUARD_NO_ALLOWLIST 上。
+        requiredConfig: runtime.deploymentReadiness(project).requiredConfig || [],
       }
     },
     /**
@@ -3781,6 +4011,10 @@ function createRuntime(ctx, config) {
       const targetNames = pipe ? Object.keys(pipe.targets || {}) : []
       let environments = []
       try { environments = pipe ? Object.keys(normalizeEnvironments(pipe.targets)) : [] } catch { environments = [] }
+      // 部署能不能发出去，是第②③④步之前的前置条件：模板项目的开头没有环境名单，
+      // 受保护环境会被护栏直接拒。把它算成独立一步，用户才知道该去改哪一行。
+      const readiness = project && pipe ? runtime.deploymentReadiness(project) : { requiredConfig: [] }
+      const missingConfig = readiness.requiredConfig || []
       steps.push({
         id: 'project',
         title: project ? `项目 ${project.name}` : '新建第一个项目',
@@ -3792,6 +4026,18 @@ function createRuntime(ctx, config) {
           ? (pipe ? (targetNames.length ? '' : '在编辑器里加一个 targets 条目') : '打开编辑器修好 pipe.yml')
           : '在「新建」里挑一张模板卡，填个名字即可',
         action: project ? (pipe ? 'editor' : 'editor') : 'create',
+      })
+
+      // ①b 环境名单：受保护环境没有 allowedActors 时，任何部署都会被护栏拒。
+      steps.push({
+        id: 'guards',
+        title: '配好受保护环境的名单',
+        done: missingConfig.length === 0,
+        detail: missingConfig.length === 0
+          ? '受保护环境都有人可以部署。'
+          : missingConfig.map((item) => `${item.key} 还没有生效的值（${item.reason}）`).join('；'),
+        next: missingConfig.length === 0 ? '' : `在 pipe.yml 里写 ${missingConfig[0].key}（如 [role:owner]）`,
+        action: 'editor',
       })
 
       // ② 身份：引导期（库里一个账号都没有）的部署是以 anonymous 记进审计的。
@@ -3821,7 +4067,9 @@ function createRuntime(ctx, config) {
       })
 
       // ④ staging 首部署：真的落到一台机器上，才算回答「我能不能发布」。
-      const releases = project ? store.releases({ limit: 1 }) : []
+      // 这一步问的是「这个项目」发出去过没有：全库最后一条发布记录可能来自别的项目，
+      // 拿它当本项目的完成证据，等于替一个从没部署过的项目打勾。
+      const releases = project ? store.releases({ limit: 1, project: project.id }) : []
       steps.push({
         id: 'deploy',
         title: '部署到 staging',
@@ -3844,6 +4092,8 @@ function createRuntime(ctx, config) {
         total: steps.length,
         complete: doneCount === steps.length,
         currentStep: current ? current.id : '',
+        // 面板可以直接把这几条渲染成「去改这一行」，不必自己再解析一遍 pipe.yml。
+        requiredConfig: missingConfig,
       }
     },
     validatePipe({ source = '', project: projectId = '' } = {}) {

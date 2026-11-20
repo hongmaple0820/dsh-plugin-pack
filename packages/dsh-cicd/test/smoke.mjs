@@ -1559,14 +1559,16 @@ checkAsync('v3.0-P6-6 引导：四步全由库现算，做完才打勾，项目�
       // ① 空库：没有任何一件事算完成，四步都说得出口且只给一个下一步。
       const fresh = await repo.call('/onboarding?project=app').then((response) => response.json())
       assert.equal(fresh.ok, true)
-      assert.equal(fresh.total, 4)
-      assert.deepEqual(fresh.steps.map((step) => step.id), ['project', 'identity', 'run', 'deploy'])
+      assert.equal(fresh.total, 5)
+      // guards（环境名单）排在身份前面：名单没配时，后面三步做完了也发不出去。
+      assert.deepEqual(fresh.steps.map((step) => step.id), ['project', 'guards', 'identity', 'run', 'deploy'])
       assert.equal(fresh.steps[0].done, true, 'pipe.yml 可读，项目这一步就该是完成的：' + JSON.stringify(fresh.steps[0]))
       assert.deepEqual(fresh.targetNames, ['staging', 'prod'])
-      assert.equal(fresh.steps[1].done, false, '库里没有账号时身份这步不能算完成')
-      assert.equal(fresh.steps[2].done, false)
+      assert.equal(fresh.steps[1].done, false, 'pipe 里 prod 没配 allowedActors，名单这步不能打勾')
+      assert.equal(fresh.steps[2].done, false, '库里没有账号时身份这步不能算完成')
       assert.equal(fresh.steps[3].done, false)
-      assert.equal(fresh.currentStep, 'identity', '第一步没做完时「下一步」应指向它，而不是从后往前找')
+      assert.equal(fresh.steps[4].done, false)
+      assert.equal(fresh.currentStep, 'guards', '名单没配时「下一步」应先指向它，而不是从后往前找')
       assert.equal(fresh.complete, false)
       // 没完成的每一步都必须给一个具体动作，否则新用户还是不知道该点哪。
       for (const step of fresh.steps.filter((item) => !item.done)) {
@@ -1579,16 +1581,17 @@ checkAsync('v3.0-P6-6 引导：四步全由库现算，做完才打勾，项目�
       const withUser = await repo.call('/onboarding?project=app').then((response) => response.json())
       const identity = withUser.steps.find((step) => step.id === 'identity')
       assert.equal(identity.done, true, '库里有了账号，身份这步必须打勾')
+      // 共 5 步：project + identity 完成，guards 仍然缺（这份 pipe 的 prod 没有名单）。
       assert.equal(withUser.doneCount, 2)
-      assert.equal(withUser.currentStep, 'run', '项目与身份都完成后，下一步应轮到第一次运行')
+      assert.equal(withUser.currentStep, 'guards', '身份完成后，仍缺的环境名单是挡在发布前的第一件事')
 
       // ③ 有过一次运行才轮到 deploy；直接往库里写一行模拟历史，避免真跑构建。
-      assert.equal(withUser.steps[2].done, false)
+      assert.equal(withUser.steps[3].done, false)
       repo.runtime.store.appendRun({ id: 'run-guide-1', projectId: 'app', status: 'succeeded', startedAt: new Date().toISOString() })
       const afterRun = await repo.call('/onboarding?project=app').then((response) => response.json())
-      assert.equal(afterRun.steps[2].done, true, '库里有了运行记录，运行这步必须打勾')
+      assert.equal(afterRun.steps[3].done, true, '库里有了运行记录，运行这步必须打勾')
       assert.equal(afterRun.doneCount, 3)
-      assert.equal(afterRun.currentStep, 'deploy', '只剩发布这一步时下一步应指向它')
+      assert.equal(afterRun.currentStep, 'guards', '运行做完后，仍缺的名单还是排在发布之前')
 
       // ④ 没有项目上下文时不能凭空报完成。
       const noProject = await repo.call('/onboarding').then((response) => response.json())
@@ -6125,6 +6128,388 @@ check('P5-S11：DB —— 制品表随 v10 迁出、晋级表随 v12 迁出，ar
     ])
     assert.ok(db.prepare("SELECT name FROM sqlite_master WHERE name = 'idx_promotions_digest'").get())
   } finally { db.close() }
+})
+
+// ============================================================================
+// v3.0-P8-S1..S4：闭环序列（从零建项目 → 部署 → 回滚）与部署锁的释放契约
+// 前面 163 条大多一次只钉一个函数；这几条钉的是「几步连起来之后状态机还自不自洽」。
+// ============================================================================
+
+checkAsync('P8-S1：模板建出来的项目开箱即可部署（releases/current 落地，不需要手写环境名单）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cicd-p8-s1-'))
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = envFetch
+  const projectDir = join(dir, 'app')
+  mkdirSync(projectDir, { recursive: true })
+  const runtime = internals.createRuntime(fakeContext(), {
+    projects: [],
+    workDir: join(dir, 'state'),
+    remoteBase: 'http://127.0.0.1:1',
+    scheduler: { enabled: false },
+  })
+  try {
+    const listed = runtime.templateDetail('bare', { name: 'app' })
+    assert.equal(listed.custom, false)
+    // 用 static 模板而不是 bare：static 打 dist.tgz 的包，产物齐了才谈得上"能不能发"；
+    // bare 的 echo 占位连产物都没有，会先撞上 ARTIFACT_NOT_FOUND，看不见名单这一层。
+    const created = await runtime.createProject({ name: 'app', path: projectDir, template: 'static' })
+    assert.equal(created.id, 'app', '模板新建应当成功：' + JSON.stringify(created).slice(0, 300))
+    assert.match(readFileSync(join(projectDir, 'pipe.yml'), 'utf8'), /^name: /m)
+
+    const validated = runtime.validatePipe({ project: 'app' })
+    assert.equal(validated.ok, true, '脚手架必须自洽：' + JSON.stringify(validated).slice(0, 300))
+    // 脚手架声明的 deploy.artifacts 就是它自己 build 的产物：bare 模板是 dist.tgz
+    writeFileSync(join(projectDir, 'dist.tgz'), 'artifact')
+
+    // 脚手架的 target 名不是 prod，所以首次部署不需要 confirm=prod，也不需要环境名单。
+    const planned = await runtime.plan({ project: 'app' })
+    assert.equal(planned.envs.includes('prod'), false, '模板默认 target 不该叫 prod：' + JSON.stringify(planned.envs))
+    assert.equal(planned.willDeployToProd, false, '与 envFetch 的 linux26/api1 环境对不上：' + JSON.stringify(planned.prodHosts))
+
+    const run = await runtime.run({ projectId: 'app', targetName: planned.target })
+    assert.equal(run.status, 'success', '开箱部署必须成功：' + JSON.stringify({ error: run.error, stages: run.stages }).slice(0, 600))
+    assert.equal(run.releases.length, 1, '一次成功部署要留下一条 release')
+
+    const listed2 = runtime.releases({ target: planned.target })
+    assert.equal(listed2.releases.length, 1)
+    assert.equal(listed2.releases[0].status, 'active')
+
+    // 刚刚 active 的那条自己是"当前版本"，回滚它等于原地重放；回滚的契约是"指回上一版"。
+    const rolled = await runtime.rollback({ target: planned.target, project: 'app' })
+    assert.equal(rolled.ok, true, '省略 releaseId 时应当读 current 指回它：' + JSON.stringify(rolled).slice(0, 300))
+    // 回滚的落点必须能对上账本里的某一版（不是空串、也不是凭空造出来的 id）
+    assert.equal(rolled.releaseId, listed2.releases[0].id, '回滚落点必须是账本里那一条 release：' + rolled.releaseId)
+  } finally {
+    runtime.dispose()
+    globalThis.fetch = originalFetch
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+checkAsync('P8-S1b：守卫写错被拒之后，不留 waiting_approval 记录也不留部署锁（只能去补配置）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cicd-p8-s1b-'))
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = envFetch
+  const projectDir = join(dir, 'app')
+  mkdirSync(projectDir, { recursive: true })
+  // 名单登记了 prod、审批也开着，却忘了写 allowedActors：护栏先拒（ENV_GUARD_NO_ALLOWLIST），
+  // 这一步必须发生在审批门之前 —— 否则会先落一条永远没人能批的 waiting_approval。
+  const pipe = [
+    'version: 1',
+    'name: shipped',
+    'environments:',
+    '  prod:',
+    '    approval: true',
+    '    branchRule: "^(main|release/.*)$"',
+    'targets:',
+    '  prod:',
+    '    hosts: [linux26]',
+    '    path: /srv/shipped',
+    'stages:',
+    '  - id: build',
+    '    steps:',
+    '      - name: build',
+    '        run: echo BUILD_OK',
+    '  - id: release',
+    '    steps:',
+    '      - name: ship',
+    '        deploy:',
+    '          target: prod',
+  ].join('\n')
+  writeFileSync(join(projectDir, 'pipe.yml'), pipe, 'utf8')
+  const runtime = internals.createRuntime(fakeContext(), {
+    projects: [{ id: 'app', name: 'app', path: projectDir, pipe: join(projectDir, 'pipe.yml') }],
+    workDir: join(dir, 'state'),
+    remoteBase: 'http://127.0.0.1:1',
+    scheduler: { enabled: false },
+    approval: { ttlSec: 3600 },
+  })
+  try {
+    await assert.rejects(runtime.run({ projectId: 'app', targetName: 'prod', confirmProd: true }), (error) => error.code === 'ENV_GUARD_NO_ALLOWLIST')
+    // 运行列表里不该出现一条「等审批」：它永远不会被批，只会让面板上多一条卡死的记录。
+    const runs = runtime.status({ project: 'app', limit: 20 }).runs
+    assert.deepEqual(runs.filter((item) => item.status === 'waiting_approval'), [], '护栏拒掉的运行不能留 waiting_approval 记录')
+    // 锁也不能留：留了就没人能部署，而且 30 分钟内没人知道为什么。
+    assert.deepEqual(runtime.lockList().locks, [], '被护栏拒掉的运行必须把锁还回去，否则 target 像被鬼占着')
+  } finally {
+    runtime.dispose()
+    globalThis.fetch = originalFetch
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+checkAsync('P8-S2：run 中途取消 → 部署锁立刻释放、运行记录收成 canceled', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cicd-p8-s2-'))
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = envFetch
+  const projectDir = join(dir, 'slow')
+  mkdirSync(projectDir, { recursive: true })
+  writeFileSync(join(projectDir, 'pipe.yml'), [
+    'version: 1',
+    'name: slow',
+    'targets:',
+    '  api2:',
+    '    hosts: [api2]',
+    '    path: /srv/slow',
+    'stages:',
+    '  - id: build',
+    '    steps:',
+    '      - name: slow',
+    '        run: node -e "setTimeout(() => {}, 30000)"',
+  ].join('\n'), 'utf8')
+  const runtime = internals.createRuntime(fakeContext(), {
+    projects: [{ id: 'slow', name: 'slow', path: projectDir, pipe: join(projectDir, 'pipe.yml') }],
+    workDir: join(dir, 'state'),
+    remoteBase: 'http://127.0.0.1:1',
+    scheduler: { enabled: false },
+    stepTimeoutSec: 60,
+  })
+  try {
+    const pending = runtime.run({ projectId: 'slow', targetName: 'api2' })
+    // 等锁真的被拿到（run 的同步前缀做完 acquire 才进第一个 await），再取消。
+    const deadline = Date.now() + 5000
+    while (runtime.lockList().locks.length === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10))
+    const held = runtime.lockList().locks
+    assert.equal(held.length, 1, '运行中必须持有部署锁')
+
+    runtime.cancel({ runId: held[0].runId })
+    const result = await pending
+    assert.equal(result.status, 'canceled', '取消后 run 要以 canceled 收口：' + JSON.stringify(result).slice(0, 300))
+    assert.equal(runtime.store.run(held[0].runId).status, 'canceled')
+    // 取消不是普通 finally 能兜住的路径，锁必须在这里也还回去，否则整个 TTL 内没人能再部署。
+    assert.deepEqual(runtime.lockList().locks, [], '取消之后部署锁必须立刻释放')
+  } finally {
+    runtime.dispose()
+    globalThis.fetch = originalFetch
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+checkAsync('P8-S3：主机失败 → 失败信息带得上主机的真实原因（不是一句「有主机未完成发布」）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cicd-p8-s3-'))
+  const projectDir = join(dir, 'app')
+  mkdirSync(projectDir, { recursive: true })
+  writeFileSync(join(projectDir, 'pipe.yml'), [
+    'version: 1',
+    'name: app',
+    'targets:',
+    '  api2:',
+    '    hosts: [api2]',
+    '    path: /srv/app',
+    'stages:',
+    '  - id: build',
+    '    steps:',
+    '      - name: build',
+    '        run: echo BUILD_OK',
+    '  - id: ship',
+    '    steps:',
+    '      - name: ship',
+    '        deploy:',
+    '          target: api2',
+    '          artifacts: [dist.tgz]',
+  ].join('\n'), 'utf8')
+  writeFileSync(join(projectDir, 'dist.tgz'), 'bundle', 'utf8')
+  // 主机上的操作全部失败：故障场景里最先要看的就是「哪台、为什么」。
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (input, init) => {
+    const url = typeof input === 'string' ? input : (input?.url || String(input))
+    if (url.includes('/api/plugins/remote/exec')) {
+      return new Response(JSON.stringify({ ok: true, result: { exitCode: 1, stdout: '', stderr: 'mkdir: Permission denied' } }), { headers: { 'content-type': 'application/json' } })
+    }
+    return envFetch(input, init)
+  }
+  const runtime = internals.createRuntime(fakeContext(), {
+    projects: [{ id: 'app', name: 'app', path: projectDir, pipe: join(projectDir, 'pipe.yml') }],
+    workDir: join(dir, 'state'),
+    remoteBase: 'http://127.0.0.1:1',
+    scheduler: { enabled: false },
+  })
+  try {
+    const run = await runtime.run({ projectId: 'app', targetName: 'api2' })
+    assert.equal(run.status, 'failed', '主机失败必须让整次运行为 failed：' + JSON.stringify(run).slice(0, 300))
+    const step = run.stages.flatMap((stage) => stage.steps).find((item) => item.kind === 'deploy')
+    assert.ok(step, '要有一条 deploy 步骤')
+    assert.equal(step.status, 'failed')
+    // 只写「部署失败：有主机未完成发布」等于把运维指向命令，而真实原因是主机上的权限。
+    assert.match(String(step.error), /api2/, '失败信息要指明是哪台主机：' + String(step.error))
+    assert.match(String(step.error), /Permission denied/, '失败信息要带上主机那边的真实原因：' + String(step.error))
+  } finally {
+    runtime.dispose()
+    globalThis.fetch = originalFetch
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+checkAsync('P8-S4：审批过期收口不依赖有人打开审批列表（run/status 读到的就是终态）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cicd-p8-s4-'))
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = envFetch
+  const projectDir = join(dir, 'app')
+  mkdirSync(projectDir, { recursive: true })
+  writeFileSync(join(projectDir, 'pipe.yml'), [
+    'version: 1',
+    'name: app',
+    'environments:',
+    '  prod:',
+    '    allowedActors: [role:owner]',
+    'targets:',
+    '  prod:',
+    '    hosts: [linux26]',
+    '    path: /srv/app',
+    'stages:',
+    '  - id: build',
+    '    steps:',
+    '      - name: build',
+    '        run: echo BUILD_OK',
+  ].join('\n'), 'utf8')
+  const runtime = internals.createRuntime(fakeContext(), {
+    projects: [{ id: 'app', name: 'app', path: projectDir, pipe: join(projectDir, 'pipe.yml') }],
+    workDir: join(dir, 'state'),
+    remoteBase: 'http://127.0.0.1:1',
+    scheduler: { enabled: false },
+    approval: { ttlSec: 3600 },
+  })
+  try {
+    const actor = { id: 'owner-1', role: 'owner', authMethod: 'token', tokenId: 'tk-1' }
+    await assert.rejects(
+      runtime.run({ projectId: 'app', targetName: 'prod', confirmProd: true, actor }),
+      (error) => error.code === 'APPROVAL_REQUIRED',
+    )
+    const waiting = runtime.status({ project: 'app', limit: 20 }).runs.filter((item) => item.status === 'waiting_approval')
+    assert.equal(waiting.length, 1, '待审批期间要能在运行列表里看到')
+    assert.deepEqual(runtime.lockList().locks, [], '停在审批门上不能占着部署锁')
+
+    // 把到期时间推到过去，然后只调 status（不看审批列表）。
+    // 注意 status 返回的是 runSummary（对外字段名是 id/status/error），审批表里存的是 run_id。
+    const db = openDatabase(join(dir, 'state', 'cicd.db'))
+    try {
+      const approvalId = db.prepare('SELECT id FROM approvals WHERE run_id = ?').get(waiting[0].id)?.id
+      assert.ok(approvalId, '待审批记录要在 approvals 表里查得到：' + waiting[0].id)
+      db.prepare('UPDATE approvals SET expires_at = ? WHERE id = ?').run('2000-01-01T00:00:00.000Z', approvalId)
+    } finally { db.close() }
+
+    const after = runtime.status({ project: 'app', limit: 20 }).runs.find((item) => item.id === waiting[0].id)
+    assert.equal(after.status, 'failed', '过期之后运行记录必须是终态，不能永远挂在等审批上：' + JSON.stringify(after))
+    assert.equal(after.error, 'approval_timeout')
+  } finally {
+    runtime.dispose()
+    globalThis.fetch = originalFetch
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// v3.0 闭环巡检：下面几条钉的都是"每一步单独看都对、连起来就自相矛盾"的地方。
+checkAsync('P8-S5：模板项目的起点没有环境名单 → 部署前的真实失败必须能被 onboarding 点名（改到哪一行）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cicd-p8-s5-'))
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = envFetch
+  const runtime = internals.createRuntime(fakeContext(), {
+    projects: [],
+    workDir: join(dir, 'state'),
+    remoteBase: 'http://127.0.0.1:1',
+    scheduler: { enabled: false },
+  })
+  try {
+    const projectDir = join(dir, 'app')
+    mkdirSync(projectDir, { recursive: true })
+    const created = await runtime.createProject({ name: 'app', path: projectDir, template: 'static' })
+    assert.ok(created.id, '建项目要返回 id：' + JSON.stringify(created))
+    writeFileSync(join(projectDir, 'dist.tgz'), 'artifact')
+
+    // 模板给的起点不带任何环境名单：先证明"现在真的发不出去"，再说清该改哪一行。
+    assert.deepEqual(created.requiredConfig, [], '没有任何受保护环境时不该凭空报缺配置')
+    const guide = runtime.onboarding({ project: created.id })
+    assert.equal(guide.steps.find((step) => step.id === 'guards').done, true, '名单这步在起点就该是完成的')
+
+    // 用户把 target 改名成 prod（生产是约定即存在的受保护环境）—— 名单还没配。
+    const pipePath = join(projectDir, 'pipe.yml')
+    const source = readFileSync(pipePath, 'utf8')
+      .replace(/^( *)default:/m, '$1prod:')
+      .replace(/target: default/, 'target: prod')
+    writeFileSync(pipePath, source, 'utf8')
+    await assert.rejects(
+      runtime.run({ projectId: created.id, targetName: 'prod' }),
+      (error) => error.code === 'ENV_GUARD_NO_ALLOWLIST',
+      '受保护环境没有名单时必须当场拒，而不是先跑完 build',
+    )
+
+    const blocked = runtime.onboarding({ project: created.id })
+    const guardStep = blocked.steps.find((step) => step.id === 'guards')
+    assert.ok(guardStep, 'onboarding 要有「配好受保护环境的名单」这一步：' + JSON.stringify(blocked.steps.map((step) => step.id)))
+    assert.equal(guardStep.done, false, '名单没配，这一步不能打勾')
+    assert.match(guardStep.next, /environments\.prod\.allowedActors/, '下一步要说清该改哪个键：' + guardStep.next)
+    assert.deepEqual(blocked.requiredConfig.map((item) => item.key), ['environments.prod.allowedActors'])
+    assert.equal(blocked.currentStep, 'guards', '名单是挡在发布前的第一件事')
+
+    // 补上名单之后，同一步要从库里现算成完成 —— 不是"点过了"。
+    // 名单放在文件开头：targets 之后再加一个顶层键，等于把 environments 挂到 targets 下面。
+    writeFileSync(pipePath, 'environments:\n  prod:\n    allowedActors: [role:owner]\n' + source, 'utf8')
+    const fixed = runtime.onboarding({ project: created.id })
+    assert.equal(fixed.steps.find((step) => step.id === 'guards').done, true, '名单补齐后这一步应打勾：' + JSON.stringify(fixed.requiredConfig))
+    assert.deepEqual(fixed.requiredConfig, [], '补齐后不能再报缺：' + JSON.stringify(fixed.requiredConfig))
+  } finally {
+    runtime.dispose()
+    globalThis.fetch = originalFetch
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+checkAsync('P8-S6：回滚到当前这一版 → 账本里它必须仍然是 active（不能把自己注销成 superseded）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cicd-p8-s6-'))
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = envFetch
+  const projectDir = join(dir, 'app')
+  mkdirSync(projectDir, { recursive: true })
+  writeFileSync(join(projectDir, 'dist.tgz'), 'artifact')
+  writeFileSync(join(projectDir, 'pipe.yml'), [
+    'version: 1',
+    'name: app',
+    'targets:',
+    '  api2:',
+    '    hosts: [api2]',
+    '    path: /srv/app',
+    'stages:',
+    '  - id: build',
+    '    steps:',
+    '      - name: build',
+    '        run: echo BUILD_OK',
+    '  - id: release',
+    '    needs: [build]',
+    '    steps:',
+    '      - name: ship',
+    '        deploy:',
+    '          target: api2',
+    '          artifacts: [dist.tgz]',
+  ].join('\n'), 'utf8')
+  const runtime = internals.createRuntime(fakeContext(), {
+    projects: [{ id: 'app', name: 'app', path: projectDir, pipe: join(projectDir, 'pipe.yml') }],
+    workDir: join(dir, 'state'),
+    remoteBase: 'http://127.0.0.1:1',
+    scheduler: { enabled: false },
+  })
+  try {
+    const first = await runtime.run({ projectId: 'app', targetName: 'api2' })
+    assert.equal(first.status, 'success', '首次部署要成功：' + JSON.stringify(first.stages || first.error))
+    const current = runtime.releases({ target: 'api2' }).releases.filter((item) => item.status === 'active')
+    assert.equal(current.length, 1, '首次部署后应有一条 active：' + JSON.stringify(current))
+
+    // 不带 releaseId 回滚 = 退回上一版；只有一版时就是原地重放 current。
+    const rolled = await runtime.rollback({ project: 'app', target: 'api2' })
+    assert.equal(rolled.ok, true, '回滚要成功：' + JSON.stringify(rolled))
+    const after = runtime.releases({ target: 'api2' }).releases
+    const actives = after.filter((item) => item.status === 'active')
+    assert.equal(actives.length, 1, '回滚后账本里必须还有且只有一条 active：' + JSON.stringify(after.map((item) => [item.id, item.status])))
+    // environments()/targets() 也是从这条 active 推当前版本的，不能因为回滚变空。
+    const targets = await runtime.targets({ project: 'app' })
+    const api2 = (targets.targets || []).find((item) => item.name === 'api2')
+    assert.ok(api2, 'targets 里要有 api2：' + JSON.stringify(targets.targets))
+    assert.ok(api2.current, '回滚之后 target 的当前版本不能变空：' + JSON.stringify(api2))
+    assert.equal(api2.current, actives[0].id, 'targets 的 current 与账本里的 active 必须是同一条记录')
+  } finally {
+    runtime.dispose()
+    globalThis.fetch = originalFetch
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 // 前端没有浏览器用例，但有一个只能靠肉眼发现的失败模式：渲染期就抛 ReferenceError 会被 DSH 的

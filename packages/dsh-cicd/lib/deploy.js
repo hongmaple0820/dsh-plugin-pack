@@ -95,6 +95,33 @@ function parsePrevious(stdout) {
   return text.split('/').filter(Boolean).pop() || ''
 }
 
+/**
+ * 一条远端命令必须先成功（exitCode 0）才算走通下一步。
+ *
+ * dsh-remote 的回包是 { ok, result:{ exitCode, stdout, stderr } } —— 只要传输成功 ok 就是 true，
+ * 命令本身失败与否只看 exitCode。deployOne 以前把 exec 的返回值全丢了，于是主机上
+ * `mkdir -p` 报 Permission denied、`ln -sfn` 失败都算"发布成功"，release 记录还会记成 active；
+ * 运维拿到的只有一句「有主机未完成发布」，看不出是哪台、为什么。
+ * stdout 仍然原样返回给需要读输出的调用方（readlink / sha256sum 那一类）。
+ */
+async function execChecked(remote, host, command, options = {}) {
+  const out = await remote.exec(host, command, options)
+  const exitCode = Number(out?.exitCode ?? 0)
+  if (Number.isFinite(exitCode) && exitCode !== 0) {
+    const stderr = String(out?.stderr || '').trim()
+    const stdout = String(out?.stdout || '').trim()
+    const reason = stderr || stdout || '（命令没有输出）'
+    const error = new Error(`[${host}] 命令失败（exit ${exitCode}）：${command}：${reason}`)
+    error.code = 'HOST_COMMAND_FAILED'
+    error.host = host
+    error.command = command
+    error.exitCode = exitCode
+    error.stderr = String(out?.stderr || '')
+    throw error
+  }
+  return out
+}
+
 function healthSeconds(value, fallback = 2) {
   if (value === undefined || value === null || value === '') return fallback
   if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value
@@ -168,11 +195,18 @@ async function healthCheck({ remote, host, target, onLog }) {
   return 'failed'
 }
 
-async function previousRelease({ remote, host, currentLink }) {
+/**
+ * 读 current 现在指向哪一版。
+ * `strict` 为 true 时区分"读不到"与"没有旧版本"：回滚要的是**当前装着的是哪一版**，
+ * 而 release 记录里的 previous 是"上一版"—— 对第一次发布来说它是空的，直接拿去回滚
+ * 等于刚部署完就报"没有可回滚的版本"。所以显式给了 releaseId 就照用，没给就读软链。
+ */
+async function previousRelease({ remote, host, currentLink, strict = false }) {
   try {
     const read = await remote.exec(host, `readlink ${shellQuote(currentLink)} || true`)
     return parsePrevious(read?.stdout)
-  } catch {
+  } catch (error) {
+    if (strict) throw error
     return ''
   }
 }
@@ -200,7 +234,7 @@ export async function deployOne({
   const targetPath = String(target.path).replace(/\/+$/, '')
   const currentLink = `${targetPath}/current`
 
-  await remote.exec(host, `mkdir -p ${shellQuote(dir)}`)
+  await execChecked(remote, host, `mkdir -p ${shellQuote(dir)}`)
   logLine(onLog, `[${host}] release dir: ${dir}`)
 
   if (artifactPath) {
@@ -208,18 +242,19 @@ export async function deployOne({
     await remote.uploadFile(host, artifactPath, `${dir}/${name}`)
     logLine(onLog, `[${host}] uploaded: ${name}`)
     if (/\.(tgz|tar\.gz)$/i.test(name)) {
-      await remote.exec(host, `tar -xzf ${shellQuote(`${dir}/${name}`)} -C ${shellQuote(dir)}`)
+      await execChecked(remote, host, `tar -xzf ${shellQuote(`${dir}/${name}`)} -C ${shellQuote(dir)}`)
       logLine(onLog, `[${host}] extracted: ${name}`)
     }
   }
 
   const previous = await previousRelease({ remote, host, currentLink })
 
-  await remote.exec(host, `ln -sfn ${shellQuote(`releases/${releaseId}`)} ${shellQuote(currentLink)}`)
+  // 软链换过去是“上一版还在、这一版已生效”的分界点：这一步失败必须停，否则后面的重启只会把旧内容再拉起来。
+  await execChecked(remote, host, `ln -sfn ${shellQuote(`releases/${releaseId}`)} ${shellQuote(currentLink)}`)
   logLine(onLog, `[${host}] current -> releases/${releaseId}`)
 
   const stamp = new Date().toISOString()
-  await remote.exec(host, `echo ${shellQuote(`${stamp} ${releaseId} ${commit}`)} >> ${shellQuote(`${targetPath}/revisions.log`)}`)
+  await execChecked(remote, host, `echo ${shellQuote(`${stamp} ${releaseId} ${commit}`)} >> ${shellQuote(`${targetPath}/revisions.log`)}`)
 
   // v3.0-P5-5：native 路径也要留下「这一版装的是哪份字节」。
   // 没有这份 manifest，回滚就只能信 current 软链，而软链证明不了目录里的包没被换过。
@@ -234,7 +269,7 @@ export async function deployOne({
       artifact: { path: artifactName ? `${dir}/${artifactName}` : '', name: artifactName, digest: artifactDigest, commit },
       activatedAt: stamp,
     }
-    await remote.exec(host, `printf '%s\\n' ${shellQuote(JSON.stringify(manifest))} > ${shellQuote(`${dir}/.dsh-manifest.json`)}`)
+    await execChecked(remote, host, `printf '%s\\n' ${shellQuote(JSON.stringify(manifest))} > ${shellQuote(`${dir}/.dsh-manifest.json`)}`)
   }
 
   const restarted = await restartTarget({ remote, host, target, onLog })
@@ -283,6 +318,7 @@ function failureResult(host, error, batch = 1) {
     host,
     ok: false,
     batch,
+    releaseId: error?.releaseId || '',
     previous: error?.previous || '',
     releaseDir: '',
     restarted: error?.restarted || '',
@@ -401,25 +437,62 @@ export async function deployRelease({
   }
 }
 
-export async function rollbackOne({ remote, target, host, releaseId, commit, onLog, actuatorFactory = null }) {
+/** 目标机上这个 release 目录还在不在（一条 test -d，成败都不抛）。 */
+async function releaseDirExists(remote, host, dir) {
+  try {
+    const out = await remote.exec(host, `test -d ${shellQuote(dir)} && echo yes || echo no`)
+    return /yes/.test(String(out?.stdout || ''))
+  } catch {
+    return false
+  }
+}
+
+/** 从 release 目录的 manifest 里读"这一版之前的上一版"（机器上的 current 不可信时用）。 */
+async function recordedPrevious({ remote, host, targetPath, releaseId }) {
+  try {
+    const file = `${targetPath}/releases/${releaseId}/.dsh-manifest.json`
+    const out = await remote.exec(host, `cat ${shellQuote(file)} 2>/dev/null || true`)
+    const text = String(out?.stdout || '').trim()
+    if (!text) return ''
+    const parsed = JSON.parse(text)
+    return String(parsed?.previous || '')
+  } catch {
+    return ''
+  }
+}
+
+export async function rollbackOne({ remote, target, host, releaseId, commit, onLog, actuatorFactory = null, rollBackwards = false }) {
   const targetPath = String(target.path).replace(/\/+$/, '')
   const currentLink = `${targetPath}/current`
-  let wanted = releaseId
-  if (!wanted) {
-    const previous = await previousRelease({ remote, host, currentLink })
-    wanted = previous
+  // releaseId 省略时读的是 **current 现在指向哪一版** —— 回滚就是"把机器退回它现在装的这一版"。
+  // 机器答不出来（dsh-remote 没就绪 / 读 -e 拿不到）就退回调用方给的 releaseId，
+  // 再不行才报错：报错信息里必须说清是"没人告诉我要回滚到哪一版"，而不是一句笼统的缺失。
+  let wanted = releaseId || await previousRelease({ remote, host, currentLink, strict: false }) || ''
+  // 方向很重要：给的（或读到的）是"现在装着的那一版"时，回滚要退到它之前的那一版。
+  // manifest 里记着这条链；没有 manifest（老 release）才原地重放当前版本。
+  if (wanted && rollBackwards) {
+    const recorded = await recordedPrevious({ remote, host, targetPath, releaseId: wanted })
+    if (recorded && recorded !== wanted) wanted = recorded
   }
   if (!wanted) {
     const error = new Error(`[${host}] 没有指定 releaseId，也没有读到当前 current 指向的版本`)
     error.code = 'RELEASE_NOT_FOUND'
+    error.releaseId = ''
     throw error
   }
   const dir = releaseDir(target, wanted)
-  const exists = await remote.exec(host, `test -d ${shellQuote(dir)} && echo yes || echo no`)
-  if (!/yes/.test(String(exists?.stdout || ''))) {
-    const error = new Error(`[${host}] release ${wanted} 不存在：${dir}`)
-    error.code = 'RELEASE_NOT_FOUND'
-    throw error
+  if (!rollBackwards && !(await releaseDirExists(remote, host, dir))) {
+    // 目标机上这一版已经没有目录了（清理过 / 上次没落盘）：退到 manifest 里记着的那一版。
+    // 链上只有它自己就报 RELEASE_NOT_FOUND —— 「回滚」不能假装成功，否则 current 与账本一起失真。
+    const recorded = await recordedPrevious({ remote, host, targetPath, releaseId: wanted })
+    if (!recorded || recorded === wanted || !(await releaseDirExists(remote, host, releaseDir(target, recorded)))) {
+      const error = new Error(`[${host}] release ${wanted} 不存在：${dir}`)
+      error.code = 'RELEASE_NOT_FOUND'
+      error.releaseId = wanted
+      throw error
+    }
+    logLine(onLog, `[${host}] release ${wanted} 不在机器上，改用 manifest 记的上一版 ${recorded}`)
+    wanted = recorded
   }
 
   const stamp = new Date().toISOString()
@@ -548,8 +621,8 @@ export async function rollbackOne({ remote, target, host, releaseId, commit, onL
     const stagedName = String(manifestPath || '').split(/[\\/]/).filter(Boolean).pop() || ''
     await verifyRemoteArtifact({ remote, host, artifactPath: `${dir}/${stagedName}`, digest: pinnedDigest })
   }
-  await remote.exec(host, `ln -sfn ${shellQuote(`releases/${wanted}`)} ${shellQuote(currentLink)}`)
-  await remote.exec(host, `echo ${shellQuote(`${stamp} rollback:${wanted} ${commit}`)} >> ${shellQuote(`${targetPath}/revisions.log`)}`)
+  await execChecked(remote, host, `ln -sfn ${shellQuote(`releases/${wanted}`)} ${shellQuote(currentLink)}`)
+  await execChecked(remote, host, `echo ${shellQuote(`${stamp} rollback:${wanted} ${commit}`)} >> ${shellQuote(`${targetPath}/revisions.log`)}`)
   logLine(onLog, `[${host}] current -> releases/${wanted}（回滚，${pinnedDigest ? pinnedDigest.slice(0, 19) + '… 已核对' : '无 digest 记录，跳过核对'}）`)
   const restarted = await restartTarget({ remote, host, target, onLog })
   const health = await healthCheck({ remote, host, target, onLog })
@@ -586,6 +659,7 @@ export async function rollbackRelease({
   commit = '',
   onLog = null,
   actuatorFactory = null,
+  rollBackwards = false,
 } = {}) {
   if (!remote) throw new Error('rollbackRelease 需要 remote')
   if (!target || !target.path) throw Object.assign(new Error('target 缺少 path，无法回滚'), { code: 'PIPE_INVALID' })
@@ -597,7 +671,7 @@ export async function rollbackRelease({
   for (const current of hosts) {
     logLine(onLog, `[${current}] rollback ${wanted || 'current'} 开始`)
     try {
-      results.push(await rollbackOne({ remote, target, host: current, releaseId: wanted, commit, onLog, actuatorFactory }))
+      results.push(await rollbackOne({ remote, target, host: current, releaseId: wanted, commit, onLog, actuatorFactory, rollBackwards }))
     } catch (error) {
       const failed = failureResult(current, error)
       results.push(failed)
@@ -609,7 +683,7 @@ export async function rollbackRelease({
   const first = results[0] || {}
   const failed = results.find((item) => !item.ok)
   return {
-    releaseId: first.releaseId || wanted,
+    releaseId: first.releaseId || failed?.releaseId || wanted || '',
     target: targetName || '',
     ok,
     hosts: results,

@@ -108,6 +108,10 @@ window.__ModuleLoader__.load({
 .cicd-status.is-failed{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}
 .cicd-status.is-canceled{color:var(--dsw-alias-label-dimmed)}
 .cicd-status.is-skipped{color:var(--dsw-alias-label-dimmed)}
+/* 审计页的「结果」列用的是同一批类名：allow / deny / error 之前全是灰的，拒绝和允许看起来一模一样 */
+.cicd-status.is-allow{border-color:var(--dsw-alias-state-success-primary);color:var(--dsw-alias-state-success-primary)}
+.cicd-status.is-deny{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}
+.cicd-status.is-error{border-color:var(--dsw-alias-state-warn-primary);color:var(--dsw-alias-state-warn-primary)}
 .cicd-detail{display:flex;flex-direction:column;gap:10px;padding:2px}
 .cicd-detail-meta{display:grid;grid-template-columns:repeat(auto-fit, minmax(120px, 1fr));gap:6px 12px;margin:0;padding:8px 10px;border:.5px solid var(--dsw-alias-border-l1);border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-2)}
 .cicd-detail-meta dt{color:var(--dsw-alias-label-dimmed);font-size:11px;line-height:15px}
@@ -257,6 +261,9 @@ window.__ModuleLoader__.load({
 .cicd-audit-row.is-deploy-failed{box-shadow:inset 2px 0 0 var(--dsw-alias-state-error-primary)}
 .cicd-audit-row.is-rollback{box-shadow:inset 2px 0 0 var(--dsw-alias-state-warn-primary)}
 .cicd-audit-row.is-canary-hold{box-shadow:inset 2px 0 0 var(--dsw-alias-brand-primary)}
+/* 被拒的一条要能在扫一眼时就分开：只靠「结果」列的一个小徽章不够醒目（含 is-deny 结果徽章） */
+.cicd-audit-row.is-deny{background:var(--dsw-alias-bg-layer-1);box-shadow:inset 2px 0 0 var(--dsw-alias-state-error-primary)}
+.cicd-audit-row.is-deny .cicd-audit-reason{color:var(--dsw-alias-state-error-primary)}
 .cicd-audit-cell{white-space:nowrap}
 .cicd-audit-cell.cicd-audit-detail{white-space:normal;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:15px}
 .cicd-audit-action{display:inline-flex;align-items:center;height:18px;padding:0 6px;border:.5px solid var(--dsw-alias-border-l2);border-radius:4px;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:14px}
@@ -408,6 +415,15 @@ window.__ModuleLoader__.load({
 /* P1：RBAC 视图 */
 .cicd-rbac-verify{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .cicd-rbac-verify .cicd-form-input{flex:1 1 200px;max-width:400px}
+/* 审计筛选：链上字段（动作名、操作人 id、资源 id）都很长，输入框要能各自伸缩不许把行撑出容器 */
+.cicd-audit-filters{flex:none;display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+.cicd-audit-filter{flex:1 1 140px;width:auto;min-width:0;max-width:240px}
+.cicd-audit-result{flex:0 0 auto}
+.cicd-audit-filter-hint{flex:1 1 100%;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:15px}
+.cicd-audit-verify-ok{margin:0;color:var(--dsw-alias-state-success-primary);font-size:11.5px;line-height:16px}
+.cicd-audit-verify-broken{display:flex;flex-direction:column;gap:2px;padding:8px 10px;border:.5px solid var(--dsw-alias-state-error-primary);border-radius:var(--dsw-radius-sm, 6px)}
+.cicd-audit-verify-title{color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:17px;font-weight:600}
+.cicd-audit-verify-detail{color:var(--dsw-alias-label-secondary);font-size:11.5px;line-height:16px;overflow-wrap:anywhere}
 /* P1：Secrets 视图 */
 .cicd-secrets-form{display:flex;flex-direction:column;gap:8px;max-width:480px}
 .cicd-secrets-form .cicd-button{align-self:flex-start}
@@ -1622,7 +1638,8 @@ window.__ModuleLoader__.load({
         h('div', { className: 'cicd-releases-head' },
           h('span', { className: 'cicd-col-title' }, '发布记录' + (targetName ? ' · ' + targetName : '')),
           h('button', { className: 'cicd-button', type: 'button', onClick: onRefresh, disabled: state.status === 'loading' }, state.status === 'loading' ? '刷新…中' : '刷新')),
-        state.status === 'loading' ? h(LoadingState, { text: '正在读取发布记录…', rows: 3 }) : null,
+        // 重取时旧表还在，只有一条都没有的时候才铺骨架，否则点一次刷新表格会闪成空白。
+        state.status === 'loading' && state.items.length === 0 ? h(LoadingState, { text: '正在读取发布记录…', rows: 3 }) : null,
         state.status === 'error' ? h(ErrorState, { title: '读取发布记录失败', error: state.error, onRetry: onRefresh }) : null,
         state.status !== 'error' && state.items.length === 0 && state.status !== 'loading'
           ? h(EmptyState, { text: '还没有发布记录。', hint: '运行一次带部署的流水线后，这里会列出可回滚的版本。' })
@@ -1691,20 +1708,30 @@ window.__ModuleLoader__.load({
       return AUDIT_ACTION_LABELS[tail] || operationLabel(text)
     }
 
-    function AuditView({ state, filters, onFilter, onRefresh, onVerify, onExport }) {
+    function AuditView({ state, filters, onFilter, onRefresh, onVerify, onExport, onFilterNow }) {
       const items = Array.isArray(state.items) ? state.items : []
       const stats = state.stats || null
       const verify = state.verify || null
       const loading = state.status === 'loading'
       const unsupported = Boolean(state.unsupported)
+      const total = typeof state.total === 'number' ? state.total : 0
       const current = filters || {}
       const bind = (key) => (event) => onFilter(key, event.currentTarget.value)
+      // 筛选框改一个字就重取一次：回车只是「立刻生效」，不必等下一次输入。
+      const submitNow = (event) => { if (event.key === 'Enter') { event.preventDefault(); onFilterNow() } }
       return h('div', { className: 'cicd-audit' },
         h('div', { className: 'cicd-audit-head' },
           h('span', { className: 'cicd-col-title' }, '操作审计'
             + (stats && typeof stats.events === 'number'
               ? '（链上共 ' + stats.events + ' 条' + (stats.denied ? '，被拒 ' + stats.denied + ' 条' : '') + '）'
               : (items.length > 0 ? '（' + items.length + '）' : ''))),
+          h('select', {
+            className: 'cicd-select cicd-audit-limit',
+            value: String(state.limit || AUDIT_DEFAULT_LIMIT),
+            onChange: (event) => onLimit(Number(event.currentTarget.value)),
+            'aria-label': '每次读多少条记录',
+            title: '每次从链尾往前读多少条（校验哈希链始终重算最后 1000 条）',
+          }, AUDIT_LIMITS.map((value) => h('option', { key: value, value: String(value) }, '最近 ' + value + ' 条'))),
           h('button', {
             className: 'cicd-button cicd-audit-verify',
             type: 'button',
@@ -1743,14 +1770,19 @@ window.__ModuleLoader__.load({
         !unsupported && loading && items.length === 0 ? h(LoadingState, { text: '正在读取操作记录…', rows: 3 }) : null,
         !unsupported && state.status === 'error' ? h(ErrorState, { title: '读取操作记录失败', error: state.error, onRetry: onRefresh }) : null,
         !unsupported && !loading && state.status !== 'error' && items.length === 0
-          ? h(EmptyState, { text: '没有符合条件的记录。', hint: '换个筛选条件，或把动作名留空再试。' })
+          ? h(EmptyState, {
+            text: current.action || current.actor || current.result ? '没有符合条件的记录。' : '链上还没有任何操作记录。',
+            hint: current.action || current.actor || current.result
+              ? '换个筛选条件，或把动作名留空再试。'
+              : '部署、回滚、吊销 token 等写操作都会落在这里，并带上前一条的哈希。',
+          })
           : null,
         items.length > 0
           ? h('div', { className: 'cicd-table-wrap' },
               h('table', { className: 'cicd-table cicd-audit-table' },
                 h('thead', null, h('tr', null,
                   ['#', '时间', '动作', '是谁', '结果', '对象', '项目', '原因'].map((label) => h('th', { key: label }, label)))),
-                h('tbody', null, items.map((row) => {
+                h('tbody', null, items.map((row, index) => {
                   const action = String(row.action || '')
                   const result = String(row.result || '')
                   const who = [row.actorId, row.authMethod ? '(' + row.authMethod + ')' : ''].filter(Boolean).join(' ')
@@ -1760,7 +1792,9 @@ window.__ModuleLoader__.load({
                     title: 'seq ' + row.seq + ' · hash ' + String(row.hash || '') + ' · prev ' + String(row.prevHash || ''),
                     'data-dsh-cicd-action': action,
                   },
-                    h('td', { className: 'cicd-audit-cell cicd-audit-seq cicd-mono' }, String(row.seq)),
+                    // 筛选之后 seq 不再连续，必须补上「第几条 / 共几条」才数得准。
+                    h('td', { className: 'cicd-audit-cell cicd-audit-seq cicd-mono', title: '这一页第 ' + (index + 1) + ' 条，筛出 ' + items.length + ' 条，链上共 ' + (total || items.length) + ' 条' },
+                      String(row.seq) + ' · ' + (index + 1) + '/' + items.length),
                     h('td', { className: 'cicd-audit-cell cicd-audit-time cicd-mono' }, formatTime(row.ts)),
                     h('td', { className: 'cicd-audit-cell' },
                       h('span', { className: 'cicd-audit-action' + (result === 'deny' ? ' is-deny' : '') }, auditLabel(action))),
@@ -1773,12 +1807,14 @@ window.__ModuleLoader__.load({
                     h('td', { className: 'cicd-audit-cell cicd-audit-reason' }, row.reason || '—'))
                 }))))
           : null,
-        !unsupported && items.length > 0
+        // 筛选框常驻：一条记录都没筛出来时它必须还在，否则用户没法把条件改回去。
+        !unsupported
           ? h('div', { className: 'cicd-audit-filters' },
               h('input', {
                 className: 'cicd-form-input cicd-audit-filter',
                 value: current.action || '',
                 onChange: bind('action'),
+                onKeyDown: submitNow,
                 placeholder: '动作前缀，如 deploy / policy',
                 'aria-label': '按动作筛选',
               }),
@@ -1786,6 +1822,7 @@ window.__ModuleLoader__.load({
                 className: 'cicd-form-input cicd-audit-filter',
                 value: current.actor || '',
                 onChange: bind('actor'),
+                onKeyDown: submitNow,
                 placeholder: '操作人 id / 邮箱',
                 'aria-label': '按操作人筛选',
               }),
@@ -1796,7 +1833,9 @@ window.__ModuleLoader__.load({
                 'aria-label': '按结果筛选',
               }, AUDIT_RESULTS.map((value) => h('option', { key: value || 'all', value: value },
                 value === '' ? '允许与拒绝' : (AUDIT_RESULT_LABELS[value] || value)))),
-              h('span', { className: 'cicd-audit-filter-hint' }, '筛选后最多显示 200 条；「校验哈希链」会重算最后 ' + (state.verifyLimit || 1000) + ' 条。'))
+              h('span', { className: 'cicd-audit-filter-hint' }, '筛出 ' + items.length + ' 条'
+                + (total > items.length ? '（链上共 ' + total + ' 条，只读了最近 ' + (state.limit || AUDIT_DEFAULT_LIMIT) + ' 条）' : '')
+                + '；「校验哈希链」会重算最后 ' + (state.verifyLimit || 1000) + ' 条。'))
           : null)
     }
 
@@ -2012,6 +2051,13 @@ window.__ModuleLoader__.load({
         })
       }, [sourceType, name, path, repoUrl, branch, kind, templateId, onSubmit])
 
+      /** 填完最后一项按回车就能建，不必回鼠标找按钮。 */
+      const onEnter = (event) => {
+        if (event.key !== 'Enter') return
+        event.preventDefault()
+        if (!busy && canSubmit) submit()
+      }
+
       /** 一张模板卡：按下即选中，再按一次取消（回到脚手架 kind）。 */
       const card = (item) => h('button', {
         key: item.id,
@@ -2035,17 +2081,17 @@ window.__ModuleLoader__.load({
               h('button', { className: 'cicd-form-radio', type: 'button', 'aria-pressed': sourceType === 'git', onClick: () => setSourceType('git') }, 'Git 仓库'))),
           h('div', { className: 'cicd-form-field' },
             h('span', { className: 'cicd-form-label' }, '项目名'),
-            h('input', { className: 'cicd-form-input', value: name, onChange: (event) => setName(event.currentTarget.value), placeholder: '例如 my-app（缺省用目录名 / 仓库名）' })),
+            h('input', { className: 'cicd-form-input', value: name, onChange: (event) => setName(event.currentTarget.value), onKeyDown: onEnter, placeholder: '例如 my-app（缺省用目录名 / 仓库名）' })),
           sourceType === 'local'
             ? h('div', { className: 'cicd-form-field' },
               h('span', { className: 'cicd-form-label' }, '本地目录'),
-              h('input', { className: 'cicd-form-input', value: path, onChange: (event) => setPath(event.currentTarget.value), placeholder: '例如 D:/work/my-app（会在这里生成 pipe.yml）' }),
+              h('input', { className: 'cicd-form-input', value: path, onChange: (event) => setPath(event.currentTarget.value), onKeyDown: onEnter, placeholder: '例如 D:/work/my-app（会在这里生成 pipe.yml）' }),
               h('p', { className: 'cicd-form-hint' }, '目录不存在会自动创建；已登记过的目录也可以重新选。'))
             : h('div', { className: 'cicd-form-field' },
               h('span', { className: 'cicd-form-label' }, 'Git 仓库地址'),
-              h('input', { className: 'cicd-form-input', value: repoUrl, onChange: (event) => setRepoUrl(event.currentTarget.value), placeholder: 'git@github.com:you/repo.git 或 https://…' }),
+              h('input', { className: 'cicd-form-input', value: repoUrl, onChange: (event) => setRepoUrl(event.currentTarget.value), onKeyDown: onEnter, placeholder: 'git@github.com:you/repo.git 或 https://…' }),
               h('span', { className: 'cicd-form-label', style: { marginTop: '6px' } }, '分支（可选）'),
-              h('input', { className: 'cicd-form-input', value: branch, onChange: (event) => setBranch(event.currentTarget.value), placeholder: '缺省用仓库默认分支' })),
+              h('input', { className: 'cicd-form-input', value: branch, onChange: (event) => setBranch(event.currentTarget.value), onKeyDown: onEnter, placeholder: '缺省用仓库默认分支' })),
           h('div', { className: 'cicd-form-field' },
             h('span', { className: 'cicd-form-label' }, '模板'),
             templates && templates.status === 'loading' ? h(LoadingState, { text: '正在读取模板…', rows: 2 }) : null,
@@ -2116,8 +2162,10 @@ window.__ModuleLoader__.load({
         h('div', { className: 'cicd-approvals-head' },
           h('span', { className: 'cicd-col-title' }, '审批门 · ' + pending.length + ' 条待审批'),
           h('button', { className: 'cicd-button', type: 'button', onClick: onRefresh, disabled: state.status === 'loading' }, state.status === 'loading' ? '刷新…中' : '刷新')),
-        state.status === 'loading' ? h(LoadingState, { text: '正在读取审批记录…', rows: 3 }) : null,
-        state.status === 'error' ? h(ErrorState, { title: '读取审批记录失败', error: state.error, onRetry: onRefresh }) : null,
+        // 旧的列表在重取期间保留，只在一条都没有时铺骨架（以前每次刷新整页闪成灰条）。
+        state.status === 'loading' && items.length === 0 ? h(LoadingState, { text: '正在读取审批记录…', rows: 3 }) : null,
+        // 通过/拒绝失败时 status 仍是 ready，只看 status 会把失败吞掉；有 error 就要报出来。
+        state.error ? h(ErrorState, { title: '读取或处理审批失败', error: state.error, onRetry: onRefresh }) : null,
         state.status === 'ready' && pending.length === 0
           ? h(EmptyState, { text: '没有待审批的部署。', hint: 'prod 环境默认停在「待审批」：运行之后在这里通过或拒绝。' })
           : null,
@@ -2144,15 +2192,37 @@ window.__ModuleLoader__.load({
     /** P1：RBAC 管理视图（用户列表 + 校验 token + 审计时间线）。 */
     function RbacView({ state, onRefresh, onRevoke, onVerify, busy }) {
       const [tokenInput, setTokenInput] = useState('')
+      // 吊销是破坏性动作（对方立刻掉权限），和「回滚」「运行」一样要二段确认。
+      const [armedUser, setArmedUser] = useState('')
+      const armedTimer = useRef(null)
+      useEffect(() => () => { if (armedTimer.current) clearTimeout(armedTimer.current) }, [])
+      const revoke = (user) => {
+        if (armedUser !== user) {
+          setArmedUser(user)
+          if (armedTimer.current) clearTimeout(armedTimer.current)
+          armedTimer.current = setTimeout(() => setArmedUser(''), ROLLBACK_CONFIRM_MS)
+          return
+        }
+        if (armedTimer.current) clearTimeout(armedTimer.current)
+        setArmedUser('')
+        onRevoke(user)
+      }
+      const submitToken = (event) => {
+        if (event.key !== 'Enter') return
+        event.preventDefault()
+        const value = tokenInput.trim()
+        if (value && !busy) onVerify(value)
+      }
       const users = Array.isArray(state.users) ? state.users : []
       const audit = Array.isArray(state.audit) ? state.audit : []
       return h('div', { className: 'cicd-rbac' },
         h('div', { className: 'cicd-rbac-head' },
           h('span', { className: 'cicd-col-title' }, 'RBAC · ' + users.length + ' 个用户'),
           h('button', { className: 'cicd-button', type: 'button', onClick: onRefresh, disabled: state.status === 'loading' }, state.status === 'loading' ? '刷新…中' : '刷新')),
-        state.status === 'loading' ? h(LoadingState, { text: '正在读取 RBAC…', rows: 3 }) : null,
-        state.status === 'error' ? h(ErrorState, { title: '读取 RBAC 失败', error: state.error, onRetry: onRefresh }) : null,
-        state.status === 'ready'
+        state.status === 'loading' && users.length === 0 ? h(LoadingState, { text: '正在读取 RBAC…', rows: 3 }) : null,
+        // 吊销失败时 status 仍是 ready：只看 status 的话按钮点下去没有任何反应。
+        state.error ? h(ErrorState, { title: '读取或吊销失败', error: state.error, onRetry: onRefresh }) : null,
+        state.status === 'ready' || state.status === 'loading'
           ? h('div', { className: 'cicd-rbac-body' },
             h('div', { className: 'cicd-section-title' }, '用户'),
             users.length === 0
@@ -2167,10 +2237,16 @@ window.__ModuleLoader__.load({
                     h('td', null, (user.projects || []).join(', ') || '*'),
                     h('td', null, user.expiresAt || '—'),
                     h('td', { className: 'cicd-release-act' },
-                      h('button', { className: 'cicd-rollback', type: 'button', onClick: () => onRevoke(user.user), disabled: busy }, '吊销'))))))),
+                      h('button', {
+                        className: 'cicd-rollback' + (armedUser === user.user ? ' is-armed' : ''),
+                        type: 'button',
+                        onClick: () => revoke(user.user),
+                        disabled: busy,
+                        title: armedUser === user.user ? '再点一次即吊销该用户的 token' : '吊销 ' + user.user + ' 的 token（需二次确认）',
+                      }, armedUser === user.user ? '确认吊销' : '吊销'))))))),
             h('div', { className: 'cicd-section-title', style: { marginTop: '12px' } }, '校验 token'),
             h('div', { className: 'cicd-rbac-verify' },
-              h('input', { className: 'cicd-form-input', value: tokenInput, onChange: (event) => setTokenInput(event.currentTarget.value), placeholder: '粘贴 token 校验' }),
+              h('input', { className: 'cicd-form-input', value: tokenInput, onChange: (event) => setTokenInput(event.currentTarget.value), onKeyDown: submitToken, placeholder: '粘贴 token 校验（回车即校验）' }),
               h('button', { className: 'cicd-button', type: 'button', onClick: () => onVerify(tokenInput.trim()), disabled: !tokenInput.trim() || busy }, '校验')),
             state.verifyResult && state.verifyResult.status === 'ready'
               ? h('span', { className: 'cicd-editor-status is-ok' }, '校验结果：' + state.verifyResult.message)
@@ -2197,13 +2273,25 @@ window.__ModuleLoader__.load({
       const [name, setName] = useState('')
       const [value, setValue] = useState('')
       const items = Array.isArray(state.items) ? state.items : []
+      const submit = () => {
+        if (busy || !name.trim() || !value) return
+        onSet(scope, name.trim(), value)
+        setName('')
+        setValue('')
+      }
+      // 三个输入框里按回车等同于点「设置」——否则每个 field 输完都得挪去鼠标。
+      const onEnter = (event) => {
+        if (event.key !== 'Enter') return
+        event.preventDefault()
+        submit()
+      }
       return h('div', { className: 'cicd-secrets' },
         h('div', { className: 'cicd-secrets-head' },
           h('span', { className: 'cicd-col-title' }, 'Secrets · ' + (project || '全局') + ' · ' + items.length + ' 条'),
           h('button', { className: 'cicd-button', type: 'button', onClick: onRefresh, disabled: state.status === 'loading' }, state.status === 'loading' ? '刷新…中' : '刷新')),
-        state.status === 'loading' ? h(LoadingState, { text: '正在读取 secrets…', rows: 3 }) : null,
+        state.status === 'loading' && items.length === 0 ? h(LoadingState, { text: '正在读取 secrets…', rows: 3 }) : null,
         state.status === 'error' ? h(ErrorState, { title: '读取 secrets 失败', error: state.error, onRetry: onRefresh }) : null,
-        state.status === 'ready'
+        state.status === 'ready' || state.status === 'loading'
           ? h('div', { className: 'cicd-secrets-body' },
             items.length === 0
               ? h(EmptyState, { text: '还没有 secret。', hint: 'pipe.yml 里用 ${{SECRET_NAME}} 引用；载荷加密落 workDir/.secrets.json（0600），DB 只存 ref。' })
@@ -2217,14 +2305,14 @@ window.__ModuleLoader__.load({
             h('div', { className: 'cicd-secrets-form' },
               h('div', { className: 'cicd-form-field' },
                 h('span', { className: 'cicd-form-label' }, 'scope'),
-                h('input', { className: 'cicd-form-input', value: scope, onChange: (event) => setScope(event.currentTarget.value), placeholder: 'global / target:prod 等' })),
+                h('input', { className: 'cicd-form-input', value: scope, onChange: (event) => setScope(event.currentTarget.value), onKeyDown: onEnter, placeholder: 'global / target:prod 等' })),
               h('div', { className: 'cicd-form-field' },
                 h('span', { className: 'cicd-form-label' }, 'name'),
-                h('input', { className: 'cicd-form-input', value: name, onChange: (event) => setName(event.currentTarget.value), placeholder: '例如 DB_PASSWORD' })),
+                h('input', { className: 'cicd-form-input', value: name, onChange: (event) => setName(event.currentTarget.value), onKeyDown: onEnter, placeholder: '例如 DB_PASSWORD' })),
               h('div', { className: 'cicd-form-field' },
                 h('span', { className: 'cicd-form-label' }, 'value'),
-                h('input', { className: 'cicd-form-input', type: 'password', value: value, onChange: (event) => setValue(event.currentTarget.value), placeholder: 'secret 值（不落明文到日志/DB）' })),
-              h('button', { className: 'cicd-button cicd-button-primary', type: 'button', onClick: () => { onSet(scope, name.trim(), value); setName(''); setValue('') }, disabled: busy || !name.trim() || !value }, busy ? '设置…中' : '设置')),
+                h('input', { className: 'cicd-form-input', type: 'password', value: value, onChange: (event) => setValue(event.currentTarget.value), onKeyDown: onEnter, placeholder: 'secret 值（不落明文到日志/DB）' })),
+              h('button', { className: 'cicd-button cicd-button-primary', type: 'button', onClick: submit, disabled: busy || !name.trim() || !value }, busy ? '设置…中' : '设置')),
             state.setResult && state.setResult.status === 'ready'
               ? h('span', { className: 'cicd-editor-status is-ok' }, state.setResult.message)
               : null,
@@ -2241,7 +2329,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'cicd-runners-head' },
           h('span', { className: 'cicd-col-title' }, '构建主机 · ' + items.length + ' 台'),
           h('button', { className: 'cicd-button', type: 'button', onClick: onRefresh, disabled: state.status === 'loading' }, state.status === 'loading' ? '刷新…中' : '刷新')),
-        state.status === 'loading' ? h(LoadingState, { text: '正在读取 runner…', rows: 3 }) : null,
+        state.status === 'loading' && items.length === 0 ? h(LoadingState, { text: '正在读取 runner…', rows: 3 }) : null,
         state.status === 'error' ? h(ErrorState, { title: '读取 runner 失败', error: state.error, onRetry: onRefresh }) : null,
         state.unsupported
           ? h(EmptyState, { tone: 'unavailable', title: 'Runner 管理不可用', text: '当前 Host 没有启用 /runners 路由。', hint: '仍可用 bin/runner.mjs 在目标机注册远端构建主机。' })
@@ -2249,7 +2337,7 @@ window.__ModuleLoader__.load({
         state.status === 'ready' && items.length === 0
           ? h(EmptyState, { text: '还没有注册 runner。', hint: '在目标机运行 node bin/runner.mjs --host=<host> --token=<token>（拉取式协议 + journal 幂等 + 自签 TLS）。' })
           : null,
-        state.status === 'ready' && items.length > 0
+        (state.status === 'ready' || state.status === 'loading') && items.length > 0
           ? h('div', { className: 'cicd-table-wrap' },
             h('table', { className: 'cicd-table' },
               h('thead', null, h('tr', null,
@@ -2283,8 +2371,9 @@ window.__ModuleLoader__.load({
           h('p', { className: 'cicd-guide-sub' },
             state.complete
               ? '项目、身份、运行、发布都已落地。之后每次进来这一步都不再打扰你。'
-              : '这四步都不需要先读文档：每步只给一个下一步动作，做完就自动打勾。'),
-          h('button', { type: 'button', className: 'cicd-button', onClick: onRefresh }, '重新检查')),
+              : `这${total || steps.length}步都不需要先读文档：每步只给一个下一步动作，做完就自动打勾。`),
+          h('button', { type: 'button', className: 'cicd-button', onClick: onRefresh, disabled: state.status === 'loading' },
+            state.status === 'loading' ? '检查…中' : '重新检查')),
         state.status === 'error'
           ? h(ErrorState, { title: '读取引导失败', error: state.error, onRetry: onRefresh })
           : h('ol', { className: 'cicd-guide-steps' },
@@ -2321,7 +2410,7 @@ window.__ModuleLoader__.load({
           h('span', { className: 'cicd-environments-foot' },
             h('button', { className: 'cicd-button', type: 'button', onClick: onOpenReleases }, '发布记录与回滚'),
             h('button', { className: 'cicd-button', type: 'button', onClick: onRefresh, disabled: state.status === 'loading' }, state.status === 'loading' ? '刷新…中' : '刷新'))),
-        state.status === 'loading' ? h(LoadingState, { text: '正在读取环境…', rows: 3 }) : null,
+        state.status === 'loading' && items.length === 0 ? h(LoadingState, { text: '正在读取环境…', rows: 3 }) : null,
         state.status === 'error' ? h(ErrorState, { title: '读取环境失败', error: state.error, onRetry: onRefresh }) : null,
         invalid.length > 0
           ? h('div', { className: 'cicd-environments-invalid', role: 'status' },
@@ -2331,7 +2420,8 @@ window.__ModuleLoader__.load({
         state.status === 'ready' && items.length === 0
           ? h(EmptyState, { text: '这个项目还没有环境。', hint: '在 pipe.yml 的 targets 里加一个 target，或用宿主配置声明 environments。' })
           : null,
-        state.status === 'ready' && items.length > 0
+        // loadEnvironments 特意保留了旧卡片，这里也必须在重取期间继续显示它们。
+        (state.status === 'ready' || state.status === 'loading') && items.length > 0
           ? h('div', { className: 'cicd-env-grid' }, ...items.map((env) => h('section', { key: env.name, className: 'cicd-env-card' + (env.drift ? ' is-drift' : '') + (env.protected ? ' is-protected' : '') },
             h('div', { className: 'cicd-env-card-head' },
               h('span', { className: 'cicd-env-name' }, env.name),
@@ -2419,9 +2509,12 @@ window.__ModuleLoader__.load({
       const [rollbackId, setRollbackId] = useState('')
       /** v0.5 生产护栏：Host 返回 409 PROD_CONFIRM_REQUIRED 时挂在这里，用户点确认后才带 confirm=prod 重发。 */
       const [prodGuard, setProdGuard] = useState(null)
-      /** v0.6 C：审计视图数据（404 时置 unsupported，不当错误处理）。 */
-      const [audit, setAudit] = useState({ status: 'idle', items: [], error: null, unsupported: false })
+      /** v3.0-P4-5：审计视图数据（哈希链；404 时置 unsupported，不当错误处理）。 */
+      const [audit, setAudit] = useState({ status: 'idle', items: [], total: 0, stats: null, limit: AUDIT_DEFAULT_LIMIT, verify: null, verifying: false, error: null, unsupported: false })
       const [auditLimit, setAuditLimit] = useState(AUDIT_DEFAULT_LIMIT)
+      /** 审计筛选条件（动作/操作人/结果）。镜像进 ref，重取时不必重建 loadAudit。 */
+      const [auditFilters, setAuditFilters] = useState({ action: '', actor: '', result: '' })
+      const auditFiltersRef = useRef({ action: '', actor: '', result: '' })
       /** v0.6 B：测试通知的内联结果（不弹窗）。 */
       const [notify, setNotify] = useState({ status: 'idle', message: '', failed: false })
       const [notifyArmed, setNotifyArmed] = useState(false)
@@ -2598,25 +2691,132 @@ window.__ModuleLoader__.load({
         }
       }, [freshSignal])
 
-      /** v0.6 C：审计时间线。Host 没有 /operations 时按「未升级」处理，不显示成红色错误。 */
+      /**
+       * v3.0-P4-5：审计页读哈希链本身（/audit），不是旧的 /operations 时间线。
+       *
+       * 不要求先选项目：链是全局的（被拒的登录、吊销 token 都不属于任何项目），
+       * 以前这里「没选项目就什么都不拉」，页面于是只剩一句「没有符合条件的记录」。
+       */
       const loadAudit = useCallback(async (limit) => {
-        if (!projectId) {
-          setAudit({ status: 'idle', items: [], error: null, unsupported: false })
-          return
-        }
-        setAudit((prev) => ({ status: 'loading', items: prev.items, error: null, unsupported: false }))
+        setAudit((prev) => ({ ...prev, status: 'loading', error: null, unsupported: false }))
         try {
-          const payload = await callApi('operations', { project: projectId, limit: limit || AUDIT_DEFAULT_LIMIT }, freshSignal('audit'))
-          setAudit({ status: 'ready', items: Array.isArray(payload.operations) ? payload.operations : [], error: null, unsupported: false })
+          const payload = await callApi('audit', {
+            project: projectId || '',
+            limit: limit || AUDIT_DEFAULT_LIMIT,
+            actor: auditFiltersRef.current.actor || '',
+            action: auditFiltersRef.current.action || '',
+            result: auditFiltersRef.current.result || '',
+          }, freshSignal('audit'))
+          setAudit({
+            status: 'ready',
+            items: Array.isArray(payload.events) ? payload.events : [],
+            total: Number(payload.total || 0),
+            stats: payload.stats || null,
+            limit: limit || AUDIT_DEFAULT_LIMIT,
+            verify: null,
+            unsupported: false,
+            error: null,
+          })
         } catch (error) {
           if (error && error.name === 'AbortError') return
           if (error && (error.status === 404 || error.code === 'NOT_FOUND')) {
-            setAudit({ status: 'ready', items: [], error: null, unsupported: true })
+            setAudit((prev) => ({ ...prev, status: 'ready', items: [], unsupported: true, error: null }))
             return
           }
-          setAudit({ status: 'error', items: [], error, unsupported: false })
+          setAudit((prev) => ({ ...prev, status: 'error', error, unsupported: false }))
         }
       }, [freshSignal, projectId])
+
+      /**
+       * 逐条重算哈希链。Host 的 /audit?action=verify 断链时返回 ok:false（错误体里夹带 brokenSeq 等字段），
+       * callApi 会把这种响应当失败抛掉、细节全丢，所以这里直接读原始 JSON：
+       * 「断在第几条、期望值/实际值」正是这个按钮唯一要回答的事。
+       */
+      const runAuditVerify = useCallback(async () => {
+        setAudit((prev) => ({ ...prev, verifying: true, verify: null }))
+        try {
+          const response = await fetch(API_BASE + '/audit' + buildQuery({ action: 'verify', limit: 1000 }), {
+            method: 'GET',
+            headers: REQUEST_HEADERS,
+            signal: freshSignal('audit-verify'),
+          })
+          let payload = null
+          try {
+            payload = await response.json()
+          } catch (error) {
+            payload = null
+          }
+          if (!payload || typeof payload !== 'object') {
+            setAudit((prev) => ({ ...prev, verifying: false, verify: { status: 'error', error: ApiError('Host 返回了无法解析的响应（HTTP ' + response.status + '）', 'BAD_RESPONSE', { status: response.status }) } }))
+            return
+          }
+          if (payload.ok === true) {
+            setAudit((prev) => ({ ...prev, verifying: false, verify: { status: 'ok', count: Number(payload.count || 0), tail: payload.tail || '' } }))
+            return
+          }
+          if (payload.brokenSeq !== undefined && payload.brokenSeq !== null) {
+            setAudit((prev) => ({
+              ...prev,
+              verifying: false,
+              verify: {
+                status: 'broken',
+                count: Number(payload.count || 0),
+                brokenSeq: payload.brokenSeq,
+                kind: payload.kind || '',
+                expected: payload.expected || '',
+                actual: payload.actual || '',
+              },
+            }))
+            return
+          }
+          setAudit((prev) => ({ ...prev, verifying: false, verify: { status: 'error', error: ApiError(payload.error || 'Host 拒绝了这次校验', payload.code, { status: response.status }) } }))
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          const wrapped = error && error.name === 'ApiError'
+            ? error
+            : ApiError('请求 Host 失败：' + ((error && error.message) || '网络错误'), 'NETWORK')
+          setAudit((prev) => ({ ...prev, verifying: false, verify: { status: 'error', error: wrapped } }))
+        }
+      }, [freshSignal])
+
+      /**
+       * 导出 CSV 在浏览器里拼（不带 token/密文），列与表一致再多给 hash / prevHash：
+       * 审计证据的用处就是拿出去和别处对账，导出的东西必须能自证。
+       */
+      const exportAuditCsv = useCallback(() => {
+        const rows = Array.isArray(audit.items) ? audit.items : []
+        if (rows.length === 0) return
+        const cell = (value) => {
+          const text = value === undefined || value === null ? '' : String(value)
+          return /[",\n\r]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text
+        }
+        const header = ['seq', '时间', '动作', '操作人', '结果', '对象', '项目', '原因', 'hash', 'prevHash']
+        const lines = [header.join(',')].concat(rows.map((row) => [
+          row.seq,
+          formatTime(row.ts),
+          row.action,
+          row.actorId,
+          AUDIT_RESULT_LABELS[row.result] || row.result,
+          [row.resourceType, row.resourceId].filter(Boolean).join(' '),
+          row.projectId,
+          row.reason,
+          row.hash,
+          row.prevHash,
+        ].map(cell).join(',')))
+        try {
+          const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' })
+          const url = URL.createObjectURL(blob)
+          const link = document.createElement('a')
+          link.href = url
+          link.download = 'cicd-audit.csv'
+          document.body.appendChild(link)
+          link.click()
+          document.body.removeChild(link)
+          setTimeout(() => URL.revokeObjectURL(url), 1000)
+        } catch (error) {
+          setAction({ status: 'error', message: '导出失败，请改用「刷新」后重试', error: null })
+        }
+      }, [audit.items])
 
       /** v2-M2：构建主机（runner）列表。Host 没有 /runners 时按「未升级」处理，UI 仍可选本机。 */
       const loadRunners = useCallback(async () => {
@@ -2645,7 +2845,7 @@ window.__ModuleLoader__.load({
         if (targetName) void loadReleases(targetName)
       }, [targetName, projectId, loadReleases])
 
-      // v0.6 C：进审计视图或改条数时拉一次 /operations。
+      // v0.6 C：进审计视图或改条数时拉一次 /audit（哈希链；原先误连旧的 /operations）。
       useEffect(() => {
         if (view !== 'audit') return
         void loadAudit(auditLimit)
@@ -2686,10 +2886,21 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         if (view !== 'run' || !projectId || !isRunning) return undefined
         const timer = setInterval(() => {
+          // 页面在后台时不发请求：看不到的刷新只是白烧 Host；回到前台由下面的 visibilitychange 立刻补一次。
+          if (typeof document !== 'undefined' && document.hidden) return
           void loadRuns(projectId, true)
           if (selectedRunId) void loadLog(selectedRunId, true, logJobId)
         }, POLL_MS)
-        return () => clearInterval(timer)
+        const onVisible = () => {
+          if (typeof document !== 'undefined' && document.hidden) return
+          void loadRuns(projectId, true)
+          if (selectedRunId) void loadLog(selectedRunId, true, logJobId)
+        }
+        document.addEventListener('visibilitychange', onVisible)
+        return () => {
+          clearInterval(timer)
+          document.removeEventListener('visibilitychange', onVisible)
+        }
       }, [view, projectId, isRunning, selectedRunId, logJobId, loadRuns, loadLog])
 
       const clearArmed = useCallback(() => {
@@ -3313,7 +3524,8 @@ window.__ModuleLoader__.load({
         },
         action.status === 'error'
           ? h('div', { className: 'cicd-action-body' },
-            h('span', { className: 'cicd-action-message' }, (action.error && action.error.message) || '操作失败'),
+            // 有些失败没有 error 体（比如剪贴板不可用），只有一句人话，别把它吞成「操作失败」。
+            h('span', { className: 'cicd-action-message' }, (action.error && action.error.message) || action.message || '操作失败'),
             action.error && action.error.code
               ? h('span', { className: 'cicd-error-code cicd-mono' }, action.error.code + (action.error.line ? ' · 第 ' + action.error.line + ' 行' : ''))
               : null,
@@ -3344,7 +3556,7 @@ window.__ModuleLoader__.load({
                 if (pending.kind === 'rollback' && pending.release) void rollbackTo(pending.release, true)
                 else void startRun(Boolean(pending.dryRun), true)
               },
-            }, busy ? '发布…中' : prodGuard.kind === 'rollback' ? '确认回滚（生产）' : '确认发布到生产'),
+            }, busy ? (prodGuard.kind === 'rollback' ? '回滚…中' : '发布…中') : prodGuard.kind === 'rollback' ? '确认回滚（生产）' : '确认发布到生产'),
             h('button', {
               className: 'cicd-button cicd-prod-cancel',
               type: 'button',
@@ -3438,6 +3650,16 @@ window.__ModuleLoader__.load({
           limit: auditLimit,
           onLimit: (value) => setAuditLimit(value),
           onRefresh: () => void loadAudit(auditLimit),
+          filters: auditFilters,
+          onFilter: (key, value) => {
+            const next = { ...auditFiltersRef.current, [key]: value }
+            auditFiltersRef.current = next
+            setAuditFilters(next)
+            void loadAudit(auditLimit)
+          },
+          onFilterNow: () => void loadAudit(auditLimit),
+          onVerify: () => void runAuditVerify(),
+          onExport: () => exportAuditCsv(),
         })
         : view === 'releases'
         ? h(ReleasesView, {
@@ -3639,7 +3861,9 @@ window.__ModuleLoader__.load({
         h('span', { key: 'sep', 'aria-hidden': 'true' }, '›'),
         h('span', { key: 'view' }, viewEntry ? viewEntry.label : '运行'),
         view === 'run' && selectedRunId
-          ? h('span', { key: 'run' }, '› ', h('span', { className: 'cicd-mono' }, selectedRunId))
+          // 运行 id 是 36 位 uuid 级别的长串：整串塞进面包屑会把「复制链接」按钮挤出视口，
+          // 所以只显示截断后的 id，完整值放 title；想知道完整 id 可以复制链接。
+          ? h('span', { key: 'run', title: selectedRunId }, '› ', h('span', { className: 'cicd-mono' }, shortId(selectedRunId, 16)))
           : null,
       ]
       /**

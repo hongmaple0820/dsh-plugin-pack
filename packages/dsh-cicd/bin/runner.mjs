@@ -122,7 +122,9 @@ function runStep(spec, workdir, { onLine, cancelSignal } = {}) {
       child = spawn(spec.command, {
         shell: true,
         cwd: spec.cwd || workdir,
-        env: { ...process.env, CI: '1', DSH_CICD_RUN_ID: spec.runId || '' },
+        // spec.env 是宿主插值后的项目 vars/secrets/toolchain PATH（lib/executors.js execute() 组装）。
+        // 早先这里直接丢弃了它，远端命令拿到的只有 runner 自己的 process.env——env/secrets 全部静默失效。
+        env: { ...process.env, ...(spec.env || {}), CI: '1', DSH_CICD_RUN_ID: spec.runId || '' },
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: process.platform !== 'win32',
         windowsHide: true,

@@ -37,6 +37,9 @@ const BUILDS = {
   bare: { command: "echo 'hello from dsh-cicd'", artifacts: ['dist.tgz'] },
 }
 
+/** 模板默认 target 名：刻意不叫 prod（见 scaffoldPipe 里的说明）。 */
+export const SCAFFOLD_TARGET = 'default'
+
 /** 需要 app 名字写进 target 的运行时装法（其余模板 app 留空，避免发布到不存在的目录）。 */
 const APP_KINDS = new Set(['node', 'python', 'go', 'java', 'php'])
 
@@ -85,11 +88,16 @@ export function scaffoldPipe({
   const build = BUILDS[templateId] || BUILDS.static
   const hostList = Array.isArray(hosts) && hosts.length ? hosts : ['host1']
 
+  // 模板的 target 名**不能**叫 prod：prod 是"约定即存在"的受保护环境，没有 allowedActors
+  // 就谁都不许发（见 lib/environments.js 的 ENV_GUARD_NO_ALLOWLIST），审批闸门也自动落在这上面。
+  // 模板是"从零到第一次发布"的起点，第一次发布不该被自己的脚手架拦住 —— 所以要发生产，
+  // 是用户把 target 改名成 prod（或加 protected）并配好名单/审批这一步显式动作。
+  // 路径与 app 名仍按用户填的写死，目标代号只用来当部署锁与 release 目录的键。
   const lines = [
     'version: 1',
     `name: ${name}`,
     'targets:',
-    '  prod:',
+    `  ${SCAFFOLD_TARGET}:`,
     `    hosts: ${flow(hostList)}`,
     `    path: ${path}`,
     `    runtime: ${runtime}`,
@@ -105,7 +113,7 @@ export function scaffoldPipe({
     '    steps:',
     '      - name: ship',
     '        deploy:',
-    '          target: prod',
+    `          target: ${SCAFFOLD_TARGET}`,
     `          artifacts: ${flow(build.artifacts)}`,
   ]
   return `${lines.join('\n')}\n`

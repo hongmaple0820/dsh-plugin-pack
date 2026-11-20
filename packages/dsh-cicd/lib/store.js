@@ -102,7 +102,7 @@ export function createStore({ dir = DEFAULT_WORK_DIR, file = '', busyTimeoutMs =
         previous = excluded.previous, artifact_sha256 = excluded.artifact_sha256, artifact_digest = excluded.artifact_digest,
         mode = excluded.mode, strategy = excluded.strategy, instances = excluded.instances, operator = excluded.operator,
         version = excluded.version`),
-    selectReleases: db.prepare("SELECT * FROM releases WHERE (? = '' OR target = ?) AND (? = '' OR host = ?) AND (? = '' OR env = ?) ORDER BY created_at DESC LIMIT ?"),
+    selectReleases: db.prepare("SELECT * FROM releases WHERE (? = '' OR target = ?) AND (? = '' OR host = ?) AND (? = '' OR env = ?) AND (? = '' OR project_id = ?) ORDER BY created_at DESC LIMIT ?"),
     selectRelease: db.prepare('SELECT * FROM releases WHERE id = ?'),
     selectActive: db.prepare(`SELECT * FROM releases WHERE status = 'active' AND (? = '' OR target = ?) AND (? = '' OR host = ?)
       ORDER BY activated_at DESC, created_at DESC LIMIT 1`),
@@ -289,10 +289,10 @@ export function createStore({ dir = DEFAULT_WORK_DIR, file = '', busyTimeoutMs =
       return statements.selectArtifacts.all(text(runId))
     },
 
-    releases({ target = '', host = '', env = '', limit = 50 } = {}) {
+    releases({ target = '', host = '', env = '', project = '', limit = 50 } = {}) {
       guard()
       return statements.selectReleases
-        .all(text(target), text(target), text(host), text(host), text(env), text(env), limitOf(limit))
+        .all(text(target), text(target), text(host), text(host), text(env), text(env), text(project), text(project), limitOf(limit))
         .map(releaseOut)
     },
 
