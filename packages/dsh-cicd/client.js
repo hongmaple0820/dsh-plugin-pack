@@ -345,6 +345,21 @@ window.__ModuleLoader__.load({
 .cicd-form-radio[aria-pressed="true"]{border-color:var(--dsw-alias-border-l4);background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-primary)}
 .cicd-create-kinds{display:flex;gap:8px;flex-wrap:wrap}
 .cicd-create-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:2px}
+.cicd-guide{display:flex;flex-direction:column;gap:14px;padding:16px;max-width:760px}
+.cicd-guide-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.cicd-guide-title{margin:0;font-size:16px;font-weight:600;color:var(--dsw-alias-text-primary)}
+.cicd-guide-sub{margin:0;flex:1 1 320px;font-size:12px;line-height:1.6;color:var(--dsw-alias-text-secondary)}
+.cicd-guide-steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.cicd-guide-step{display:flex;align-items:flex-start;gap:10px;padding:10px 12px;border:1px solid var(--dsw-alias-border-default);border-radius:8px;background:var(--dsw-alias-bg-surface)}
+.cicd-guide-step.is-current{border-color:var(--dsw-alias-brand-primary)}
+.cicd-guide-step.is-done .cicd-guide-step-title{color:var(--dsw-alias-text-secondary);text-decoration:line-through}
+.cicd-guide-mark{flex:none;width:18px;text-align:center;font-size:13px;line-height:18px;color:var(--dsw-alias-text-secondary)}
+.cicd-guide-step.is-done .cicd-guide-mark{color:var(--dsw-alias-brand-primary)}
+.cicd-guide-body{flex:1 1 auto;min-width:0}
+.cicd-guide-step-title{font-size:13px;font-weight:600;color:var(--dsw-alias-text-primary)}
+.cicd-guide-detail{margin:2px 0 0;font-size:12px;line-height:1.6;color:var(--dsw-alias-text-secondary)}
+.cicd-guide-next{margin:4px 0 0;font-size:12px;line-height:1.6;color:var(--dsw-alias-brand-primary)}
+.cicd-guide-hint{margin:0;font-size:12px;color:var(--dsw-alias-text-secondary)}
 /* v3.0-P6-2：模板中心 —— 先把选择摊开，选完只剩「名字 + 目录 + 创建」 */
 .cicd-template-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:8px}
 .cicd-template-card{display:flex;flex-direction:column;gap:2px;padding:8px 10px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm, 6px);background:var(--dsw-alias-bg-layer-1);text-align:left;cursor:pointer;box-sizing:border-box;min-height:52px}
@@ -528,9 +543,10 @@ window.__ModuleLoader__.load({
      * history API：面板挂在既有页面里，`pushState` 会改掉宿主页面自身的路径，刷新时宿主不认识这个
      * 路由；hash 只动片段，宿主刷新后仍能挂载面板，面板自己把视图还原回来。
      */
-    const ROUTE_VIEWS = ['run', 'environments', 'releases', 'editor', 'create', 'approvals', 'rbac', 'secrets', 'runners', 'audit']
+    const ROUTE_VIEWS = ['run', 'guide', 'environments', 'releases', 'editor', 'create', 'approvals', 'rbac', 'secrets', 'runners', 'audit']
     /** 视图 → 路径段（`run` 是默认视图，不带段，保证 `#/projects/x` 是最短可分享形式）。 */
     const VIEW_SEGMENTS = {
+      guide: 'guide',
       environments: 'environments',
       releases: 'releases',
       editor: 'pipeline',
@@ -2155,6 +2171,46 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * v3.0-P6-6 首屏引导：只走一次的四步，且每一步都对应一件真的会挡住你的事。
+     *
+     * 刻意不做成「教程进度条」：这里没有「我已阅读」的勾，勾全是后端从库与磁盘现算的——
+     * 昨天点过按钮不算完成，只有真的有了项目、真的有过一次运行、真的有发布记录才打勾。
+     * 每步只给**一个**下一步动作，避免新用户面对一排按钮不知道先点哪个。
+     */
+    function GuideView({ state, project, onRefresh, onGo }) {
+      const steps = Array.isArray(state.steps) ? state.steps : []
+      const done = state.doneCount || 0
+      const total = state.total || 0
+      if (state.status === 'idle' || (state.status === 'loading' && steps.length === 0)) {
+        return h('section', { className: 'cicd-guide', 'aria-label': '引导' }, h(LoadingState, { text: '正在算还差什么…', rows: 4 }))
+      }
+      return h('section', { className: 'cicd-guide', 'aria-label': '引导' },
+        h('header', { className: 'cicd-guide-head' },
+          h('h2', { className: 'cicd-guide-title' }, state.complete ? '都通了' : `引导 ${done}/${total}`),
+          h('p', { className: 'cicd-guide-sub' },
+            state.complete
+              ? '项目、身份、运行、发布都已落地。之后每次进来这一步都不再打扰你。'
+              : '这四步都不需要先读文档：每步只给一个下一步动作，做完就自动打勾。'),
+          h('button', { type: 'button', className: 'cicd-button', onClick: onRefresh }, '重新检查')),
+        state.status === 'error'
+          ? h(ErrorState, { title: '读取引导失败', error: state.error, onRetry: onRefresh })
+          : h('ol', { className: 'cicd-guide-steps' },
+            steps.map((step) => h('li', {
+              key: step.id,
+              className: 'cicd-guide-step' + (step.done ? ' is-done' : '') + (step.id === state.currentStep ? ' is-current' : ''),
+            },
+            h('span', { className: 'cicd-guide-mark', 'aria-hidden': 'true' }, step.done ? '✓' : '○'),
+            h('div', { className: 'cicd-guide-body' },
+              h('div', { className: 'cicd-guide-step-title' }, step.title),
+              step.detail ? h('p', { className: 'cicd-guide-detail' }, step.detail) : null,
+              !step.done && step.next ? h('p', { className: 'cicd-guide-next' }, '→ ' + step.next) : null),
+            !step.done && step.action
+              ? h('button', { type: 'button', className: 'cicd-button cicd-button-primary', onClick: () => onGo(step.action) }, '去这一步')
+              : null))),
+        project ? null : h('p', { className: 'cicd-guide-hint' }, '还没有选中项目：先在左上角选一个，或去「新建」挑一张模板卡。'))
+    }
+
+    /**
      * v3.0-P6-3 环境页：一眼看到 prod 跑什么。
      *
      * 这一页只回答四个问题，且都在第一屏：每个环境现在跑的是哪份字节、那台机器上真的是不是它、
@@ -2300,6 +2356,8 @@ window.__ModuleLoader__.load({
       const [secrets, setSecrets] = useState({ status: 'idle', items: [], error: null, setResult: null })
       /** v3.0-P6-3：环境页数据（当前版本 / 实例 / 护栏）。 */
       const [environments, setEnvironments] = useState({ status: 'idle', items: [], invalid: [], error: null })
+      /** v3.0-P6-6：首次引导（四步现在算，不存状态）。 */
+      const [guide, setGuide] = useState({ status: 'idle', steps: [], doneCount: 0, total: 4, complete: false, currentStep: '', error: null })
       /** P1：Runner 管理视图数据（复用 runners 状态）。 */
       /** v3.0-P6-5：命令面板展开状态（⌘K / Ctrl+K 切换）。 */
       const [palette, setPalette] = useState(false)
@@ -2763,6 +2821,31 @@ window.__ModuleLoader__.load({
         }
       }, [freshSignal])
 
+      /**
+       * v3.0-P6-6：引导数据。每次都重算——「昨天点过了」不算完成，
+       * 只有库里真的有了项目/账号/运行/发布，那一步才打勾。
+       */
+      const loadGuide = useCallback(async (project) => {
+        setGuide((prev) => (prev.status === 'ready'
+          ? { ...prev, status: 'loading', error: null }
+          : { status: 'loading', steps: prev.steps || [], doneCount: prev.doneCount || 0, total: prev.total || 4, complete: false, currentStep: '', error: null }))
+        try {
+          const payload = await callApi('onboarding', { project: project || '' }, freshSignal('onboarding'))
+          setGuide({
+            status: 'ready',
+            steps: Array.isArray(payload.steps) ? payload.steps : [],
+            doneCount: Number(payload.doneCount || 0),
+            total: Number(payload.total || 0),
+            complete: Boolean(payload.complete),
+            currentStep: String(payload.currentStep || ''),
+            error: null,
+          })
+        } catch (error) {
+          if (error && error.name === 'AbortError') return
+          setGuide({ status: 'error', steps: [], doneCount: 0, total: 4, complete: false, currentStep: '', error })
+        }
+      }, [freshSignal])
+
       /** P1：Secrets 视图数据加载。 */
       const loadSecrets = useCallback(async (project) => {
         setSecrets((prev) => ({ status: 'loading', items: prev.items, error: null, setResult: null }))
@@ -2807,6 +2890,7 @@ window.__ModuleLoader__.load({
         if (view === 'runners') void loadRunners()
         if (view === 'environments') void loadEnvironments(projectId)
         if (view === 'create') void loadTemplates()
+        if (view === 'guide') void loadGuide(projectId)
       }, [clearArmed, clearRollback, loadProjects, loadTargets, loadRuns, loadReleases, projectId, targetName, view, loadAudit, auditLimit, loadTemplates, loadApprovals, loadRbac, loadSecrets, loadRunners, loadEnvironments])
 
       /**
@@ -2820,7 +2904,8 @@ window.__ModuleLoader__.load({
         if (view === 'secrets') void loadSecrets(projectId)
         if (view === 'runners') void loadRunners()
         if (view === 'environments') void loadEnvironments(projectId)
-      }, [view, projectId, loadApprovals, loadRbac, loadSecrets, loadRunners, loadEnvironments])
+        if (view === 'guide') void loadGuide(projectId)
+      }, [view, projectId, loadApprovals, loadRbac, loadSecrets, loadRunners, loadEnvironments, loadGuide])
 
       /**
        * v3.0-P0：切视图只有一个入口。
@@ -3320,6 +3405,13 @@ window.__ModuleLoader__.load({
           onSet: (scope, name, value) => void setSecret(scope, name, value),
           busy,
         })
+        : view === 'guide'
+        ? h(GuideView, {
+          state: guide,
+          project: projectId,
+          onRefresh: () => void loadGuide(projectId),
+          onGo: (next) => goView(ROUTE_VIEWS.indexOf(next) >= 0 ? next : 'run'),
+        })
         : view === 'environments'
         ? h(EnvironmentsView, {
           state: environments,
@@ -3384,6 +3476,7 @@ window.__ModuleLoader__.load({
         {
           title: '流水线',
           entries: [
+            { view: 'guide', label: '引导', hint: '还差什么才能真的发一次', badge: guide.complete ? 0 : 1 },
             { view: 'run', label: '运行', hint: '阶段 / 运行历史 / 发布三栏' },
             { view: 'environments', label: '环境', hint: 'prod 跑的是什么、谁能发、护栏长什么样' },
             { view: 'releases', label: '发布', hint: '当前目标的发布记录与回滚' },

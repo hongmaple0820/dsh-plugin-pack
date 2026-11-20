@@ -782,11 +782,11 @@ function callPath(pathname, query = '', { headers = {} } = {}) {
   return route.resource(new Request(`http://x${pathname}${query}`, { headers }))
 }
 
-check('apply：注册 33 个工具、45 条路由（41 exact + 4 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
-  assert.equal(ctx.toolsList.length, 33)
+check('apply：注册 34 个工具、46 条路由（42 exact + 4 prefix）、1 条 WS upgrade 与 runtime disposer', () => {
+  assert.equal(ctx.toolsList.length, 34)
   assert.deepEqual(ctx.toolsList.map((tool) => tool.name).sort(), [
     'cicd_approve', 'cicd_artifacts', 'cicd_audit', 'cicd_auth', 'cicd_cancel', 'cicd_dora', 'cicd_environments', 'cicd_locks',
-    'cicd_logs', 'cicd_metrics', 'cicd_notify_ledger', 'cicd_pipe_save', 'cicd_plan', 'cicd_project_create', 'cicd_project_meta',
+    'cicd_logs', 'cicd_metrics', 'cicd_notify_ledger', 'cicd_onboarding', 'cicd_pipe_save', 'cicd_plan', 'cicd_project_create', 'cicd_project_meta',
     'cicd_projects', 'cicd_promotions',
     'cicd_rbac', 'cicd_registry', 'cicd_releases', 'cicd_rollback', 'cicd_run', 'cicd_runners', 'cicd_secrets', 'cicd_status',
     'cicd_storage', 'cicd_targets', 'cicd_templates', 'cicd_tokens', 'cicd_toolchain', 'cicd_triggers', 'cicd_users', 'cicd_validate',
@@ -798,11 +798,11 @@ check('apply：注册 33 个工具、45 条路由（41 exact + 4 prefix）、1 �
     assert.equal(typeof tool.output.render, 'function')
     assert.equal(typeof tool.execute, 'function')
   }
-  assert.equal(ctx.routes.length, 45)
+  assert.equal(ctx.routes.length, 46)
   assert.deepEqual(ctx.routes.filter((route) => route.kind === 'exact').map((route) => route.path).sort(), [
     '/api/plugins/cicd/approvals', '/api/plugins/cicd/approve', '/api/plugins/cicd/artifacts', '/api/plugins/cicd/audit', '/api/plugins/cicd/auth',
     '/api/plugins/cicd/cancel', '/api/plugins/cicd/dora', '/api/plugins/cicd/environments', '/api/plugins/cicd/locks',
-    '/api/plugins/cicd/log', '/api/plugins/cicd/metrics', '/api/plugins/cicd/notify-ledger', '/api/plugins/cicd/notify-test',
+    '/api/plugins/cicd/log', '/api/plugins/cicd/metrics', '/api/plugins/cicd/notify-ledger', '/api/plugins/cicd/notify-test', '/api/plugins/cicd/onboarding',
     '/api/plugins/cicd/operations', '/api/plugins/cicd/pipe-save',
     '/api/plugins/cicd/plan', '/api/plugins/cicd/preview', '/api/plugins/cicd/project-create', '/api/plugins/cicd/project-meta', '/api/plugins/cicd/projects',
     '/api/plugins/cicd/promotions', '/api/plugins/cicd/rbac', '/api/plugins/cicd/releases', '/api/plugins/cicd/rollback', '/api/plugins/cicd/run',
@@ -820,7 +820,7 @@ check('apply：注册 33 个工具、45 条路由（41 exact + 4 prefix）、1 �
   assert.equal(typeof ctx.upgrades[0].handler, 'function')
 })
 
-check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补注册 39+4 条；remote() 惰性取 port', () => {
+check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补注册 42+4 条；remote() 惰性取 port', () => {
   const coldRoutes = []
   const coldUpgrades = []
   const coldWeb = {
@@ -842,8 +842,8 @@ check('冷启动回归：webServer 未就绪时 0 路由，inject 就绪后补�
   assert.ok(typeof scopeFn === 'function', 'apply 应把路由注册挂到 ctx.inject 上')
   // 模拟 webServer 就绪：cordis 以一个能 get 到服务的 scope 触发回调（真实环境由服务就绪事件驱动）。
   scopeFn({ get: (key) => (key === 'webServer' ? coldWeb : undefined), effect() {} })
-  assert.equal(coldRoutes.length, 45, '就绪后应补注册 41 条 exact + 4 条 prefix 路由')
-  assert.equal(coldRoutes.filter((route) => route.kind === 'exact').length, 41)
+  assert.equal(coldRoutes.length, 46, '就绪后应补注册 42 条 exact + 4 条 prefix 路由')
+  assert.equal(coldRoutes.filter((route) => route.kind === 'exact').length, 42)
   assert.equal(coldUpgrades.length, 1, '就绪后应补注册 /log-ws upgrade 路由')
 
   // remote() 惰性解析：apply 时拿不到 port（remoteBase 为空），就绪后首次调用应取到 55470。
@@ -1041,6 +1041,78 @@ checkAsync('v3.0-P6-2 模板中心：内置 9 种 + 自定义模板 + 另存为�
     } finally { repo.close() }
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
+checkAsync('v3.0-P6-6 引导：四步全由库现算，做完才打勾，项目换一个不会假装已完成', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cicd-p6-6-'))
+  try {
+    const projectDir = join(dir, 'app')
+    mkdirSync(projectDir, { recursive: true })
+    writeFileSync(join(projectDir, 'pipe.yml'), [
+      'name: guide-app',
+      'default_target: staging',
+      'targets:',
+      '  staging:',
+      '    hosts: [dev1]',
+      '    path: /srv/guide-app',
+      '  prod:',
+      '    hosts: [web1]',
+      '    path: /srv/guide-app',
+      'stages:',
+      '  - id: build',
+      '    steps:',
+      '      - name: b',
+      '        run: echo hi',
+      '',
+    ].join('\n'))
+    const repo = await repoTool(join(dir, 'state'), { projects: [{ id: 'app', name: 'app', path: projectDir }] })
+    try {
+      // ① 空库：没有任何一件事算完成，四步都说得出口且只给一个下一步。
+      const fresh = await repo.call('/onboarding?project=app').then((response) => response.json())
+      assert.equal(fresh.ok, true)
+      assert.equal(fresh.total, 4)
+      assert.deepEqual(fresh.steps.map((step) => step.id), ['project', 'identity', 'run', 'deploy'])
+      assert.equal(fresh.steps[0].done, true, 'pipe.yml 可读，项目这一步就该是完成的：' + JSON.stringify(fresh.steps[0]))
+      assert.deepEqual(fresh.targetNames, ['staging', 'prod'])
+      assert.equal(fresh.steps[1].done, false, '库里没有账号时身份这步不能算完成')
+      assert.equal(fresh.steps[2].done, false)
+      assert.equal(fresh.steps[3].done, false)
+      assert.equal(fresh.currentStep, 'identity', '第一步没做完时「下一步」应指向它，而不是从后往前找')
+      assert.equal(fresh.complete, false)
+      // 没完成的每一步都必须给一个具体动作，否则新用户还是不知道该点哪。
+      for (const step of fresh.steps.filter((item) => !item.done)) {
+        assert.ok(step.next, '未完成的步骤必须说明下一步：' + step.id)
+        assert.ok(step.action, '未完成的步骤必须有一个跳转目标：' + step.id)
+      }
+
+      // ② 建一个账号后身份这步才打勾 —— 勾是从库里算的，不是前端记的。
+      repo.runtime.users({ action: 'create', email: 'guide@acc.test', password: 'Passw0rd!23', displayName: 'Guide', role: 'owner' })
+      const withUser = await repo.call('/onboarding?project=app').then((response) => response.json())
+      const identity = withUser.steps.find((step) => step.id === 'identity')
+      assert.equal(identity.done, true, '库里有了账号，身份这步必须打勾')
+      assert.equal(withUser.doneCount, 2)
+      assert.equal(withUser.currentStep, 'run', '项目与身份都完成后，下一步应轮到第一次运行')
+
+      // ③ 有过一次运行才轮到 deploy；直接往库里写一行模拟历史，避免真跑构建。
+      assert.equal(withUser.steps[2].done, false)
+      repo.runtime.store.appendRun({ id: 'run-guide-1', projectId: 'app', status: 'succeeded', startedAt: new Date().toISOString() })
+      const afterRun = await repo.call('/onboarding?project=app').then((response) => response.json())
+      assert.equal(afterRun.steps[2].done, true, '库里有了运行记录，运行这步必须打勾')
+      assert.equal(afterRun.doneCount, 3)
+      assert.equal(afterRun.currentStep, 'deploy', '只剩发布这一步时下一步应指向它')
+
+      // ④ 没有项目上下文时不能凭空报完成。
+      const noProject = await repo.call('/onboarding').then((response) => response.json())
+      assert.equal(noProject.steps[0].done, false, '没传 project 时项目这步必须是否')
+      assert.equal(noProject.complete, false)
+      assert.equal(noProject.currentStep, 'project')
+
+      // ⑤ 未知参数要挡：引导只读两个字段，多传一个就说明调用方写错了。
+      const stray = await repo.call('/onboarding?project=app&projet=typo')
+      assert.equal(stray.status, 400)
+      const crossOrigin = await repo.call('/onboarding?project=app', { headers: { origin: 'http://evil.test' } })
+      assert.equal(crossOrigin.status, 403, '引导是只读的，但仍然只接受同源请求')
+    } finally { repo.close() }
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
 checkAsync('routes：pipe-save 校验通过才写盘，非法源不落盘，写保护与未知参数', async () => {
   assert.equal((await call('/pipe-save', '?project=demo&source=x')).status, 403)
   assert.equal((await call('/pipe-save', '?project=demo&source=x', { headers: { 'x-dsh-cicd': '1' } })).status, 400)
@@ -1188,7 +1260,7 @@ checkAsync('routes：operations 时间线、notify-test 未配置与写保护', 
 })
 
 check('routes：所有资源都走 resource，没有 handler/POST 形态', () => {
-  assert.equal(ctx.routes.length, 45)
+  assert.equal(ctx.routes.length, 46)
   for (const route of ctx.routes) {
     assert.equal(route.handler, undefined)
     assert.ok(route.kind === 'exact' || route.kind === 'prefix')

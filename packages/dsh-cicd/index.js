@@ -3551,6 +3551,94 @@ function createRuntime(ctx, config) {
         pipeSource,
       }
     },
+    /**
+     * v3.0-P6-6 首次引导：把「还差什么」算出来，而不是塞一张教程图。
+     *
+     * 每一步都对应一件**真的会挡住你**的事：没有项目就没有可以跑的东西；身份是你自己
+     * （匿名引导期部署由 anonymous 发起，审计里没有名字）；第一次运行决定这个面板之后
+     * 有没有东西可看；staging 首部署才真正回答了「我能不能发布」。
+     * 每步都带 done 与 next（下一步该点哪、缺什么），前端只负责画，不负责推理。
+     * 刻意不写任何状态：全部由库与磁盘现算，用户刷新多少次都不会出现「昨天点过了」的假完成。
+     */
+    onboarding({ project: projectId = '' } = {}) {
+      const project = projectId ? (options.projects || []).find((item) => item.id === projectId) || null : null
+      const hasUsers = auth.hasUsers()
+      const steps = []
+
+      // ① 项目：pipe.yml 能读进来才算真的有了。
+      let pipe = null
+      let pipeError = ''
+      if (project) {
+        try { pipe = readPipe(project) } catch (error) { pipeError = error.message || String(error) }
+      }
+      const targetNames = pipe ? Object.keys(pipe.targets || {}) : []
+      let environments = []
+      try { environments = pipe ? Object.keys(normalizeEnvironments(pipe.targets)) : [] } catch { environments = [] }
+      steps.push({
+        id: 'project',
+        title: project ? `项目 ${project.name}` : '新建第一个项目',
+        done: Boolean(project && pipe),
+        detail: project
+          ? (pipe ? `pipe.yml 可读，${targetNames.length} 个目标：${targetNames.join(', ') || '（无）'}` : `pipe.yml 读不出来：${pipeError}`)
+          : '项目就是这个面板的全部上下文——没有它，下面三步都没有对象。',
+        next: project
+          ? (pipe ? (targetNames.length ? '' : '在编辑器里加一个 targets 条目') : '打开编辑器修好 pipe.yml')
+          : '在「新建」里挑一张模板卡，填个名字即可',
+        action: project ? (pipe ? 'editor' : 'editor') : 'create',
+      })
+
+      // ② 身份：引导期（库里一个账号都没有）的部署是以 anonymous 记进审计的。
+      steps.push({
+        id: 'identity',
+        title: hasUsers ? '已经有账号了' : '建一个自己的账号',
+        done: hasUsers,
+        detail: hasUsers
+          ? '写操作会记到具体的人头上，审批也需要第二个人。'
+          : '当前是引导期：谁进来都是 owner，部署在审计里只留下 anonymous——出了事追不到人。',
+        next: hasUsers ? '' : '在「RBAC」里新建一个账号，然后用它登录',
+        action: hasUsers ? 'rbac' : 'rbac',
+      })
+
+      // ③ 第一次运行：拿默认目标或第一个目标 dry-run 一遍，不碰任何主机。
+      const runs = project ? store.runs({ project: project.id, limit: 1 }) : []
+      const firstTarget = pipe ? (pipe.defaultTarget || targetNames[0] || '') : ''
+      steps.push({
+        id: 'run',
+        title: '跑一次（dry-run 不碰主机）',
+        done: runs.length > 0,
+        detail: runs.length > 0
+          ? `最近的运行 ${runs[0].id}：${runs[0].status}`
+          : (project ? '运行会真的执行 build 步骤，dry-run 只打印计划。' : '先有项目。'),
+        next: runs.length > 0 ? '' : (project ? `在「运行」里对 ${firstTarget || '第一个目标'} 点一次 dry-run` : '先建项目'),
+        action: 'runs',
+      })
+
+      // ④ staging 首部署：真的落到一台机器上，才算回答「我能不能发布」。
+      const releases = project ? store.releases({ limit: 1 }) : []
+      steps.push({
+        id: 'deploy',
+        title: '部署到 staging',
+        done: releases.length > 0,
+        detail: releases.length > 0
+          ? `已有发布记录 ${releases[0].id}`
+          : '受保护环境还要过护栏与审批——先把 staging 跑通，再谈 prod。',
+        next: releases.length > 0 ? '' : '在「运行」里选 staging 目标点部署，确认后它会等你按确认',
+        action: 'releases',
+      })
+
+      const doneCount = steps.filter((item) => item.done).length
+      const current = steps.find((item) => !item.done) || null
+      return {
+        ok: true,
+        steps,
+        environments,
+        targetNames,
+        doneCount,
+        total: steps.length,
+        complete: doneCount === steps.length,
+        currentStep: current ? current.id : '',
+      }
+    },
     validatePipe({ source = '', project: projectId = '' } = {}) {
       // 「保存前校验」：source 给定时校验编辑器里的原始文本；否则校验项目落盘的 pipe.yml。
       // 解析失败不抛异常，而是返回带行号的诊断，供编辑器点击定位。
@@ -3909,6 +3997,45 @@ function registerTools(ctx, runtime) {
     },
     async execute(args = {}) {
       return runtime.createProject({ kind: args.kind || 'static', name: args.name || '', path: args.path || '', repoUrl: args.repoUrl || '', branch: args.branch || '', template: args.template || '' })
+    },
+  })
+
+  register({
+    name: 'cicd_onboarding',
+    description: '首次引导：回答「还差什么才能真的发布一次」——项目、身份、第一次运行、staging 首部署四步的完成情况与下一步该点哪里。全部由库与磁盘现算，不存任何已完成状态。',
+    parameters: {
+      type: 'object',
+      properties: {
+        project: { type: 'string', description: '项目 id；省略则只报环境无关的步骤' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          steps: { type: 'array', items: { type: 'object' } },
+          environments: { type: 'array', items: { type: 'string' } },
+          targetNames: { type: 'array', items: { type: 'string' } },
+          doneCount: { type: 'number' },
+          total: { type: 'number' },
+          complete: { type: 'boolean' },
+          currentStep: { type: 'string' },
+        },
+      },
+      render(_args, value) {
+        const lines = [`引导：${value.doneCount}/${value.total} 步已完成`]
+        for (const step of value.steps || []) {
+          lines.push(`${step.done ? '[x]' : '[ ]'} ${step.title}`)
+          if (step.detail) lines.push(`    ${step.detail}`)
+          if (!step.done && step.next) lines.push(`    → ${step.next}`)
+        }
+        if (value.currentStep) lines.push(`下一步：${value.currentStep}`)
+        return textBlocks(lines.join('\n'))
+      },
+    },
+    async execute(args = {}) {
+      return runtime.onboarding({ project: args.project || '' })
     },
   })
 
@@ -5474,6 +5601,20 @@ function collectSkippedStages(pipe, { branch = '', tag = '' } = {}) {
   return out
 }
 
+/**
+ * v3.0-P6-6 首次引导：GET /onboarding 回答「还差什么才能真的发一次」。
+ * 只读、只算，读它不需要身份——新用户装完就是靠这一屏知道下一步点哪里。
+ */
+async function onboardingResource(request, runtime) {
+  if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
+  const params = queryOf(request)
+  const bad = unsupportedParams(params, new Set(['project']))
+  if (bad) return json({ ok: false, error: bad }, 400)
+  try {
+    return json(runtime.onboarding({ project: params.get('project') || '' }))
+  } catch (error) { return errorJson(error) }
+}
+
 async function validateResource(request, runtime) {
   if (!isSameOrigin(request)) return json({ ok: false, error: '只接受本地同源请求', code: 'CSRF_ORIGIN' }, 403)
   const params = queryOf(request)
@@ -6649,6 +6790,7 @@ function registerHttpRoutes(ctx, runtime) {
     { kind: 'exact', path: `${ROUTE_PREFIX}/project-create`, resource: (request) => projectCreateResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/templates`, resource: (request) => templatesResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/template-save`, resource: (request) => templateSaveResource(request, runtime) },
+    { kind: 'exact', path: `${ROUTE_PREFIX}/onboarding`, resource: (request) => onboardingResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/validate`, resource: (request) => validateResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/preview`, resource: (request) => previewResource(request, runtime) },
     { kind: 'exact', path: `${ROUTE_PREFIX}/pipe-save`, resource: (request) => pipeSaveResource(request, runtime) },
