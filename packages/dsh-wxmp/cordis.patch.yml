@@ -1,0 +1,11 @@
+- insert:
+    - id: dsh-wxmp
+      name: '@local/dsh-wxmp'
+      config:
+        timeoutMs: 15000
+        rateLimitGlobalPerMin: 10
+        articleIntervalMs: 3000
+        cacheTtlMs: 60000
+        pollIntervalMs: 600000
+        pollLimit: 10
+        webhooks: []
