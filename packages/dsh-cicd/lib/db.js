@@ -235,7 +235,8 @@ const DDL = [
     revoked_by TEXT NOT NULL DEFAULT '',
     token_sha256 TEXT NOT NULL DEFAULT '',
     protocol INTEGER NOT NULL DEFAULT 1,
-    joined_at TEXT NOT NULL DEFAULT ''
+    joined_at TEXT NOT NULL DEFAULT '',
+    stats_json TEXT NOT NULL DEFAULT ''
   )`,
   `CREATE INDEX IF NOT EXISTS idx_runners_status ON runners (status, last_seen_at DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals (status, requested_at DESC)`,
@@ -506,6 +507,11 @@ function migrate(db) {
     }
     if (!hasColumn(db, 'runners', 'joined_at')) {
       db.exec(`ALTER TABLE runners ADD COLUMN joined_at TEXT NOT NULL DEFAULT ''`)
+    }
+    // v13 → v14：M3 心跳统计（在跑数/磁盘/缓存命中）。存 JSON 原文而不是拆列：
+    // runner 以后多报一个字段，不该再动一次表结构。
+    if (!hasColumn(db, 'runners', 'stats_json')) {
+      db.exec(`ALTER TABLE runners ADD COLUMN stats_json TEXT NOT NULL DEFAULT ''`)
     }
     // v10 → v11：指针表改成 WITHOUT ROWID。v10 的迁移脚本先建过一次普通表（带 rowid），
     // 这里按「有没有 rowid」判新旧——PRAGMA index_list 看不出这个，只能问 sqlite_master 的原始 DDL。

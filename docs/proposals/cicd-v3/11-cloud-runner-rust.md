@@ -89,7 +89,7 @@ runner 身份认证在 handler 内部做（runner token），不依赖 DSH Peer�
 | POST | `/runner/v2/logs` | 批量日志行 `{taskId, lines:[{seq,text}]}` | `(taskId,seq)` 去重 |
 | POST | `/runner/v2/credentials` | secretRefs → 短期值（TTL=租约，随租约续） | 租约内缓存 |
 | POST | `/runner/v2/complete` | 终态 + exitCode + artifacts 清单 | 返回既有结果 |
-| PUT | `/runner/v2/artifacts/:taskId/:name` | 流式上传（分块，`Content-Digest` 校验） | CAS 去重 |
+| PUT | `/runner/v2/artifacts/:taskId/:name` | 裸 tar.gz 上传（≤ 512 MiB，一个制品一个包） | CAS 去重 |
 | POST | `/runner/v2/drain` | 排空：不领新任务，跑完当前 | 幂等 |
 
 与 §5.1 表的差异：路径加 `/runner/v2` 前缀（挂在插件命名空间下，不新起端口）；runnerId
@@ -159,8 +159,21 @@ runner/（cargo workspace，单二进制）
 ### 5.3 workspace 与缓存
 
 - `<workdir>/ws/<runId>/<jobId>`；`clean:true` → 步骤前清空；TTL 后台 GC（默认 1h）。
-- 缓存：任务声明 `{key, paths, mode}` → 执行前从 `<workdir>/cache/<key>.tgz` 解包到
-  请求路径，任务成功后回写。宿主侧只存 key 元数据与命中统计（心跳上报）。
+- 缓存（M3 落地）：任务体带 `cache: [{key, paths, restoreKeys, mode}]`。runner 在 checkout
+  之后、第一个 `run` 步骤之前 `POST /cache/lookup`（精确 key 优先，未命中再按 `restoreKeys`
+  前缀回退），命中后 `GET /cache/blob?digest=` 拿 tar.gz 裸字节、用系统 tar 解包到 workspace
+  根；`succeeded` 之后按 `save`/`both` 打包存在的 paths，`PUT /cache/blob?key=` 推回宿主。字节
+  不进 meta 表：走既有 CAS（`artifactStore.putFile`）并在 refs 里挂一条 `cache:<projectId>`
+  指针，所以 `artifacts gc` 不会回收仍在引用的缓存字节。runner 侧 fail-open（任一步失败只记
+  miss/日志，不改任务结论）；tar 探测不到就整段跳过并在 `register` 的 `tools` 里省掉 `tar`。
+- 命中统计：`hits/misses/saves` 随心跳 `stats.cache` 上报（`runners.stats_json` 落库，
+  `cicd_runners` 直接可见）；`stats.running` 是当前在跑任务数，`diskFreePct` 目前留空。
+- 心跳是**后台周期任务**（`spawn_heartbeat`），与 claim/execute 解耦：注册成功后立刻一次，之后每
+  `heartbeatSec` 一次，任务执行期间照常上报（`stats.running=1`）。原因是宿主 liveness 读库判活、
+  阈值 `heartbeatSec×3`（默认 90 s），只在空闲分支发心跳会让任何超过阈值的正常构建被判
+  `RUNNER_OFFLINE` 杀掉。心跳失败只记日志、不致命。
+- `uses: cache` 步骤仍在宿主侧执行（作用于宿主的项目目录），**远程构建请用顶层 `cache:`**；
+  远程 executor 下这条步骤会在日志里被点名提醒（`lib/runner.js` 的 `remoteCacheStepNotice`）。
 - 磁盘水位：心跳带 `df`；低于 5% 自动 drain + 告警（宿主侧 P7 混沌逻辑已有磁盘满用例）。
 
 ### 5.4 制品回流
@@ -185,9 +198,9 @@ CAS（复用 artifactStore.put 及其 repaired 语义）→ 关联 (runId, taskI
 | H1 | handler 路由注册 `/runner/v2/*`（auth:'anonymous'，内部 token 认证） | index.js 路由表旁新增（resource 路由表不动） |
 | H2 | 任务 broker v2：把现有 step 编排翻译成 §5.2 任务描述（pipe 的 run 步骤 → steps；deploy 步骤仍宿主执行，runner 只跑 build——设计如此，见 03 §6） | lib/executors.js createRemoteExecutor |
 | H3 | join token 管理：GUI 生成/吊销（现有 joinTokenMatches 复用）+ runner token 存量表（含轮换） | lib/executors.js + index.js runners 资源 |
-| H4 | 短期凭据端点：secretRefs → 值，TTL=租约；审计记「凭据揭示」 | lib/secrets.js + audit |
+| ✅ H4 | 短期凭据端点：secretRefs → 值，TTL=租约；审计记「凭据揭示」 | lib/secrets.js + audit |
 | H5 | 制品回流 PUT handler + complete 校验 | index.js + lib/artifacts.js |
-| H6 | 心跳负载入库（磁盘/缓存命中率/在跑数）+ stale 标记 | runners 资源 + client.js 构建主机页 |
+| ✅ H6 | 心跳负载入库（缓存命中率/在跑数；磁盘水位 runner 侧未采）+ stale 标记 | runners 资源 + client.js 构建主机页 |
 | H7 | GUI：构建主机页新增 v2 列（协议版本/缓存命中率/安装命令） | client.js |
 | H8 | 测试：fake Rust runner（协议 v2 的 Node 模拟器，风格同现有 fake runner）+ 全链路用例 | test/smoke.mjs P9-* |
 
@@ -195,13 +208,48 @@ CAS（复用 artifactStore.put 及其 repaired 语义）→ 关联 (runId, taskI
 
 | 里程碑 | 内容 | 验收（红→绿用例） |
 |---|---|---|
-| M1 协议骨架 | H1+H3 + Rust api.rs：register/heartbeat/claim/logs/complete；run 步骤执行 | fake runner 走完 build-only 任务；吊销后 401；断链重连日志 seq 去重 |
-| M2 workspace | checkout/toolchain 步骤 + workspace TTL GC + journal 断电续跑 | kill -9 后重启续跑不重做成功步骤；GC 只删过期 |
-| M3 缓存+凭据 | cache.rs + H4：缓存命中统计入心跳；secretRefs 换短期值 | 日志/DB grep 不到 secret 原文；缓存第二次构建命中 |
-| M4 制品回流 | collect + H5：PUT → CAS → run 记录关联 digest | 完整 build→upload→promote→deploy 闭环（现有 P5-S12 篡改用例扩展到 runner 路径） |
-| M5 迁移 | 版本握手 + v1 runner 兼容跑通 + 文档（README/08-security-rbac 的 runner 章节）+ roadmap V2-M2 勾选 | 双 runner 并存各跑一条 run；文档与实现一致 |
+| ✅ M1 协议骨架 | H1+H3 + Rust api.rs：register/heartbeat/claim/logs/complete；run 步骤执行 | fake runner 走完 build-only 任务；吊销后 401；断链重连日志 seq 去重 |
+| ✅ M2 workspace | checkout 步骤 + workspace TTL GC + journal 断电续跑（toolchain 步骤见下方交付说明） | kill -9 后重启续跑不重做成功步骤；GC 只删过期 |
+| ✅ M3 缓存+凭据 | cache.rs + H4：缓存命中统计入心跳；secretRefs 换短期值 | 日志/DB grep 不到 secret 原文；缓存第二次构建命中 |
+| ✅ M4 制品回流 | collect + H5：PUT → CAS → run 记录关联 digest | 完整 build→upload→promote→deploy 闭环（宿主 P9-S10/S11 + runner 集成用例；P5-S12 的 digest 校验沿用同一 CAS） |
+| ✅ M5 迁移 | 版本握手 + v1 runner 兼容跑通 + 文档（README/08-security-rbac 的 runner 章节）+ roadmap V2-M2 勾选 | 双 runner 并存各跑一条 run；文档与实现一致（宿主 P9-S12 + runner 2 个集成用例） |
 
 每个里程碑独立可发布（宿主侧改动向后兼容，v1 不受影响）。
+
+> **M1/M2 交付说明（2026-11-21）**
+>
+> - M2 的 `toolchain` 步骤没有做，因为当前 v2 broker 根本不下发它：`lib/executors.js`、`lib/runner-v2.js` 构造的任务描述里没有 `toolchain` 步骤，runner 侧实现了也没有东西可跑。工具链安装随 M3 的 cache 层一起进（同一批要碰 `runner-work` 的目录布局与依赖解析），宿主侧 `lib/toolchain.js` 仍是唯一权威。
+> - 「journal 断电续跑」之所以用任务级 journal 就能满足「不重做成功步骤」：宿主按 step 派发任务（`spec.stepIndex`，一个 step 一个 taskId），所以任务级 journal 等价于步骤级 checkpoint——已 finished 的步骤重启后只补发 complete 不重跑，被中断的那一步由宿主重派。
+> - 验收证据：`packages/dsh-cicd/runner` 的 23 个单测 + 7 个集成用例（含真实 `git clone` 到 `ws/<runId>`、`tools:['git']` 上报、journal 命中不重跑）；宿主侧 `test/smoke.mjs` 的 P9-S3（任务描述）与 P9-S4（无 git 能力的 runner 被 `RUNNER_CAPABILITY_MISSING` 拦下）。
+
+> **M3 交付说明（2026-11-21）**
+>
+> - 线上契约：`POST /credentials` 只放行任务申报过的名字（否则 403 `SECRET_NOT_DECLARED`，未知任务 404 `TASK_UNKNOWN`），TTL = min(租约, 900) 且 ≥ 60，揭示动作写审计 `secret.reveal`；`POST /cache/lookup`、`GET|PUT /cache/blob`（裸字节，PUT 上限 256 MiB）。三条缓存端点共用 `declaredCache()` 门禁：key 未申报 403 `CACHE_NOT_DECLARED`，`mode` 不含 save 的 key PUT 得 403 `CACHE_SAVE_FORBIDDEN`，超过上限 413 `CACHE_TOO_LARGE`。
+> - 任务体脱敏：`secretRefs` 只带名字；`env` 与 `command` 里的明文改写为 `${NAME}`（长度 < 4 的值不碰，免得把普通文本打成占位符）；`env` 里整值等于某个 secret 的条目抽成 `secretEnv: [{env, ref}]`。runner 先按 `secretRefs` 同名注入、再按 `secretEnv` 映射注入（映射优先），换不到值即 fail closed：complete `failed`、exit `-1`、checkout 与所有步骤都不跑。
+> - 「缓存第二次构建命中」目前是契约级证据：宿主侧 P9-S8（lookup 命中与 `restoreKeys` 前缀回退、GET/PUT 字节逐字节一致、未申报 403、幽灵任务 404、非 GET/PUT 405），runner 侧集成用例 `cache_hit_restores_files_via_system_tar`（真 tar 打包 → 下载 → 解包 → 步骤里看得见 `dist/hit.txt`）、`cache_save_uploads_blob_and_heartbeat_reports_stats`（成功任务 PUT 的 key 正确、心跳 `stats.cache.saves ≥ 1`）、`cache_lookup_failure_is_fail_open`（lookup 503 时任务照旧 succeeded）。跨进程真跑一条完整流水线留给 M4 的制品回流用例一并做。
+> - 交付前修掉一个判活缺陷：runner 原先只在 claim 拿到空任务时发心跳，而宿主 liveness 探针每 5 s 读库判活、阈值 `heartbeatSec×3`（默认 90 s），于是任何超过 90 s 的正常构建都会被判 `RUNNER_OFFLINE` 杀掉，心跳里的 `stats.running` 也恒为 0。现在心跳改为后台周期任务（注册后立刻一次，随主循环退出而 abort），集成用例 `heartbeat_ticks_during_long_task`（`heartbeatSec=1` + 4 s 步骤）断言执行期间 ≥2 次心跳、≥1 次 `stats.running=1`、任务仍 succeeded。
+> - tar 是系统依赖（本机 bsdtar 3.5.2），不新增 cargo 依赖；压缩包落 `<workdir>/cache/`（不在 `ws/` 内，workspace 清理删不到在途包），300 s 超时 + `kill_on_drop`。
+> - 已知限制：`uses: cache` 是宿主侧动作，缓存的是宿主的项目目录；远程构建必须用顶层 `cache:`（远程 executor 下会打一条点名该 runner 的提醒）。M2 交付说明里「toolchain 随 M3 的 cache 层一起进」没有兑现——v2 任务描述仍没有 `toolchain` 步骤，宿主侧 `lib/toolchain.js` 仍是唯一权威，runner 侧安装器随「加 toolchain 步骤」的那个里程碑走。
+> - 验收证据：`cargo test --offline` 37 单测 + 13 集成全绿（新增 cache 3 单测 + 3 集成 + 1 心跳集成）；宿主 `test/smoke.mjs` 180 checks passed（新增 P9-S5 凭据、P9-S6 心跳统计、P9-S7 顶层 cache 声明、P9-S8 缓存字节闭环、P9-S9 远程 `uses: cache` 提醒）。
+
+> **M4 交付说明（2026-11-21）**
+>
+> - 线上契约：`PUT /runner/v2/artifacts/:taskId/:name?runnerId=` 裸 tar.gz（≤ 512 MiB），响应 `{ok,name,digest,bytes,deduped}`；错误码 401 / 400 `BAD_ARTIFACT_NAME`（name 必须匹配 `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`）/ 404 `TASK_UNKNOWN` / 403 `ARTIFACT_NOT_DECLARED`（名字不在该任务声明里）/ 413 `ARTIFACT_TOO_LARGE`。字节进 CAS 后挂一个 `{projectId,name}` 指针（`artifacts.putRef`），所以 `artifacts gc` 不会回收还在被引用的回流件。
+> - 声明按 stage 收敛：`collectDeclarations(pipe, stageId)` 只把当前 stage 的 `uses: collect` 翻成任务声明。runner 每个任务一个干净 workspace，build 的产物不会出现在 deploy 阶段的任务里，声明混在一起只会让后者假失败。
+> - 收口在 complete：宿主以「PUT 记录 ∪ 声明的名字」判定，非 optional 的缺失把任务改成 `failed` + `code: ARTIFACT_MISSING`（构建退出码 0 不算数——少了产物，下游 deploy/promote 是无米之炊），并写审计 `artifact.missing`。因为判定看 PUT 记录而不是只看 complete 的 body，journal 重放（`src/app.rs:188` / `src/app.rs:266` 补发的 complete 不带 artifacts）不会误判：字节确实到过宿主就还算到齐；只有在崩溃于上传之前时才会得到 `ARTIFACT_MISSING`，那也正是事实。
+> - 远程构建里的 `uses: collect` 不在宿主 glob（host 项目目录里没有远程产物），runStep 会打一条点名 runner 的提醒并把该步骤记成 `skipped`；同时把「只有 `failed` 才拖垮 stage」这条判据收紧——之前 `skipped` 也会让 stage 失败，远程 collect 一上线就会把整条流水线打成红的。
+> - 制品与缓存的边界：缓存是「下一轮更快」，制品是「这一次的产物」。两者都走 CAS、都用系统 tar（不新增 cargo 依赖），但制品没有 restoreKeys/回退语义，名字由 pipe.yml 指定。
+> - 已知限制：① runner 侧打包是「glob 命中 → 单个 tar.gz」，不做分块断点续传（设计里列作可选项）；② `toolchain` 步骤仍未下发，宿主 `lib/toolchain.js` 仍是唯一权威（M2/M3 遗留，随「加 toolchain 步骤」的里程碑走）。
+> - 验收证据：`cargo test --offline` 41 单测 + 16 集成全绿（新增 `collect` 4 个 glob 单测 + 3 个集成：`artifacts_are_uploaded_and_reported_on_complete`、`no_artifacts_declared_uploads_nothing`、`artifact_glob_miss_is_skipped`）；宿主 `test/smoke.mjs` 182 checks passed（新增 P9-S10 制品回流含 403/404/400/405/401 与 `ARTIFACT_MISSING`、P9-S11 按 stage 翻译声明与远程跳过）。
+
+> **M5 交付说明（2026-11-21）**
+>
+> - 握手是双向的：runner 注册时自报 `protocol: 2`（`RegisterRequest.protocol`，可选字段——不带时老宿主照旧当 v1 收）；宿主回 `protocol` 与 `minProtocol`，runner 见到 `minProtocol > 2` 立刻退出并提示升级，而不是拿旧规矩解释新任务。
+> - 三种错法给三种码，因为修法不同：400 缺字段是调用方写错；**426 `RUNNER_PROTOCOL_UNSUPPORTED`** 是「你敲的是 v2 端点但你不是 v2」（`endpoints.register` 协商，且不把机器登记进来）；**409 `RUNNER_PROTOCOL_MISMATCH`** 是「你登记的身份和这条路径不匹配」——既覆盖 v1 机器拿 v2 token 敲 `/claim`（`authenticate()` 在比对 token 之前就判），也覆盖 v2 机器回头轮询 v1 的 `/runner-poll` / 回报 `/runner-result`（那边拿到的是 raw spec，没有 secretRefs/cache 语义，还会绕过 complete 的制品校验）。
+> - v1 注册显式写 `protocol: 1`（`index.js` 的 `runnerRegister`），不再靠 `runners.register()` 的默认值：默认值一旦改动，老 runner 会被悄悄当成 v2，而这类错位在日志里长得跟凭据问题一模一样。
+> - 并存是既有结构，不是新机制：v1 与 v2 共用一个 broker（`broker.claim(spec, runnerId)`），一台机器走哪条路径由它注册时用的端点决定；用例里两台机器在同一个 runtime 上各跑完一条 run，互不影响。
+> - 已知限制：① v1 路径没有制品到齐判定与凭据交换（这是 v1 的定义，不是缺陷），需要这些语义就必须走 v2；② `toolchain` 步骤仍未下发（M2/M3/M4 遗留）；③ 握手只到「版本号」粒度，没有能力位图协商——能力仍走 `tools` 标签过滤。
+> - 验收证据：`cargo test --offline` 41 单测 + **18 集成**全绿（新增 `register_declares_protocol_version`、`newer_host_protocol_stops_the_runner`）；宿主 `test/smoke.mjs` **183 checks passed**（新增 P9-S12：协商成功 / 自报 1 得 426 且不登记 / v1 落 protocol=1 / 跨协议 409 / 双 runner 并存各跑一条）。
 
 ## 8. 风险与开放问题
 
@@ -224,5 +272,5 @@ CAS（复用 artifactStore.put 及其 repaired 语义）→ 关联 (runId, taskI
 ## 10. 与既有文档的关系
 
 - 03-architecture.md §5：本方案是它的落地设计（路径/认证细节有偏差，见 §3 差异说明）；
-- 10-roadmap.md：V2-M2 执行面按 M1-M5 重述，完成后逐项勾选；
+- 10-roadmap.md：V2-M2 执行面按 M1-M5 重述，完成后逐项勾选（已勾，见该文件 V2-M2 行）；
 - 08-security-rbac.md：§4 认证设计补进该文档的 runner 章节（实施 M1 时同步）。

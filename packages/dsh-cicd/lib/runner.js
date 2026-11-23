@@ -130,6 +130,18 @@ async function runStep({ step, stageId, jobId, ctx }) {
 
   if (step.kind === 'uses') {
     const name = step.uses || ''
+    if (name === 'cache') {
+      const notice = remoteCacheStepNotice(ctx.activeExecutor)
+      if (notice) log(where, notice)
+    }
+    // M4：远程构建的 collect 由 runner 在步骤全部成功后执行（它在自己的 workspace 里 glob，
+    // 再把字节 PUT 回宿主 CAS）。在宿主这边跑同一个动作只会 glob 到一个空项目目录，
+    // 然后硬失败「collect 没有匹配到任何文件」——那是个假故障。
+    if (name === 'collect' && ctx.activeExecutor?.kind === 'remote') {
+      const notice = remoteCollectStepNotice(ctx.activeExecutor)
+      if (notice) log(where, notice)
+      return { ...step, status: 'skipped', durationMs: 0, exitCode: 0, error: '' }
+    }
     if (!ctx.actions) {
       // 干跑（或没有动作运行时）：明确说跳过，而不是假装成功。
       log(where, `跳过动作 ${name}：当前上下文没有动作运行时（干跑不执行动作）`)
@@ -195,8 +207,14 @@ async function runStep({ step, stageId, jobId, ctx }) {
         signal,
         taskId: `run-${runId}-step-${stageId}-${jobId ? `${jobId}-` : ''}${step.index}`,
         runId,
+        // M3：凭据按项目取（secretRefs），缓存按任务下发——两个都靠 projectId 定位。
+        projectId: project?.id || '',
         stepIndex: step.index,
         stageId,
+        source: ctx.source || null,
+        cache: ctx.cache || [],
+        // M4：制品声明按 stage 下发（同 stage 的 uses: collect 步骤）。
+        artifacts: typeof ctx.collectDecls === 'function' ? ctx.collectDecls(stageId) : [],
       },
     )
     if (result.status === 'success') break
@@ -236,6 +254,52 @@ function recordStep({ store, runId, stageId, jobId, step, result, logFile, activ
       runner_id: activeExecutor?.runnerId || '',
     })
   } catch { /* step rows are best effort */ }
+}
+
+/**
+ * `uses: cache` 步骤是宿主侧动作：它打包/解包的是**宿主**的项目目录，而远端 runner 的
+ * 构建产物在它自己的 workspace 里，宿主磁盘上根本没有。所以远程构建必须写 pipe.yml 顶层的
+ * `cache:`（任务体下发、runner 自己恢复/保存）。这里不改行为，只把这件事在日志里说清楚——
+ * 静默缓存一个空目录比报错更坏。
+ */
+/**
+ * M4：把 pipe 里的 `uses: collect` 步骤翻译成任务级的制品声明。
+ * 按 stage 取而不是全 pipe 取：runner 每个任务一个干净 workspace（clean:true），
+ * build 阶段的产物不会出现在 deploy 阶段的任务里，声明混在一起只会让后者报 ARTIFACT_MISSING。
+ */
+export function collectDeclarations(pipe, stageId) {
+  const stages = Array.isArray(pipe?.stages) ? pipe.stages : []
+  const stage = stages.find((item) => item && item.id === stageId)
+  if (!stage) return []
+  const stepsOf = (job) => (Array.isArray(job?.steps) ? job.steps : [])
+  const groups = Array.isArray(stage.jobs) && stage.jobs.length > 0 ? stage.jobs.map(stepsOf) : [stepsOf(stage)]
+  const decls = []
+  for (const steps of groups) {
+    for (const step of steps) {
+      // parsePipe 原样保留 pipe.yml 的形状（没有 kind 字段），kind 是 runStep 里现算的；
+      // 这里按同一判据认步骤，否则声明永远是空的。
+      const isUses = step?.kind === 'uses' || Boolean(step?.uses)
+      if (!isUses || step.uses !== 'collect') continue
+      const name = String(step.with?.name || '').trim()
+      if (!name) continue
+      const raw = step.with?.paths
+      const paths = (Array.isArray(raw) ? raw : [raw]).map((value) => String(value || '').trim()).filter(Boolean)
+      if (paths.length === 0) continue
+      decls.push({ name, paths, optional: Boolean(step.with?.optional) })
+    }
+  }
+  return decls
+}
+
+export function remoteCollectStepNotice(executor) {
+  if (!executor || executor.kind !== 'remote') return ''
+  return `uses: collect 由 runner ${executor.runnerId || ''} 执行：它在自己的 workspace 里 glob 声明的 paths，成功后 PUT 回宿主 CAS（本次运行按 digest 认这包字节）`
+}
+
+export function remoteCacheStepNotice(executor) {
+  if (!executor || executor.kind !== 'remote') return ''
+  const id = executor.runnerId || ''
+  return `注意：uses: cache 在宿主侧执行，缓存的是宿主的项目目录（runner ${id} 的构建产物不在里面）；远程构建请用 pipe.yml 顶层的 cache: 声明`
 }
 
 export async function runPipeline({
@@ -383,7 +447,14 @@ export async function runPipeline({
   // 没有它，派出去的任务只能在超时后失败，而超时原因会把人的注意力引向命令而不是机器。
   // v3.0-P7：步骤级的认领超时。远端 executor 的任务先入队再等某台机器来接，
   // 没有上限的话「没有机器来领」这件事只能靠进程重启收场。本地 spawn 不看这个字段。
-  const stepContext = { runId, log, store, logFile, activeExecutor, project, vars, signal, executeDeploy, secrets: secretMap, toolchainEnv: null, actions, runnerLiveness, claimTimeoutMs: stepTimeoutSec || 0 }
+  // 云流水线 M2：远端 runner 没有「项目本地目录」，git 项目把源码信息随任务下发，
+  // runner 在自己的 workspace 里 checkout。local/非 git 项目 source 为 null，行为不变。
+  const source = project?.sourceType === 'git' && project?.repoUrl
+    ? { type: 'git', url: String(project.repoUrl), ref: String(project.branch || 'HEAD'), sha: String(project.commit || ''), depth: 1 }
+    : null
+  // M3：顶层 `cache:` 声明随上下文下发到 executor。宿主侧的 uses: cache 步骤照旧走
+  // lib/actions.js；这里给的是「整任务级」缓存——远端 runner 自己恢复/保存，宿主不碰文件。
+  const stepContext = { runId, log, store, logFile, activeExecutor, project, vars, signal, executeDeploy, secrets: secretMap, toolchainEnv: null, actions, runnerLiveness, claimTimeoutMs: stepTimeoutSec || 0, source, cache: pipe?.cache || [], collectDecls: (sid) => collectDeclarations(pipe, sid) }
 
   // 工具链在这里装、在这里断言：放到 runPipeline 之外会让安装失败的构建没有 run 记录，
   // 用户只看到一条 500 和空日志；放进来则失败也是一次可见的、可回看的运行。
@@ -467,7 +538,9 @@ async function runStageLoop({ stages, runId, hub, store, runRecord, stepContext 
       // 取消的 step 也要留一行：否则日志里有「已取消」，store 里却查不到是哪一步被取消的。
       recordStep({ store, runId, stageId: item.id, jobId: '', step, result, logFile: stepContext.logFile, activeExecutor: stepContext.activeExecutor })
       if (result.status === 'canceled') { canceled = true; break }
-      if (result.status !== 'success' && !step.allowFailure) { stageFailed = true; break }
+      // 只有 failed 才拖垮 stage：skipped 是「这一步没有可做的事」
+      // （远程构建把 uses: collect 交给 runner、干跑不执行动作），不是失败。
+      if (result.status === 'failed' && !step.allowFailure) { stageFailed = true; break }
     }
     if (canceled) {
       await flushFinalizers(stageFinalizers, log, { stageId: item.id, jobId: '' })
@@ -624,7 +697,7 @@ async function runJobGraph({ pipe, project, target, stages, stage, runId, hub, s
           await flushFinalizers(finalizers, stepContext.log, { stageId: job.stage || '', jobId: job.id })
           return { status: 'canceled', error: '已取消', durationMs: Date.now() - started, steps: stepResults, state: 'canceled' }
         }
-        if (result.status !== 'success' && !step.allowFailure) {
+        if (result.status === 'failed' && !step.allowFailure) {
           const failure = {
             status: 'failed',
             error: result.error || `步骤 ${step.name} 失败（exit ${result.exitCode}）`,

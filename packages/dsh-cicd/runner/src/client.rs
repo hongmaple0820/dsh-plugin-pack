@@ -4,7 +4,7 @@ use std::fmt;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::protocol::*;
 
@@ -13,6 +13,22 @@ pub const CLAIM_WAIT_MS: u64 = 25_000;
 
 /// Extra time granted to /claim on top of its waitMs before the HTTP call fails.
 pub const CLAIM_TIMEOUT_MARGIN: Duration = Duration::from_secs(15);
+/// 缓存字节端点（lookup/blob）的单次请求上限：缓存是加速层，不能把任务拖住。
+pub const CACHE_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 制品上传回执（宿主 PUT /artifacts 的响应；protocol.rs 冻结，DTO 放在客户端侧）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArtifactSaveResponse {
+    #[allow(dead_code)]
+    pub ok: bool,
+    #[allow(dead_code)]
+    pub name: String,
+    pub digest: String,
+    pub bytes: u64,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub deduped: bool,
+}
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -131,13 +147,63 @@ impl Client {
             serde_json::from_slice(&bytes)
                 .map_err(|e| ClientError::Network(format!("invalid response body: {e}")))
         } else {
-            let api: ApiErrorBody =
-                serde_json::from_slice(&bytes).unwrap_or_default();
-            Err(ClientError::Api {
-                status,
-                code: api.code.unwrap_or_default(),
-                error: api.error.unwrap_or_default(),
-            })
+            Err(api_error(status, &bytes))
+        }
+    }
+
+    /// 字节端点的 GET：2xx 回裸字节，非 2xx 走同一套 api 错误映射。
+    async fn get_bytes(&self, endpoint: &str, query: &[(&str, &str)]) -> Result<Vec<u8>, ClientError> {
+        let url = format!("{}/{endpoint}", self.base);
+        let resp = self
+            .http
+            .get(&url)
+            .query(query)
+            .bearer_auth(self.token.as_deref().unwrap_or(""))
+            .timeout(CACHE_HTTP_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+        if (200..300).contains(&status) {
+            Ok(bytes.to_vec())
+        } else {
+            Err(api_error(status, &bytes))
+        }
+    }
+
+    /// 字节端点的 PUT（裸 body）：2xx 解析 JSON 回执，非 2xx 走同一套映射。
+    async fn put_bytes<T: DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        query: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> Result<T, ClientError> {
+        let url = format!("{}/{endpoint}", self.base);
+        let resp = self
+            .http
+            .put(&url)
+            .query(query)
+            .bearer_auth(self.token.as_deref().unwrap_or(""))
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .timeout(CACHE_HTTP_TIMEOUT)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ClientError::Network(e.to_string()))?;
+        if (200..300).contains(&status) {
+            serde_json::from_slice(&bytes)
+                .map_err(|e| ClientError::Network(format!("invalid response body: {e}")))
+        } else {
+            Err(api_error(status, &bytes))
         }
     }
 
@@ -145,11 +211,12 @@ impl Client {
         self.post("register", req, false).await
     }
 
-    pub async fn heartbeat(&self) -> Result<HeartbeatResponse, ClientError> {
+    pub async fn heartbeat(&self, stats: Option<RunnerStats>) -> Result<HeartbeatResponse, ClientError> {
         self.post(
             "heartbeat",
             &HeartbeatRequest {
                 runner_id: self.runner_id.clone(),
+                stats,
             },
             true,
         )
@@ -177,6 +244,87 @@ impl Client {
 
     pub async fn complete(&self, req: &CompleteRequest) -> Result<CompleteResponse, ClientError> {
         self.post("complete", req, true).await
+    }
+
+    /// M3 缓存查询：命中回指针，未命中回 hit=false（缓存层自行 fail-open）。
+    pub async fn cache_lookup(
+        &self,
+        req: &CacheLookupRequest,
+    ) -> Result<CacheLookupResponse, ClientError> {
+        self.post("cache/lookup", req, true).await
+    }
+
+    /// GET /cache/blob：下载缓存 tar.gz 裸字节。
+    pub async fn cache_download(
+        &self,
+        runner_id: &str,
+        task_id: &str,
+        digest: &str,
+    ) -> Result<Vec<u8>, ClientError> {
+        self.get_bytes(
+            "cache/blob",
+            &[("runnerId", runner_id), ("taskId", task_id), ("digest", digest)],
+        )
+        .await
+    }
+
+    /// PUT /cache/blob：上传缓存 tar.gz 裸字节。
+    pub async fn cache_upload(
+        &self,
+        runner_id: &str,
+        task_id: &str,
+        key: &str,
+        bytes: Vec<u8>,
+    ) -> Result<CacheSaveResponse, ClientError> {
+        self.put_bytes(
+            "cache/blob",
+            &[("runnerId", runner_id), ("taskId", task_id), ("key", key)],
+            bytes,
+        )
+        .await
+    }
+
+    /// PUT /artifacts/:taskId/:name：上传制品 tar.gz 裸字节，回执带 digest。
+    pub async fn artifact_upload(
+        &self,
+        runner_id: &str,
+        task_id: &str,
+        name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<ArtifactSaveResponse, ClientError> {
+        self.put_bytes(
+            &format!("artifacts/{task_id}/{name}"),
+            &[("runnerId", runner_id)],
+            bytes,
+        )
+        .await
+    }
+
+    /// M3 短期凭据：用名字换值。ok=false 时合成一个 Api 错误（这个响应体没有
+    /// code/error 字段），调用方据此 fail closed，并停止重试 token 失效类错误。
+    pub async fn credentials(
+        &self,
+        req: &CredentialsRequest,
+    ) -> Result<CredentialsResponse, ClientError> {
+        let resp: CredentialsResponse = self.post("credentials", req, true).await?;
+        if !resp.ok {
+            return Err(ClientError::Api {
+                status: 200,
+                code: "CREDENTIALS_REJECTED".to_string(),
+                error: "credentials request rejected".to_string(),
+            });
+        }
+        Ok(resp)
+    }
+}
+
+/// 统一把非 2xx 的响应体映射成 Api 错误（json 端点与字节端点共用）。
+fn api_error(status: u16, bytes: &[u8]) -> ClientError {
+    let api: ApiErrorBody = serde_json::from_slice(bytes).unwrap_or_default();
+    ClientError::Api {
+        status,
+        code: api.code.unwrap_or_default(),
+        error: api.error.unwrap_or_default(),
     }
 }
 

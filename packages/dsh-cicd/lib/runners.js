@@ -52,6 +52,16 @@ function parseTime(value) {
  * @param {number} [options.heartbeatSec] 心跳周期（秒），默认 30
  * @param {() => number} [options.now] 注入时钟，测试用
  */
+/** stats_json → 对象。空串/坏 JSON 返回 null：注册表宁可说「不知道」，也不报一个假的 0。 */
+function parseStats(raw) {
+  const text = String(raw || '')
+  if (!text) return null
+  try {
+    const parsed = JSON.parse(text)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
+  } catch { return null }
+}
+
 export function createRunnerRegistry({ db, heartbeatSec = DEFAULT_HEARTBEAT_SEC, now = Date.now } = {}) {
   if (!db) throw new Error('createRunnerRegistry 需要 db')
   const intervalSec = Number.isFinite(heartbeatSec) && heartbeatSec > 0 ? Math.trunc(heartbeatSec) : DEFAULT_HEARTBEAT_SEC
@@ -77,6 +87,8 @@ export function createRunnerRegistry({ db, heartbeatSec = DEFAULT_HEARTBEAT_SEC,
     // 协议 v2：runner token 只存 sha256 摘要，明文只在注册响应里出现一次。
     setToken: db.prepare(`UPDATE runners SET token_sha256 = ?, joined_at = ?, protocol = 2 WHERE runner_id = ?`),
     tokenSha: db.prepare(`SELECT token_sha256 AS sha FROM runners WHERE runner_id = ?`),
+    // 协议 v2 / M3：心跳统计落库（JSON 原文，读的时候再解析）。
+    setStats: db.prepare(`UPDATE runners SET stats_json = ? WHERE runner_id = ?`),
   }
 
   let cache = null
@@ -115,6 +127,9 @@ export function createRunnerRegistry({ db, heartbeatSec = DEFAULT_HEARTBEAT_SEC,
       offlineAfterSec: intervalSec * OFFLINE_MULTIPLIER,
       // 协议版本：1 = 旧 GET 轮询，2 = 云流水线 POST+token。老库行默认 1。
       protocol: Number(row.protocol || 1),
+      // M3：runner 上次心跳带回来的运行时统计；没报过就是 null（不是空对象，
+      // 好让上层区分「这条机器还不会报」与「报了但是 0」。
+      stats: parseStats(row.stats_json),
     }
   }
 
@@ -156,6 +171,15 @@ export function createRunnerRegistry({ db, heartbeatSec = DEFAULT_HEARTBEAT_SEC,
     stmts.touch.run(nowIso(now), id)
     invalidate()
     return { ...row, lastSeenAt: nowIso(now), status: 'online', stale: false }
+  }
+
+  /** 心跳统计（M3）：整块覆盖。坏 JSON 一律当没报过，绝不让一条脏数据卡住后续读取。 */
+  function recordStats(runnerId, stats) {
+    const id = String(runnerId || '').trim()
+    if (!id || !stats || typeof stats !== 'object') return null
+    stmts.setStats.run(JSON.stringify(stats), id)
+    invalidate()
+    return describe(id)
   }
 
   function describe(runnerId) {
@@ -232,6 +256,7 @@ export function createRunnerRegistry({ db, heartbeatSec = DEFAULT_HEARTBEAT_SEC,
   return {
     register,
     heartbeat,
+    recordStats,
     describe,
     list,
     revoke,

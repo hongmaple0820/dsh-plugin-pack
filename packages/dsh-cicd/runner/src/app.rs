@@ -1,6 +1,7 @@
 //! Runner lifecycle: register -> recovery -> claim loop -> execute -> complete.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,12 +9,16 @@ use anyhow::{anyhow, Context};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, Instant};
 
+use crate::cache::{self, CacheRunner};
+use crate::collect;
 use crate::cli::Args;
 use crate::client::{classify, Backoff, Client, FailureKind, CLAIM_WAIT_MS};
+use crate::cred::CredCache;
 use crate::exec::{run_command, EmittedLine, StepOutcome};
 use crate::journal::Journal;
 use crate::protocol::*;
 use crate::seq::SeqAlloc;
+use crate::workspace::{self, GcState};
 
 const DEFAULT_BATCH_MS: u64 = 250;
 const DEFAULT_STEP_TIMEOUT_SEC: u64 = 600;
@@ -89,6 +94,25 @@ async fn run_inner(args: &Args, mut cancel: watch::Receiver<bool>) -> anyhow::Re
         return Ok(0);
     }
 
+    // M2 TTL GC：后台每 60s 扫 <workdir>/ws/，回收过期且不活跃的 run 目录。
+    let gc = GcState::default();
+    tokio::spawn(workspace::gc_loop(args.workdir.clone(), gc.clone()));
+
+    // M3 缓存层：计数器给心跳读取，压缩包落 <workdir>/cache/（不在 ws/ 里）。
+    let cache = CacheRunner::new(&args.workdir);
+    // 本 runner 串行执行：跑任务时为 1，空闲为 0。
+    let running = Arc::new(AtomicU32::new(0));
+
+    // 心跳与 claim/execute 解耦：后台按 heartbeat_sec 周期上报（注册后立刻一次），
+    // 否则宿主 liveness 会把超过 heartbeatSec*3 的正常构建判成 RUNNER_OFFLINE。
+    let _hb = spawn_heartbeat(
+        client.clone(),
+        cache.clone(),
+        running.clone(),
+        cancel.clone(),
+        heartbeat_sec,
+    );
+
     let mut idle_backoff = Backoff::new();
     loop {
         if *cancel.borrow() {
@@ -124,10 +148,6 @@ async fn run_inner(args: &Args, mut cancel: watch::Receiver<bool>) -> anyhow::Re
         let task = match claim.task {
             Some(t) => t,
             None => {
-                match heartbeat_with_retry(&client, &mut cancel).await {
-                    Ok(()) => log("heartbeat ok"),
-                    Err(e) => log(&format!("heartbeat aborted: {e:#}")),
-                }
                 if *cancel.borrow() {
                     return Ok(0);
                 }
@@ -150,11 +170,44 @@ async fn run_inner(args: &Args, mut cancel: watch::Receiver<bool>) -> anyhow::Re
             task.run_id,
             task.steps.len()
         ));
+
+        // M2 断电续跑强化：journal 里已 finished 的任务不重跑（避免成功任务
+        // 被重复执行），只补发一次 complete —— 宿主侧 complete 是幂等的。
+        if let Some((status, exit_code)) = journal.finished(&task.task_id) {
+            log(&format!(
+                "task {} already finished in journal ({status}); re-sending complete only",
+                task.task_id
+            ));
+            let st = status_from_str(&status);
+            let req = CompleteRequest {
+                runner_id: args.runner_id.clone(),
+                task_id: task.task_id.clone(),
+                status: st,
+                exit_code,
+                error: String::new(),
+                // 重放路径没有制品清单（journal 不存），缺失判定交宿主。
+                artifacts: Vec::new(),
+            };
+            if !complete_until_ok(&client, &req, &mut cancel).await {
+                return Ok(0);
+            }
+            if args.once {
+                log("--once: exiting after one task");
+                return Ok(if st == TaskStatus::Succeeded { 0 } else { 1 });
+            }
+            continue;
+        }
+
         if let Err(e) = journal.append_claimed(&task.task_id) {
             log(&format!("journal write failed: {e}"));
         }
-
-        let outcome = execute_task(args, &client, &task, &mut cancel).await;
+        // 记录该 run 的 TTL 并标记活跃，供 GC 判断（活跃目录不能删）。
+        gc.set_ttl(&task.run_id, task.workspace.ttl_sec);
+        gc.mark_active(&task.run_id);
+        running.store(1, Ordering::Relaxed);
+        let outcome = execute_task(args, &client, &task, &cache, &mut cancel).await;
+        running.store(0, Ordering::Relaxed);
+        gc.unmark_active(&task.run_id);
         log(&format!(
             "task {} -> {} (exit {})",
             task.task_id,
@@ -171,6 +224,15 @@ async fn run_inner(args: &Args, mut cancel: watch::Receiver<bool>) -> anyhow::Re
             log("--once: exiting after one task");
             return Ok(if outcome.status == TaskStatus::Succeeded { 0 } else { 1 });
         }
+    }
+}
+
+/// journal 里存的 status 字符串还原回 TaskStatus（未知值按 failed 处理）。
+fn status_from_str(s: &str) -> TaskStatus {
+    match s {
+        "succeeded" => TaskStatus::Succeeded,
+        "canceled" => TaskStatus::Canceled,
+        _ => TaskStatus::Failed,
     }
 }
 
@@ -203,6 +265,7 @@ async fn replay_journal(
             status: TaskStatus::Failed,
             exit_code: -1,
             error: "runner crashed before reporting completion".to_string(),
+            artifacts: Vec::new(),
         };
         if !complete_until_ok(client, &req, cancel).await {
             log(&format!("recovery: complete for {task_id} aborted"));
@@ -245,6 +308,19 @@ fn write_credentials(path: &Path, runner_id: &str, token: &str) -> std::io::Resu
     Ok(())
 }
 
+/// M2 能力上报：探测本机工具。git（checkout 需要）、tar（M3 缓存需要）；
+/// 探测不到的就不上报，宿主据此过滤需要 checkout / 缓存的任务。
+fn detect_tools() -> Vec<String> {
+    let mut tools = vec![];
+    if workspace::git_available() {
+        tools.push("git".to_string());
+    }
+    if cache::tar_available() {
+        tools.push("tar".to_string());
+    }
+    tools
+}
+
 /// Returns Some(heartbeatSec) when registered, None when canceled first.
 async fn register_with_retry(
     args: &Args,
@@ -257,12 +333,18 @@ async fn register_with_retry(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+    let tools = detect_tools();
+    if !tools.is_empty() {
+        log(&format!("tools available: {tools:?}"));
+    }
     let req = RegisterRequest {
         runner_id: args.runner_id.clone(),
         labels,
         version: env!("CARGO_PKG_VERSION").to_string(),
         capacity: args.capacity,
         join_token: args.join_token.clone(),
+        tools,
+        protocol: Some(RUNNER_PROTOCOL),
     };
     let mut backoff = Backoff::new();
     loop {
@@ -273,9 +355,20 @@ async fn register_with_retry(
         };
         match res {
             Ok(resp) => {
+                // M5 握手的另一半：宿主说它最低要什么版本，比本机高就别硬跑——
+                // 用旧规矩解释新任务，比连不上更难查。
+                if let Some(min) = resp.min_protocol {
+                    if min > RUNNER_PROTOCOL {
+                        return Err(anyhow!(
+                            "宿主要求 runner 协议 >= {min}，本 runner 只支持 {RUNNER_PROTOCOL}：请升级 dsh-cicd-runner"
+                        ));
+                    }
+                }
                 log(&format!(
-                    "registered: heartbeatSec={} offlineAfterSec={}",
-                    resp.heartbeat_sec, resp.offline_after_sec
+                    "registered: protocol={} heartbeatSec={} offlineAfterSec={}",
+                    resp.protocol.unwrap_or(RUNNER_PROTOCOL),
+                    resp.heartbeat_sec,
+                    resp.offline_after_sec
                 ));
                 client.set_token(resp.runner_token.clone());
                 let cred_path = credentials_path(&args.workdir);
@@ -301,6 +394,7 @@ async fn register_with_retry(
 
 async fn heartbeat_with_retry(
     client: &Client,
+    stats: Option<RunnerStats>,
     cancel: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let mut backoff = Backoff::new();
@@ -308,7 +402,7 @@ async fn heartbeat_with_retry(
     loop {
         attempts += 1;
         let res = tokio::select! {
-            r = client.heartbeat() => r,
+            r = client.heartbeat(stats.clone()) => r,
             _ = wait_cancel(cancel) => return Err(anyhow!("canceled")),
         };
         match res {
@@ -321,6 +415,39 @@ async fn heartbeat_with_retry(
                 backoff.sleep().await;
             }
         }
+    }
+}
+
+/// 后台周期心跳：注册成功后立刻发一次，之后按 heartbeat_sec 一轮；
+/// 每轮都带当前在跑任务数与缓存计数，执行期间同样可见。
+fn spawn_heartbeat(
+    client: Client,
+    cache: CacheRunner,
+    running: Arc<AtomicU32>,
+    mut cancel: watch::Receiver<bool>,
+    heartbeat_sec: u64,
+) -> AbortOnDrop {
+    AbortOnDrop(tokio::spawn(async move {
+        let period = Duration::from_secs(heartbeat_sec.max(1));
+        loop {
+            let stats = Some(cache.runner_stats(running.load(Ordering::Relaxed)));
+            if let Err(e) = heartbeat_with_retry(&client, stats, &mut cancel).await {
+                log(&format!("heartbeat aborted: {e:#}"));
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(period) => {}
+                _ = wait_cancel(&mut cancel) => return,
+            }
+        }
+    }))
+}
+
+/// 后台任务句柄：随所有者 drop 而 abort，主循环退出后不再残留心跳。
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -385,29 +512,18 @@ async fn complete_until_ok(
     }
 }
 
-/// Execute a claimed task: prepare workspace, run steps, stream logs, complete.
+/// Execute a claimed task: prepare workspace, (M2) checkout source, run steps,
+/// stream logs, complete.
 pub async fn execute_task(
     args: &Args,
     client: &Client,
     task: &Task,
+    cache: &CacheRunner,
     cancel: &mut watch::Receiver<bool>,
 ) -> RunOutcome {
-    let ws_root = args.workdir.join(&task.workspace.root);
-    if let Err(e) = prepare_workspace(&ws_root, task.workspace.clean).await {
-        log(&format!("workspace error: {e:#}"));
-        let req = CompleteRequest {
-            runner_id: args.runner_id.clone(),
-            task_id: task.task_id.clone(),
-            status: TaskStatus::Failed,
-            exit_code: -1,
-            error: format!("workspace setup failed: {e}"),
-        };
-        let _ = complete_until_ok(client, &req, cancel).await;
-        return RunOutcome {
-            status: TaskStatus::Failed,
-            exit_code: -1,
-        };
-    }
+    // M2：工作目录以本地 <workdir>/ws/<runId> 为准（tasks/ 前缀保留 M1 兼容）。
+    let ws_root = workspace::resolve_ws_root(&args.workdir, task);
+    let git_ok = workspace::git_available();
 
     let batch_ms = task.log_stream.batch_ms.unwrap_or(DEFAULT_BATCH_MS).max(10);
     let (line_tx, line_rx) = mpsc::unbounded_channel::<EmittedLine>();
@@ -432,52 +548,161 @@ pub async fn execute_task(
     let mut failed: Option<(i64, String)> = None;
     let mut last_exit: Option<i64> = None;
 
+    // M3：任务体只带名字，值在跑第一个步骤（含 checkout）之前换一次；
+    // 合并后的 env 是唯一来源，凭据只在这里出现，不落盘、不进日志。
+    let mut env = task.env.clone();
+    let mut creds = CredCache::new(&task.task_id);
+    let mut creds_failed = false;
+
+    if let Err(e) = creds
+        .ensure(client, &task.secret_refs, &task.secret_env, &mut env)
+        .await
+    {
+        // fail closed：拿不到凭据就一个步骤都不跑，绝不带着空 env 继续。
+        log(&format!("step 阶段开始前的中止：{e}"));
+        creds_failed = true;
+        failed = Some((-1, e));
+    } else if let Err(e) = prepare_workspace(&ws_root, task.workspace.clean).await {
+        failed = Some((-1, format!("workspace setup failed: {e}")));
+    } else if let Some(source) = &task.source {
+        // M2 checkout：带 source 的任务先 clone 到工作目录，再跑 run 步骤。
+        if source.source_type != "git" {
+            failed = Some((
+                -1,
+                format!("unsupported source type \"{}\"", source.source_type),
+            ));
+        } else if !git_ok {
+            failed = Some((
+                -1,
+                "git is not available on this runner; cannot checkout source".to_string(),
+            ));
+        } else {
+            // clone 的目标目录已由 prepare_workspace 建好（clean 后为空目录，
+            // git 允许 clone 进空目录）；命令在 ws 根的父目录下执行。
+            let parent = ws_root
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| args.workdir.clone());
+            for (i, cmd) in workspace::checkout_commands(source, &ws_root).into_iter().enumerate() {
+                if *cancel.borrow() {
+                    canceled = true;
+                    break;
+                }
+                log(&format!("checkout cmd {i}: {cmd}"));
+                let res = run_command(
+                    &cmd,
+                    &parent,
+                    &env,
+                    Duration::from_secs(workspace::CHECKOUT_TIMEOUT_SEC),
+                    seq.clone(),
+                    Some(line_tx.clone()),
+                    step_cancel_rx.clone(),
+                )
+                .await;
+                match res {
+                    Ok(StepOutcome::Exited(code)) => {
+                        last_exit = Some(code);
+                        if code != 0 {
+                            failed = Some((code, format!("checkout failed with exit code {code}")));
+                            break;
+                        }
+                    }
+                    Ok(StepOutcome::TimedOut) => {
+                        failed = Some((
+                            124,
+                            format!("checkout timeout after {}s", workspace::CHECKOUT_TIMEOUT_SEC),
+                        ));
+                        break;
+                    }
+                    Ok(StepOutcome::Canceled) => {
+                        canceled = true;
+                        break;
+                    }
+                    Err(e) => {
+                        failed = Some((-1, format!("checkout spawn error: {e}")));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // M3：checkout 之后、跑 run 步骤之前恢复缓存（fail-open，绝不改任务结论）。
+    if failed.is_none() && !canceled {
+        cache.restore(client, &args.runner_id, task, &ws_root).await;
+    }
+
     for (idx, step) in task.steps.iter().enumerate() {
         if *cancel.borrow() {
             canceled = true;
             break;
         }
-        if step.uses != "run" {
-            failed = Some((
-                -1,
-                format!("step {idx}: unsupported step kind \"{}\"", step.uses),
-            ));
-            break;
-        }
-        let command = step.command.clone().unwrap_or_default();
-        let step_cwd = ws_root.join(step.cwd.clone().unwrap_or_else(|| ".".to_string()));
-        let timeout_sec = step.timeout_sec.unwrap_or(DEFAULT_STEP_TIMEOUT_SEC);
+        match step.uses.as_str() {
+            "run" => {
+                if creds_failed {
+                    break;
+                }
+                // 每一步开始前确认凭据还够新（余量不足 30s 就重换）。
+                if let Err(e) = creds
+                    .ensure(client, &task.secret_refs, &task.secret_env, &mut env)
+                    .await
+                {
+                    log(&format!("step {idx} 前的中止：{e}"));
+                    // 这里不用再置 creds_failed：紧接的 break 已经结束循环，没有下一轮会读它。
+                    failed = Some((-1, e));
+                    break;
+                }
+                let command = step.command.clone().unwrap_or_default();
+                let step_cwd = ws_root.join(step.cwd.clone().unwrap_or_else(|| ".".to_string()));
+                let timeout_sec = step.timeout_sec.unwrap_or(DEFAULT_STEP_TIMEOUT_SEC);
 
-        log(&format!("step {idx} (timeout {timeout_sec}s): {command}"));
-        let res = run_command(
-            &command,
-            &step_cwd,
-            &task.env,
-            Duration::from_secs(timeout_sec),
-            seq.clone(),
-            Some(line_tx.clone()),
-            step_cancel_rx.clone(),
-        )
-        .await;
+                log(&format!("step {idx} (timeout {timeout_sec}s): {command}"));
+                let res = run_command(
+                    &command,
+                    &step_cwd,
+                    &env,
+                    Duration::from_secs(timeout_sec),
+                    seq.clone(),
+                    Some(line_tx.clone()),
+                    step_cancel_rx.clone(),
+                )
+                .await;
 
-        match res {
-            Ok(StepOutcome::Exited(code)) => {
-                last_exit = Some(code);
-                if code != 0 {
-                    failed = Some((code, format!("step {idx} failed with exit code {code}")));
+                match res {
+                    Ok(StepOutcome::Exited(code)) => {
+                        last_exit = Some(code);
+                        if code != 0 {
+                            failed = Some((code, format!("step {idx} failed with exit code {code}")));
+                            break;
+                        }
+                    }
+                    Ok(StepOutcome::TimedOut) => {
+                        failed = Some((124, format!("step timeout after {timeout_sec}s")));
+                        break;
+                    }
+                    Ok(StepOutcome::Canceled) => {
+                        canceled = true;
+                        break;
+                    }
+                    Err(e) => {
+                        failed = Some((-1, format!("step {idx} spawn error: {e}")));
+                        break;
+                    }
+                }
+            }
+            // M2：宿主会把 {"uses":"checkout"} 放在 steps[0]；真正的 checkout
+            // 已在上方 source 阶段完成，这里只消费掉该步骤。
+            "checkout" => {
+                if task.source.is_none() {
+                    failed = Some((
+                        -1,
+                        format!("step {idx}: checkout step without a source"),
+                    ));
                     break;
                 }
             }
-            Ok(StepOutcome::TimedOut) => {
-                failed = Some((124, format!("step timeout after {timeout_sec}s")));
-                break;
-            }
-            Ok(StepOutcome::Canceled) => {
-                canceled = true;
-                break;
-            }
-            Err(e) => {
-                failed = Some((-1, format!("step {idx} spawn error: {e}")));
+            other => {
+                failed = Some((-1, format!("step {idx}: unsupported step kind \"{other}\"")));
                 break;
             }
         }
@@ -498,12 +723,25 @@ pub async fn execute_task(
         (TaskStatus::Succeeded, last_exit.unwrap_or(0), String::new())
     };
 
+    // M3：只有成功才保存缓存（fail-open，失败不改任务结论）。
+    if status == TaskStatus::Succeeded {
+        cache.save(client, &args.runner_id, task, &ws_root).await;
+    }
+
+    // M4：步骤全部成功后回流制品；无命中/上传失败只记日志，判定归宿主。
+    let artifacts = if status == TaskStatus::Succeeded {
+        collect::collect(client, &args.runner_id, task, &ws_root, &args.workdir).await
+    } else {
+        Vec::new()
+    };
+
     let req = CompleteRequest {
         runner_id: args.runner_id.clone(),
         task_id: task.task_id.clone(),
         status,
         exit_code,
         error,
+        artifacts,
     };
     if !complete_until_ok(client, &req, cancel).await {
         log("complete aborted by cancellation");

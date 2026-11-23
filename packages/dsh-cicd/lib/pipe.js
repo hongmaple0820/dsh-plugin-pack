@@ -722,6 +722,8 @@ export function parsePipe(source, { path = 'pipe.yml' } = {}) {
 
   const triggers = normalizeTriggers(root)
   const toolchain = normalizeToolchain(root.toolchain)
+  // M3：顶层 `cache:`（04-pipe-v2 §8）——声明式缓存，任务随 runner 一起走。
+  const cache = normalizeCacheSpec(root.cache)
   // v3.0-P4-3：受保护环境的护栏可以写在 pipe 里（`environments:`），也可以写在插件配置里。
   // 解析只做形状检查，语义判定统一在 lib/environments.js 的 parseEnvironmentGuards ——
   // 两处各写一份校验，最后一定会出现"pipe 说合法、运行时说不合法"的分裂。
@@ -730,7 +732,7 @@ export function parsePipe(source, { path = 'pipe.yml' } = {}) {
   // 和真正运行时的选择规则可能不一样（预览显示 prod、实跑 staging 是最坏的一种不一致）。
   const defaultTarget = typeof root.default_target === 'string' ? root.default_target.trim() : ''
   if (defaultTarget && !targetNames.has(defaultTarget)) throw new PipeError(`default_target 指向不存在的 target “${defaultTarget}”`)
-  return { version, name, vars: vars || {}, targets: normalizedTargets, defaultTarget, stages: normalizedStages, triggers, toolchain, environments, path }
+  return { version, name, vars: vars || {}, targets: normalizedTargets, defaultTarget, stages: normalizedStages, triggers, toolchain, environments, cache, path }
 }
 
 /**
@@ -742,6 +744,44 @@ export function parsePipe(source, { path = 'pipe.yml' } = {}) {
  * 在解析层抛异常反而更糟：一个环境的名单写错会让整条流水线跑不起来，
  * 而正确的反应是"只有那个环境拒绝部署"。
  */
+/**
+ * 归一顶层 `cache:`（M3）。
+ *
+ * 只做形状检查与默认值，不做求值：`key` 支持普通插值（${{ vars.x }}），当前不支持
+ * `hashFiles()` 这类函数——它会在求值层以「未知函数」明确报错，好过在这里假装支持
+ * 然后给出一份永远不命中的 key。
+ *
+ * paths 只许相对路径且不许 `..`：缓存目录里的文件由 runner 解包回项目目录，
+ * 绝对路径与上跳会让一条 pipe.yml 获得写穿 workspace 的能力。
+ */
+function normalizeCacheSpec(input) {
+  if (input === undefined || input === null) return []
+  if (!Array.isArray(input)) throw new PipeError('cache 必须是数组')
+  return input.map((item, index) => {
+    const where = `cache 第 ${index + 1} 项`
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new PipeError(`${where} 必须是 map`)
+    const key = typeof item.key === 'string' ? item.key.trim() : ''
+    if (!key) throw new PipeError(`${where} 缺少 key`)
+    const paths = asArray(item.paths, `${where} 的 paths`).map((value) => {
+      if (typeof value !== 'string' || !value.trim()) throw new PipeError(`${where} 的 paths 必须是非空字符串`)
+      const path = value.trim()
+      if (path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path)) throw new PipeError(`${where} 的 paths 只允许相对项目目录的路径（拿到的“${path}”）`)
+      if (path.split(/[\\/]/).includes('..')) throw new PipeError(`${where} 的 paths 不允许跳出项目目录（拿到的“${path}”）`)
+      return path
+    })
+    if (paths.length === 0) throw new PipeError(`${where} 的 paths 不能为空`)
+    const restoreKeys = item.restore_keys === undefined
+      ? []
+      : asArray(item.restore_keys, `${where} 的 restore_keys`).map((value) => {
+        if (typeof value !== 'string' || !value.trim()) throw new PipeError(`${where} 的 restore_keys 必须是非空字符串`)
+        return value.trim()
+      })
+    const mode = item.mode === undefined ? 'both' : String(item.mode)
+    if (!['restore', 'save', 'both'].includes(mode)) throw new PipeError(`${where} 的 mode 只能是 restore / save / both（拿到的“${mode}”）`)
+    return { key, paths, restoreKeys, mode }
+  })
+}
+
 function normalizePipeEnvironments(input) {
   if (input === undefined || input === null) return {}
   if (typeof input !== 'object' || Array.isArray(input)) throw new PipeError('environments 必须是 map')

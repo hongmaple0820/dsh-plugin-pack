@@ -129,8 +129,12 @@ pub async fn run_command(
 ) -> Result<StepOutcome> {
     #[cfg(windows)]
     let mut cmd = {
+        // 逐字命令行：cmd 收到的必须是我们拼好的那一行。用 args() 时 std 会给
+        // 参数加引号并把内部双引号转义，cmd 再把那个反斜杠加引号原样传给子进程，
+        // 于是 git clone ... "<dest>" 拿到带引号的字面量路径并以 128 退出。
         let mut c = tokio::process::Command::new("cmd");
-        c.args(["/C", command]);
+        c.raw_arg("/C ");
+        c.raw_arg(command);
         c
     };
     #[cfg(not(windows))]
@@ -243,5 +247,30 @@ mod tests {
         let first = rx.try_recv().expect("one line");
         assert_eq!(first.seq, 1);
         assert_eq!(first.text, "hi");
+    }
+
+    /// 引号必须原样交给子进程：checkout 用 "路径" 包住 clone 目标，
+    /// 一旦 shell 层把引号转义成字面量，git 就会以 128 拒绝这条路径。
+    #[tokio::test]
+    async fn run_command_keeps_quoted_args_verbatim() {
+        let seq = std::sync::Arc::new(std::sync::Mutex::new(SeqAlloc::new(1)));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let outcome = run_command(
+            "echo \"a b\"",
+            &std::env::temp_dir(),
+            &HashMap::new(),
+            Duration::from_secs(30),
+            seq,
+            Some(tx),
+            cancel_rx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, StepOutcome::Exited(0));
+        let line = rx.try_recv().expect("one line").text;
+        // cmd.exe 的 echo 保留引号本身，sh 的 echo 会吃掉引号。
+        let expected = if cfg!(windows) { "\"a b\"" } else { "a b" };
+        assert_eq!(line, expected);
     }
 }

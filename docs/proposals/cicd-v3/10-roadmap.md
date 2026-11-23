@@ -233,6 +233,20 @@ P1+P2+P3 ─→ P5 制品库(3w) ─→ P6 体验(4w) ─→ P7 加固(持续)
 | M6 | +19w | 制品 CAS + promotion |
 | M7 | +23w | 三栏编辑器、模板中心、引导闭环 |
 
+### V2-M2 · 执行面（云端 runner，按 M1–M5 重述）
+
+> 详细设计与契约见 `11-cloud-runner-rust.md`。这里只回答「做到哪一步、验收证据是什么」。
+
+| 里程碑 | 内容 | 验收证据 |
+|---|---|---|
+| ✅ M1 协议骨架 | H1+H3 + Rust `api.rs`：register/heartbeat/claim/logs/complete；`run` 步骤执行 | fake runner 走完 build-only 任务；吊销后 401；断链重连日志 seq 去重 |
+| ✅ M2 workspace | checkout 步骤 + workspace TTL GC + journal 断电续跑 | kill -9 后重启续跑不重做成功步骤；GC 只删过期 |
+| ✅ M3 缓存+凭据 | `cache.rs` + H4：缓存命中统计入心跳；`secretRefs` 换短期值 | 日志/DB grep 不到 secret 原文；缓存第二次构建命中 |
+| ✅ M4 制品回流 | collect + H5：PUT → CAS → run 记录关联 digest | 完整 build→upload→promote→deploy 闭环（宿主 P9-S10/S11 + runner 集成用例） |
+| ✅ M5 迁移 | 版本握手 + v1 runner 兼容跑通 + 文档（runner README / `08-security-rbac.md` 的 runner 章节）+ 本节勾选 | 双 runner 并存各跑一条 run（宿主 P9-S12）；文档与实现一致 |
+
+现状一句话：v2 执行面可独立发布，v1 runner 不受影响；`toolchain` 步骤仍未下发（宿主 `lib/toolchain.js` 仍唯一权威），是这条线唯一还欠的一口。
+
 ---
 
 ## 11. 风险登记

@@ -101,6 +101,35 @@ impl Journal {
         }
         pending
     }
+
+    /// M2 断电续跑强化：该任务最后一次事件是否是 finished。
+    /// 是 → 重启后再 claim 到同 taskId 时不重跑，只补发 complete。
+    /// （claimed 出现在 finished 之后则视为再次执行中，返回 None。）
+    pub fn finished(&self, task_id: &str) -> Option<(String, i64)> {
+        let data = fs::read_to_string(&self.path).ok()?;
+        let mut out: Option<(String, i64)> = None;
+        for line in data.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let ev: JournalEvent = match serde_json::from_str(line) {
+                Ok(e) => e,
+                Err(_) => continue, // torn write from a crash: skip
+            };
+            if ev.task_id != task_id {
+                continue;
+            }
+            match ev.event.as_str() {
+                "claimed" => out = None,
+                "finished" => {
+                    out = Some((ev.status.unwrap_or_default(), ev.exit_code.unwrap_or(-1)))
+                }
+                _ => {}
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -147,6 +176,20 @@ mod tests {
         j.append_claimed("t1").unwrap();
         j.append_claimed("t1").unwrap();
         assert_eq!(j.recover(), vec!["t1".to_string()]);
+    }
+
+    #[test]
+    fn finished_reports_last_status_and_respects_reclaim() {
+        let j = tmp_journal("finished");
+        assert!(j.finished("t1").is_none()); // 文件不存在/无记录
+        j.append_claimed("t1").unwrap();
+        assert!(j.finished("t1").is_none()); // 只 claimed 不算完成
+        j.append_finished("t1", "succeeded", 0).unwrap();
+        assert_eq!(j.finished("t1"), Some(("succeeded".into(), 0)));
+        j.append_claimed("t1").unwrap(); // 重新领走：回到执行中
+        assert!(j.finished("t1").is_none());
+        j.append_finished("t1", "failed", 3).unwrap();
+        assert_eq!(j.finished("t1"), Some(("failed".into(), 3)));
     }
 
     #[test]

@@ -18,11 +18,12 @@
 
 import { createHash, timingSafeEqual, randomBytes } from 'node:crypto'
 import { Readable } from 'node:stream'
-import fs, { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync } from 'node:fs'
+import fs, { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync, createWriteStream } from 'node:fs'
 // v3.0-P7 混沌：磁盘满不是「日志写不进去」就完了——SQLite 写库、CAS 落盘、release 目录都同时跟着死。
 // statfs 只在出问题时调用（它本身也可能失败），所以按名字取，缺失时返回 null 而不是抛。
 const statfsOf = (target) => (typeof fs.statfs === 'function' ? fs.statfs(target, { bigint: true }) : null)
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
+import { pipeline } from 'node:stream/promises'
 import { basename, isAbsolute, join, relative, resolve } from 'node:path'
 import { parsePipe, planPipeline, interpolate, matchArtifacts, isHostSelector, parseHostSelector, explainWhen, stageConditionOf } from './lib/pipe.js'
 import { createStore, DEFAULT_WORK_DIR } from './lib/store.js'
@@ -584,7 +585,9 @@ function createRuntime(ctx, config) {
   // 云流水线 M1：协议 v2 服务（register/heartbeat/claim/logs/complete，Bearer token 认证）。
   // 纯调度层挂在 runtime 上，HTTP 适配器由 registerHttpRoutes 注册成 handler 路由——
   // resource 路由只答 GET，v2 的 POST/JSON body/长轮询必须走 handler 路由。
-  const runnerV2 = createRunnerV2Service({ runners, broker, options, audit, store })
+  // M3：把 secret store 传进去，任务体里才能把明文换成 secretRefs + 占位符。
+  // artifacts：M3 的缓存字节进同一个制品 CAS（内容寻址、天然去重），指针存在 refs 下。
+  const runnerV2 = createRunnerV2Service({ runners, broker, options, audit, store, secrets, artifacts: artifactStore })
   // v3.0-P2：工具链托管（JDK/Node/Python/Maven…）。store 在 workDir 下，所以同一台机器上
   // 所有项目共享一份下载与解包结果；锁文件放项目的 pipe.lock，跟着仓库走。
   const toolchainRoot = options.toolchain?.storeDir || join(options.workDir, 'toolchains')
@@ -959,6 +962,32 @@ function createRuntime(ctx, config) {
       }
       return { path: filePath, bytes: stat.size, sha256 }
     } catch { return null }
+  }
+
+  /**
+   * 云流水线 M4：远程构建的制品在 CAS 里，宿主磁盘上没有。
+   * 「制品在哪」这件事因此有两个答案，按顺序问：
+   * 1) 老路径：宿主项目目录里 glob（本地构建，行为一个字节都没变）；
+   * 2) 新路径：本次 run 的制品台账里，runner 回流时落下的那几行（path = 制品名）。
+   *    命中就把 CAS 字节物化到临时文件——deploy 的既有上传路径只认文件路径，
+   *    而且它随后会重算 digest，所以「发出去的」与「晋级过的」仍然是同一句内容地址。
+   */
+  async function runnerArtifactPath(runId, patterns) {
+    if (!patterns || patterns.length === 0 || !artifactStore) return ''
+    const rows = (store?.artifactsOf?.(runId) || [])
+      .filter((row) => row && typeof row.path === 'string' && row.path && !isAbsolute(row.path))
+    if (rows.length === 0) return ''
+    const matched = matchArtifacts(patterns, rows.map((row) => row.path))
+    if (matched.length === 0) return ''
+    // 同名制品后写覆盖先写：取台账里最新那一条（artifacts.id 自增）。
+    const best = rows.filter((row) => matched.includes(row.path)).sort((a, b) => (b.id || 0) - (a.id || 0))[0]
+    const digest = 'sha256:' + String(best.sha256 || '')
+    if (!best.sha256 || !artifactStore.has(digest)) return ''
+    const dir = join(tmpdir(), 'dsh-cicd-artifacts')
+    mkdirSync(dir, { recursive: true })
+    const out = join(dir, `${runId}-${basename(best.path)}`)
+    await pipeline(artifactStore.open(digest).stream(), createWriteStream(out))
+    return out
   }
 
   // ---- v0.5：env/group/tag 选择器展开 + 生产护栏 + 部署锁 --------------------------------
@@ -1376,7 +1405,14 @@ function createRuntime(ctx, config) {
     // 这些「不发出去」的结论本该先于「发不出去」的基础设施错误给出。
     const expanded = await tryExpandTarget(targetName, target)
     const deployTarget = { ...target, hosts: expanded.hosts }
-    const artifactPath = artifactFor(project, step.deploy?.artifacts || [])
+    let artifactPath = artifactFor(project, step.deploy?.artifacts || [])
+    if (!artifactPath) {
+      // M4：远程构建刚回流的那份字节。宿主目录里当然找不到它，但「找不到」不等于「没有」。
+      artifactPath = await runnerArtifactPath(runId, step.deploy?.artifacts || [])
+      if (artifactPath) {
+        try { log?.(`制品取自本次运行的回流件：${basename(artifactPath)}`) } catch { /* 日志失败不改变取件 */ }
+      }
+    }
     if (!artifactPath) {
       throw Object.assign(new Error(`stage 的 deploy.artifacts 没有匹配到任何文件（target ${targetName}）`), { code: 'ARTIFACT_NOT_FOUND' })
     }
@@ -2816,11 +2852,13 @@ function createRuntime(ctx, config) {
         throw error
       }
       // 先落库（吊销过的会在这里抛 RUNNER_REVOKED），再登记到 broker 的任务队列。
-      const info = runners.register(runnerId, { labels, version, capacity })
+      // M5：v1 注册显式落 protocol=1。以前靠 register() 的默认值，一旦默认值变了，
+      // 老 runner 会被悄悄当成 v2——协议错位必须写进库里，而不是靠一个参数默认值活着。
+      const info = runners.register(runnerId, { labels, version, capacity, protocol: 1 })
       broker.register(runnerId, { labels, version, capacity })
       try { store.appendOperation({ action: 'runner-register', project: runnerId, status: 'ok', detail: JSON.stringify({ labels: info.labels, version: info.version }) }) } catch { /* best effort */ }
       try { audit.record({ action: 'runner.register', actorId: '', authMethod: 'runner-token', resourceType: 'runner', resourceId: runnerId, result: 'allow', reason: `labels:${info.labels.join(',')}` }) } catch { /* 审计失败不阻断注册 */ }
-      return { ok: true, runnerId: info.runnerId, labels: info.labels, version: info.version, capacity: info.capacity, lastSeenAt: info.lastSeenAt, status: info.status, heartbeatSec: info.heartbeatSec, offlineAfterSec: info.offlineAfterSec, serverTime: new Date().toISOString() }
+      return { ok: true, runnerId: info.runnerId, protocol: 1, labels: info.labels, version: info.version, capacity: info.capacity, lastSeenAt: info.lastSeenAt, status: info.status, heartbeatSec: info.heartbeatSec, offlineAfterSec: info.offlineAfterSec, serverTime: new Date().toISOString() }
     },
     runnerHeartbeat({ runnerId } = {}) {
       const info = runners.heartbeat(runnerId)
@@ -2843,6 +2881,14 @@ function createRuntime(ctx, config) {
           error.code = 'RUNNER_REVOKED'
           throw error
         }
+        // M5：v1 端点只服务 v1 runner。一台 v2 机器来轮询 v1 队列，拿到的是 raw spec 而不是
+        // 脱敏后的任务描述（没有 secretRefs/cache 语义），还会绕过 complete 的制品校验——
+        // 与其静默降级，不如让它改用 /runner/v2/claim。
+        if (Number(row.protocol || 1) === 2) {
+          const error = new Error(`runner ${runnerId} 是按 v2 协议注册的，/runner-poll 只服务 v1；请改用 POST /runner/v2/claim`)
+          error.code = 'RUNNER_PROTOCOL_MISMATCH'
+          throw error
+        }
         try { runners.heartbeat(runnerId) } catch { /* 刚被吊销，下面再判一次 */ }
         const verdict = runners.isRunnable(runnerId)
         if (!verdict.ok) {
@@ -2858,6 +2904,13 @@ function createRuntime(ctx, config) {
     runnerResult({ runnerId = '', taskId, status = '', exitCode = -1, error = '' } = {}) {
       // 吊销的 runner 回报的结果一律丢弃：它可能已经不该碰这个任务了。
       if (runnerId) {
+        // 同 poll：v2 机器的终态必须走 /runner/v2/complete（那里才有制品到齐判定）。
+        const protocolRow = runners.describe(runnerId)
+        if (protocolRow && Number(protocolRow.protocol || 1) === 2) {
+          const error = new Error(`runner ${runnerId} 是按 v2 协议注册的，/runner-result 只服务 v1；请改用 POST /runner/v2/complete`)
+          error.code = 'RUNNER_PROTOCOL_MISMATCH'
+          throw error
+        }
         const verdict = runners.isRunnable(runnerId)
         if (!verdict.ok) {
           const err = new Error(verdict.message)

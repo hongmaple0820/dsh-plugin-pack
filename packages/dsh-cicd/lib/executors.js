@@ -196,6 +196,15 @@ export function createRemoteExecutor({ broker, runnerId } = {}) {
       return { kind: 'remote', runnerId, labels: info?.labels || [], version: info?.version || '', lastSeenAt: info?.lastSeenAt || '' }
     },
     async execute(step, context) {
+      // 云流水线 M2：任务带 git 源码时，执行机必须有 git。能力在注册时上报（tools:['git'] →
+      // labels 'tool:git'），这里不等任务发出去才失败——排队超时的报错只会把人指向命令，
+      // 真实原因是那台机器没有 checkout 能力。
+      if (context.source && context.source.url) {
+        const labels = typeof broker.describe === 'function' ? (broker.describe(runnerId)?.labels || []) : []
+        if (!labels.includes('tool:git')) {
+          return { status: 'failed', exitCode: -1, error: `runner ${runnerId} 未上报 git 能力（注册时 tools 里没有 'git'），无法执行需要 checkout 的任务`, code: 'RUNNER_CAPABILITY_MISSING' }
+        }
+      }
       const spec = {
         taskId: context.taskId || '',
         stepIndex: context.stepIndex ?? 0,
@@ -205,6 +214,14 @@ export function createRemoteExecutor({ broker, runnerId } = {}) {
         env: context.env || {},
         timeoutSec: step.timeoutSec || 0,
         runId: context.runId || '',
+        // M3：projectId 让 runner 能换凭据（secretRefs）并按项目隔离缓存。
+        projectId: context.projectId || '',
+        // 云流水线 M2：git 项目的源码信息随任务下发，runner 在自己的 workspace 里 checkout。
+        source: context.source || null,
+        // M3：任务级缓存声明；空数组＝这台 runner 不需要动磁盘。
+        cache: Array.isArray(context.cache) ? context.cache : [],
+        // M4：任务级制品声明（同 stage 的 uses: collect）。runner 在步骤成功后按它 glob 并上传。
+        artifacts: Array.isArray(context.artifacts) ? context.artifacts : [],
       }
       return await broker.claim(spec, runnerId, {
         onLine: context.onLine,
@@ -390,6 +407,10 @@ export function createTaskBroker({ onTaskForRunner = null, log = () => {} } = {}
       exitCode: Number.isInteger(result?.exitCode) ? result.exitCode : -1,
       error: String(result?.error || ''),
       signal: String(result?.signal || ''),
+      // 机器可读的失败原因要一路带到 run 记录里：只有 error 文本的话，
+      // 「runner 掉线」和「产物没回来」在台账里长得一模一样。
+      code: String(result?.code || ''),
+      artifacts: Array.isArray(result?.artifacts) ? result.artifacts : [],
     }
     task.finishedAt = new Date().toISOString()
     if (task.runnerId) running.get(task.runnerId)?.delete(taskId)

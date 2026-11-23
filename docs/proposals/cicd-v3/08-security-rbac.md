@@ -210,7 +210,7 @@ environments:
 | 隔离 | 建议容器内运行；至少独立系统用户 + 只读挂载源码缓存 |
 | 吊销 | Admin 一键吊销；心跳超时 3× 周期自动标 offline |
 | 标签 | 能力标签用于调度，见 03 §Runner |
-| 版本 | 上报 runner version，过低拒绝领任务 |
+| 版本 | 注册时自报 `protocol`（v2 = 2）：宿主不是 2 就回 426 `RUNNER_PROTOCOL_UNSUPPORTED`，机器不登记；已登记的 machine 走错门（v1 端点 vs v2 端点）回 409 `RUNNER_PROTOCOL_MISMATCH`；宿主也会回 `minProtocol`，runner 见它比自己高就停下并提示升级——比 401 更能说明「凭据没问题，是版本不对」 |
 
 ---
 

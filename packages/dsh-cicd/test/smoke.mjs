@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { Writable } from 'node:stream'
 
 import {
   internals,
@@ -18,7 +19,7 @@ import { createStore } from '../lib/store.js'
 import { PROMOTION_ERRORS, promotionError, envRequiresPromotion, findSourceRelease, currentPointer, reachablePointer, isPromoted, listPromotions, recordPromotion, promotionView } from '../lib/promotions.js'
 import { openDatabase, SCHEMA_VERSION } from '../lib/db.js'
 import { DatabaseSync } from 'node:sqlite'
-import { runPipeline, makeRunId } from '../lib/runner.js'
+import { runPipeline, makeRunId, remoteCacheStepNotice, remoteCollectStepNotice, collectDeclarations } from '../lib/runner.js'
 import { createRemote, remoteUnavailable } from '../lib/remote.js'
 import { deployRelease, rollbackRelease, shellQuote } from '../lib/deploy.js'
 import { dispatchNotifications } from '../lib/notify.js'
@@ -6836,6 +6837,570 @@ checkAsync('P9-S2：协议 v2 任务生命周期——claim 长轮询 → 日志
   }
 })
 
+
+
+// ============================================================================
+// v3.0-M2 · 云流水线 workspace：源码随任务下发 + checkout 步骤 + git 能力门禁
+// ============================================================================
+
+check('P9-S3：M2 任务描述——git 项目的 source 下发、checkout 前置步骤、workspace ws/<runId>', () => {
+  const workDir = mkdtempSync(join(tmpdir(), 'dsh-cicd-m2-'))
+  const runtime = internals.createRuntime(fakeContext(), {
+    projects: [{ id: 'demo', path: projectDir }],
+    workDir,
+    scheduler: { enabled: false },
+    runners: { joinToken: 'join-secret' },
+  })
+  try {
+    const withSource = runtime.runnerV2.taskDescription({ spec: {
+      taskId: 'task-m2-1', runId: 'run-m2', command: 'mvn package', cwd: '.',
+      source: { type: 'git', url: 'git@example.com:team/app.git', ref: 'main', sha: 'abc123', depth: 1 },
+    } })
+    assert.equal(withSource.source.type, 'git')
+    assert.equal(withSource.source.url, 'git@example.com:team/app.git')
+    assert.equal(withSource.source.ref, 'main')
+    assert.equal(withSource.source.sha, 'abc123')
+    assert.deepEqual(withSource.steps.map((step) => step.uses), ['checkout', 'run'], '带源码的任务第一步必须是显式 checkout')
+    assert.equal(withSource.workspace.root, 'ws/run-m2', 'M2 workspace 统一 ws/<runId>（tasks/ 前缀是 M1 历史形态）')
+
+    const noSource = runtime.runnerV2.taskDescription({ spec: { taskId: 'task-m2-2', runId: 'run-m2', command: 'echo hi' } })
+    assert.equal(noSource.source, null)
+    assert.deepEqual(noSource.steps.map((step) => step.uses), ['run'], '无源码任务与 M1 行为一致')
+
+    // 缺 url / 非 git 的 source 视为没有源码：runner 拿到半截描述去 clone 只会得到雾茫茫的失败。
+    assert.equal(runtime.runnerV2.taskDescription({ spec: { source: { type: 'git', ref: 'main' } } }).source, null)
+    assert.equal(runtime.runnerV2.taskDescription({ spec: { source: { type: 'svn', url: 'x' } } }).source, null)
+  } finally { runtime.dispose() }
+})
+
+checkAsync('P9-S4：M2 能力门禁——tools 上报并入 labels；无 git 的 runner 接 checkout 任务当场失败', async () => {
+  const workDir = mkdtempSync(join(tmpdir(), 'dsh-cicd-m2-'))
+  const runtime = internals.createRuntime(fakeContext(), {
+    projects: [{ id: 'demo', path: projectDir }],
+    workDir,
+    scheduler: { enabled: false },
+    runners: { joinToken: 'join-secret' },
+  })
+  try {
+    // 有 git 能力的 runner：tools 并入 labels（tool:git）。
+    const token = (await runtime.runnerProtocol({ path: '/register', body: { runnerId: 'r-git', joinToken: 'join-secret', tools: ['git'] } })).body.runnerToken
+    assert.equal((await runtime.runnerProtocol({ path: '/heartbeat', token, body: { runnerId: 'r-git' } })).status, 200)
+    assert.ok(runtime.runnerV2Broker.describe('r-git').labels.includes('tool:git'), 'tools 上报应并入 broker labels')
+
+    // 无 git 能力的 runner：任务还没进队列就失败，错误码点明缺的是能力而不是命令慢。
+    const plain = (await runtime.runnerProtocol({ path: '/register', body: { runnerId: 'r-plain', joinToken: 'join-secret' } })).body.runnerToken
+    await runtime.runnerProtocol({ path: '/heartbeat', token: plain, body: { runnerId: 'r-plain' } })
+    const executor = internals.createRemoteExecutor({ broker: runtime.runnerV2Broker, runnerId: 'r-plain' })
+    const denied = await executor.execute(
+      { command: 'mvn package', timeoutSec: 10 },
+      { cwd: '.', env: {}, runId: 'run-m2', taskId: 'task-m2-3', stepIndex: 0, stageId: 'build', source: { type: 'git', url: 'git@example.com:team/app.git', ref: 'main', sha: '', depth: 1 } },
+    )
+    assert.equal(denied.status, 'failed')
+    assert.equal(denied.code, 'RUNNER_CAPABILITY_MISSING')
+    assert.equal(runtime.runnerV2Broker.task('task-m2-3'), null, '门禁失败的任务不应进队列')
+  } finally { runtime.dispose() }
+})
+
+// ============================================================================
+// v3.0-M3 · 凭据交换 + 缓存声明
+// 钉两件事：①任务体里不能出现 secret 明文（日志/DB/v2 响应都从任务体来）；
+// ②runner 只能换到本任务申报过的名字。缓存声明同理：只在描述里出现合法的相对路径。
+// ============================================================================
+
+checkAsync('P9-S5：M3 凭据交换——任务体无明文，/credentials 只放行本任务申报的名字', async () => {
+  const workDir = mkdtempSync(join(tmpdir(), 'dsh-cicd-v2-'))
+  const runtime = internals.createRuntime(fakeContext(), {
+    projects: [{ id: 'demo', path: projectDir }],
+    workDir,
+    scheduler: { enabled: false },
+    runners: { joinToken: 'join-secret' },
+  })
+  const PLAIN = 'hunter2-DB-password'
+  try {
+    runtime.secrets({ project: 'demo', name: 'DB_PASSWORD', value: PLAIN })
+    const token = (await runtime.runnerProtocol({ path: '/register', body: { runnerId: 'r5', joinToken: 'join-secret' } })).body.runnerToken
+    const broker = runtime.runnerV2Broker
+    const claimPromise = broker.claim({
+      taskId: 'task-secret-1',
+      runId: 'run-sec',
+      projectId: 'demo',
+      stepIndex: 0,
+      stageId: 'build',
+      command: 'deploy --password ' + PLAIN,
+      cwd: '.',
+      env: { DB_PASSWORD: PLAIN, LOG_PLAIN: 'prefix ' + PLAIN + ' suffix', NORMAL: 'plain' },
+      timeoutSec: 30,
+    }, 'r5', { timeoutMs: 5000 })
+    const claimed = await runtime.runnerProtocol({ path: '/claim', token, body: { runnerId: 'r5', waitMs: 0 } })
+    const task = claimed.body.task
+    assert.ok(task, 'claim 应返回任务描述')
+    assert.equal(JSON.stringify(task).includes(PLAIN), false, '任务描述里不能出现 secret 明文：' + JSON.stringify(task))
+    assert.deepEqual(task.secretRefs, ['DB_PASSWORD'], '命令与 env 里用到的名字都要申报')
+    assert.deepEqual(task.secretEnv, [{ env: 'DB_PASSWORD', ref: 'DB_PASSWORD' }], '整值等于密钥的 env 要抽成映射，任务体不留值')
+    assert.equal(task.env.LOG_PLAIN, 'prefix ${DB_PASSWORD} suffix', '混在文本里的明文要改写成占位符')
+    assert.equal(task.env.NORMAL, 'plain', '非机密变量原样保留')
+    assert.equal(task.steps[0].command, 'deploy --password ${DB_PASSWORD}')
+
+    // 换凭据：值只在响应里出现一次。
+    const cred = await runtime.runnerProtocol({ path: '/credentials', token, body: { runnerId: 'r5', taskId: 'task-secret-1', names: ['DB_PASSWORD'] } })
+    assert.equal(cred.status, 200, JSON.stringify(cred.body))
+    assert.deepEqual(cred.body.values, { DB_PASSWORD: PLAIN })
+    assert.deepEqual(cred.body.missing, [])
+    assert.ok(cred.body.ttlSec >= 60 && cred.body.ttlSec <= 900, 'TTL 必须在 [60,900] 之间：' + cred.body.ttlSec)
+    assert.ok(Date.parse(cred.body.expiresAt) > Date.now(), 'expiresAt 必须是未来时刻')
+
+    // 没申报的名字一律 403：拿一个任务就能把整个项目的 secret 拉一遍是不可接受的。
+    const undeclared = await runtime.runnerProtocol({ path: '/credentials', token, body: { runnerId: 'r5', taskId: 'task-secret-1', names: ['DB_PASSWORD', 'OTHER_TOKEN'] } })
+    assert.equal(undeclared.status, 403)
+    assert.equal(undeclared.body.code, 'SECRET_NOT_DECLARED')
+    assert.equal(JSON.stringify(undeclared.body).includes(PLAIN), false, '被拒的响应里不能夹带任何值')
+    const ghost = await runtime.runnerProtocol({ path: '/credentials', token, body: { runnerId: 'r5', taskId: 'task-ghost', names: ['DB_PASSWORD'] } })
+    assert.equal(ghost.status, 404)
+    assert.equal(ghost.body.code, 'TASK_UNKNOWN')
+    const noToken = await runtime.runnerProtocol({ path: '/credentials', body: { runnerId: 'r5', taskId: 'task-secret-1', names: ['DB_PASSWORD'] } })
+    assert.equal(noToken.status, 401)
+
+    await runtime.runnerProtocol({ path: '/complete', token, body: { runnerId: 'r5', taskId: 'task-secret-1', status: 'succeeded', exitCode: 0 } })
+    await claimPromise
+
+    // 太短的值不改写：长度 2 的 secret 会把普通文本打成占位符（与「漏改写」相比更危险）。
+    runtime.secrets({ project: 'demo', name: 'PIN', value: 'ab' })
+    const shortPromise = broker.claim({ taskId: 'task-secret-2', runId: 'run-sec-2', projectId: 'demo', stepIndex: 0, stageId: 'build', command: 'echo ab', cwd: '.', env: {}, timeoutSec: 30 }, 'r5', { timeoutMs: 5000 })
+    const claimed2 = await runtime.runnerProtocol({ path: '/claim', token, body: { runnerId: 'r5', waitMs: 0 } })
+    assert.equal(claimed2.body.task.steps[0].command, 'echo ab', '短 secret 不参与改写')
+    assert.deepEqual(claimed2.body.task.secretRefs, [])
+    await runtime.runnerProtocol({ path: '/complete', token, body: { runnerId: 'r5', taskId: 'task-secret-2', status: 'succeeded', exitCode: 0 } })
+    await shortPromise
+  } finally {
+    runtime.dispose()
+  }
+})
+
+checkAsync('P9-S6：M3 心跳统计——stats 入库并在 runners 输出里可见，坏形状不覆盖好数据', async () => {
+  const workDir = mkdtempSync(join(tmpdir(), 'dsh-cicd-v2-'))
+  const runtime = internals.createRuntime(fakeContext(), {
+    projects: [{ id: 'demo', path: projectDir }],
+    workDir,
+    scheduler: { enabled: false },
+    runners: { joinToken: 'join-secret' },
+  })
+  try {
+    const token = (await runtime.runnerProtocol({ path: '/register', body: { runnerId: 'r6', joinToken: 'join-secret' } })).body.runnerToken
+    const stats = { running: 3, diskFreePct: 41.5, cache: { hits: 9, misses: 4, saves: 2 } }
+    const beat = await runtime.runnerProtocol({ path: '/heartbeat', token, body: { runnerId: 'r6', stats } })
+    assert.equal(beat.status, 200)
+    assert.deepEqual(beat.body.stats, stats)
+    assert.deepEqual(runtime.runners().find((row) => row.runnerId === 'r6').stats, stats, 'stats 要落库并随 runners 输出带出')
+
+    // 越界/负数拉回边界：统计字段不该因为 runner 算错就污染展示。
+    await runtime.runnerProtocol({ path: '/heartbeat', token, body: { runnerId: 'r6', stats: { running: -2, diskFreePct: 240, cache: { hits: '7' } } } })
+    assert.deepEqual(runtime.runners().find((row) => row.runnerId === 'r6').stats, { running: 0, diskFreePct: 100, cache: { hits: 7 } })
+
+    // 形状完全不可用：整块丢弃，心跳照常成功，上一份好数据不被覆盖。
+    const garbage = await runtime.runnerProtocol({ path: '/heartbeat', token, body: { runnerId: 'r6', stats: { running: 'many', cache: 'nope' } } })
+    assert.equal(garbage.status, 200)
+    assert.equal(garbage.body.stats, null)
+    assert.deepEqual(runtime.runners().find((row) => row.runnerId === 'r6').stats, { running: 0, diskFreePct: 100, cache: { hits: 7 } }, '坏数据不能覆盖上一份')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+checkAsync('P9-S7：M3 顶层 cache 声明——解析归一、paths 只许相对路径、任务描述只带合法条目', async () => {
+  const pipe = parsePipe([
+    'version: 1',
+    'name: cache-pipe',
+    'cache:',
+    '  - key: m2-x64',
+    '    paths: [.m2, target/classes]',
+    '    restore_keys: [m2-]',
+    'targets:',
+    '  prod:',
+    '    hosts: [h]',
+    '    path: /opt/demo',
+    'stages:',
+    '  - id: build',
+    '    steps:',
+    '      - run: echo hi',
+  ].join('\n'))
+  assert.deepEqual(pipe.cache, [{ key: 'm2-x64', paths: ['.m2', 'target/classes'], restoreKeys: ['m2-'], mode: 'both' }])
+  const bad = (cacheLines, why) => assert.throws(() => parsePipe(['version: 1', 'name: p', 'cache:', ...cacheLines, 'targets:', '  prod:', '    hosts: [h]', '    path: /opt/demo', 'stages:', '  - id: build', '    steps:', '      - run: echo hi'].join('\n')), /cache/, why)
+  bad(['  - paths: [.m2]'], '缺 key 必须拒绝')
+  bad(['  - key: k'], '缺 paths 必须拒绝')
+  bad(['  - key: k', '    paths: [/etc/passwd]'], '绝对路径必须拒绝')
+  bad(['  - key: k', '    paths: [../escape]'], '上跳必须拒绝')
+  bad(['  - key: k', '    paths: [.m2]', '    mode: sometimes'], 'mode 只认 restore/save/both')
+
+  const workDir = mkdtempSync(join(tmpdir(), 'dsh-cicd-v2-'))
+  const runtime = internals.createRuntime(fakeContext(), {
+    projects: [{ id: 'demo', path: projectDir }],
+    workDir,
+    scheduler: { enabled: false },
+    runners: { joinToken: 'join-secret' },
+  })
+  try {
+    const token = (await runtime.runnerProtocol({ path: '/register', body: { runnerId: 'r7', joinToken: 'join-secret' } })).body.runnerToken
+    const broker = runtime.runnerV2Broker
+    const pending = broker.claim({
+      taskId: 'task-cache-1', runId: 'run-cache', projectId: 'demo', stepIndex: 0, stageId: 'build', command: 'echo hi', cwd: '.', env: {}, timeoutSec: 30,
+      cache: [{ key: 'm2-x64', paths: ['.m2'], restore_keys: ['m2-'] }, { key: 'abs', paths: ['/etc'] }, { key: '', paths: ['.x'] }],
+    }, 'r7', { timeoutMs: 5000 })
+    const claimed = await runtime.runnerProtocol({ path: '/claim', token, body: { runnerId: 'r7', waitMs: 0 } })
+    // 非法条目在描述里直接消失：runner 侧因此永远不会拿到绝对路径去解包。
+    assert.deepEqual(claimed.body.task.cache, [{ key: 'm2-x64', paths: ['.m2'], restoreKeys: ['m2-'], mode: 'both' }])
+    await runtime.runnerProtocol({ path: '/complete', token, body: { runnerId: 'r7', taskId: 'task-cache-1', status: 'succeeded', exitCode: 0 } })
+    await pending
+  } finally {
+    runtime.dispose()
+  }
+})
+
+/** 裸字节请求：PUT 用 Buffer body，GET 用可写流收字节（缓存 blob 走的就是这条路）。 */
+function v2Raw(path, { method = 'GET', token = '', body = null } = {}) {
+  const received = []
+  const res = new Writable({
+    write(chunk, _enc, cb) { received.push(Buffer.from(chunk)); cb() },
+  })
+  res.status = 0
+  res.headers = null
+  res.writeHead = function (status, headers) { this.status = status; this.headers = headers; return this }
+  const events = []
+  const req = {
+    method,
+    url: `${internals.ROUTE_PREFIX}${internals.RUNNER_V2_PATH}${path}`,
+    headers: { 'content-type': 'application/octet-stream', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    on(event, fn) { events.push([event, fn]); return req },
+    destroy() {},
+  }
+  const routes = activeRoutes || ctx.routes
+  const route = routes.find((item) => item.path === `${internals.ROUTE_PREFIX}${internals.RUNNER_V2_PATH}`)
+  assert.ok(route, 'v2 handler 路由已注册')
+  route.handler(req, res)
+  for (const [event, fn] of events) {
+    if (event === 'data' && body !== null) fn(Buffer.from(body))
+    if (event === 'end') fn()
+  }
+  return { res, received }
+}
+
+/** 等裸流落定，然后把收到的字节整块交回（JSON 响应也在这条路上）。 */
+async function v2RawCall(path, options, routes = null) {
+  activeRoutes = routes
+  const { res, received } = v2Raw(path, options)
+  activeRoutes = null
+  for (let i = 0; i < 400 && !res.writableFinished; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.ok(res.writableFinished, `v2 raw ${path} 没有及时响应（status=${res.status}）`)
+  const bytes = Buffer.concat(received)
+  return { status: res.status, headers: res.headers || {}, bytes }
+}
+
+checkAsync('P9-S8：M3 缓存字节闭环——lookup 命中/前缀、GET 取字节、PUT 存字节、未申报一律 403', async () => {
+  const workDir = mkdtempSync(join(tmpdir(), 'dsh-cicd-v2-'))
+  const v2Ctx = fakeContext()
+  const runtime = internals.createRuntime(v2Ctx, {
+    projects: [{ id: 'demo', path: projectDir }],
+    workDir,
+    scheduler: { enabled: false },
+    runners: { joinToken: 'join-secret' },
+  })
+  try {
+    internals.registerHttpRoutes(v2Ctx, runtime)
+    const token = (await runtime.runnerProtocol({ path: '/register', body: { runnerId: 'r8', joinToken: 'join-secret' } })).body.runnerToken
+    const broker = runtime.runnerV2Broker
+    const spec = (taskId, cache) => ({
+      taskId, runId: `run-${taskId}`, projectId: 'demo', stepIndex: 0, stageId: 'build',
+      command: 'echo hi', cwd: '.', env: {}, timeoutSec: 30, cache,
+    })
+    const pending = broker.claim(spec('task-cache-bytes', [{ key: 'k1', paths: ['dist'], restore_keys: ['k-'], mode: 'both' }]), 'r8', { timeoutMs: 5000 })
+    const claimed = await runtime.runnerProtocol({ path: '/claim', token, body: { runnerId: 'r8', waitMs: 0 } })
+    assert.deepEqual(claimed.body.task.cache, [{ key: 'k1', paths: ['dist'], restoreKeys: ['k-'], mode: 'both' }])
+
+    // 未命中不是错误：hit:false，构建照旧继续。
+    const miss = await v2Call('/cache/lookup', { token, body: { runnerId: 'r8', taskId: 'task-cache-bytes', key: 'k1' } }, v2Ctx.routes)
+    assert.equal(miss.status, 200)
+    assert.equal(miss.body.hit, false)
+    assert.equal(miss.body.digest, '')
+
+    // PUT：裸字节进 CAS，指针挪到新 digest。
+    const payload = Buffer.from('dsh-cicd-cache-payload\n'.repeat(64), 'utf8')
+    const put = await v2RawCall('/cache/blob?runnerId=r8&taskId=task-cache-bytes&key=k1', { method: 'PUT', token, body: payload }, v2Ctx.routes)
+    assert.equal(put.status, 200, put.bytes.toString('utf8'))
+    const saved = JSON.parse(put.bytes.toString('utf8'))
+    assert.equal(saved.ok, true)
+    assert.match(saved.digest, /^sha256:[0-9a-f]{64}$/)
+    assert.equal(saved.bytes, payload.length)
+
+    // 命中：同一个 key 现在有指针，paths 跟着指针走。
+    const hit = await v2Call('/cache/lookup', { token, body: { runnerId: 'r8', taskId: 'task-cache-bytes', key: 'k1', restoreKeys: ['k-'] } }, v2Ctx.routes)
+    assert.equal(hit.body.hit, true)
+    assert.equal(hit.body.digest, saved.digest)
+    assert.deepEqual(hit.body.paths, ['dist'])
+
+    // GET：按 digest 取回字节，逐字节一致。
+    const got = await v2RawCall(`/cache/blob?runnerId=r8&taskId=task-cache-bytes&digest=${encodeURIComponent(saved.digest)}`, { method: 'GET', token }, v2Ctx.routes)
+    assert.equal(got.status, 200)
+    assert.equal(got.headers['content-type'], 'application/octet-stream')
+    assert.equal(got.headers['x-cicd-cache-digest'], saved.digest)
+    assert.equal(got.headers['x-cicd-cache-key'], 'k1')
+    assert.ok(Buffer.compare(got.bytes, payload) === 0, '取回的字节必须与存进去的一致')
+
+    // 未申报的 key / 未申报的 restoreKeys 前缀 / 无 token / 幽灵任务。
+    const notDeclared = await v2Call('/cache/lookup', { token, body: { runnerId: 'r8', taskId: 'task-cache-bytes', key: 'other' } }, v2Ctx.routes)
+    assert.equal(notDeclared.status, 403)
+    assert.equal(notDeclared.body.code, 'CACHE_NOT_DECLARED')
+    const badPrefix = await v2Call('/cache/lookup', { token, body: { runnerId: 'r8', taskId: 'task-cache-bytes', key: 'k1', restoreKeys: ['zzz'] } }, v2Ctx.routes)
+    assert.equal(badPrefix.body.code, 'CACHE_NOT_DECLARED')
+    const noToken = await v2Call('/cache/lookup', { body: { runnerId: 'r8', taskId: 'task-cache-bytes', key: 'k1' } }, v2Ctx.routes)
+    assert.equal(noToken.status, 401)
+    const ghost = await v2Call('/cache/lookup', { token, body: { runnerId: 'r8', taskId: 'ghost', key: 'k1' } }, v2Ctx.routes)
+    assert.equal(ghost.status, 404)
+    assert.equal(ghost.body.code, 'TASK_UNKNOWN')
+
+    // digest 必须是本项目的缓存指针：换一个不存在的 digest 取不到字节。
+    const alien = await v2RawCall(`/cache/blob?runnerId=r8&taskId=task-cache-bytes&digest=${encodeURIComponent(`sha256:${'a'.repeat(64)}`)}`, { method: 'GET', token }, v2Ctx.routes)
+    assert.equal(alien.status, 403)
+    assert.equal(JSON.parse(alien.bytes.toString('utf8')).code, 'CACHE_NOT_DECLARED')
+    // 方法限制：cache/blob 只认 GET/PUT。
+    const badMethod = await v2RawCall('/cache/blob', { method: 'POST', token, body: Buffer.from('{}') }, v2Ctx.routes)
+    assert.equal(badMethod.status, 405)
+    await runtime.runnerProtocol({ path: '/complete', token, body: { runnerId: 'r8', taskId: 'task-cache-bytes', status: 'succeeded', exitCode: 0 } })
+    await pending
+
+    // mode=restore 的 key 不许保存（只读缓存不能被子任务覆盖）。
+    const roPending = broker.claim(spec('task-cache-ro', [{ key: 'ro', paths: ['dist'], mode: 'restore' }]), 'r8', { timeoutMs: 5000 })
+    await runtime.runnerProtocol({ path: '/claim', token, body: { runnerId: 'r8', waitMs: 0 } })
+    const roPut = await v2RawCall('/cache/blob?runnerId=r8&taskId=task-cache-ro&key=ro', { method: 'PUT', token, body: Buffer.from('nope') }, v2Ctx.routes)
+    assert.equal(roPut.status, 403)
+    assert.equal(JSON.parse(roPut.bytes.toString('utf8')).code, 'CACHE_SAVE_FORBIDDEN')
+    await runtime.runnerProtocol({ path: '/complete', token, body: { runnerId: 'r8', taskId: 'task-cache-ro', status: 'succeeded', exitCode: 0 } })
+    await roPending
+  } finally {
+    runtime.dispose()
+  }
+})
+
+checkAsync('P9-S9：M3 远程构建里的 uses: cache 会被点名提醒（它缓存的是宿主目录）', async () => {
+  const { dir, project } = runnerProject()
+  const store = createStore({ dir: join(dir, '.state') })
+  try {
+    const pipe = parsePipe([
+      'stages:',
+      '  - id: build',
+      '    steps:',
+      '      - uses: cache',
+      '        with:',
+      '          key: acts-cache-v1',
+      '          paths:',
+      '            - dist/**',
+    ].join('\n'))
+    const lines = []
+    const executor = { kind: 'remote', runnerId: 'r-remote', execute: async () => ({ status: 'success', exitCode: 0, durationMs: 0 }) }
+    await runPipeline({ pipe, project, target: '', store, executor, stepTimeoutSec: 10, onLog: (entry) => lines.push(entry.line) })
+    const notice = lines.find((line) => line.includes('uses: cache 在宿主侧执行'))
+    assert.ok(notice, '远程构建里的 uses: cache 必须被点名（静默缓存一个空目录比报错更坏）')
+    assert.ok(notice.includes('r-remote'), '提醒里要点名是哪台 runner')
+    assert.ok(notice.includes('顶层'), '提醒要给出正确写法（顶层 cache: 声明）')
+    // 本地构建一个字都不多说：同一个步骤在本地是有效的。
+    assert.equal(remoteCacheStepNotice({ kind: 'local' }), '')
+    assert.equal(remoteCacheStepNotice(null), '')
+  } finally {
+    store.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+checkAsync('P9-S10：M4 制品回流——声明下发、PUT 收进 CAS、complete 缺件判失败', async () => {
+  const workDir = mkdtempSync(join(tmpdir(), 'dsh-cicd-v2-'))
+  const v2Ctx = fakeContext()
+  const runtime = internals.createRuntime(v2Ctx, {
+    projects: [{ id: 'demo', path: projectDir }],
+    workDir,
+    scheduler: { enabled: false },
+    runners: { joinToken: 'join-secret' },
+  })
+  try {
+    internals.registerHttpRoutes(v2Ctx, runtime)
+    const token = (await runtime.runnerProtocol({ path: '/register', body: { runnerId: 'r10', joinToken: 'join-secret' } })).body.runnerToken
+    const broker = runtime.runnerV2Broker
+    const spec = (taskId, artifacts) => ({
+      taskId, runId: `run-${taskId}`, projectId: 'demo', stepIndex: 0, stageId: 'build',
+      command: 'echo hi', cwd: '.', env: {}, timeoutSec: 30, artifacts,
+    })
+    const pending = broker.claim(spec('task-art', [
+      { name: 'web-dist', paths: ['dist/**'] },
+      { name: 'bad name', paths: ['x'] },
+      { name: 'abs', paths: ['/etc/passwd'] },
+      { name: 'extra', paths: ['build/out.txt'], optional: true },
+    ]), 'r10', { timeoutMs: 5000 })
+    const claimed = await runtime.runnerProtocol({ path: '/claim', token, body: { runnerId: 'r10', waitMs: 0 } })
+    // 非法条目在描述里直接消失：runner 因此不会拿到一个绝对路径去打包。
+    assert.deepEqual(claimed.body.task.artifacts, [
+      { name: 'web-dist', paths: ['dist/**'], optional: false },
+      { name: 'extra', paths: ['build/out.txt'], optional: true },
+    ])
+
+    const payload = Buffer.from('dsh-cicd-artifact-bytes\n'.repeat(32), 'utf8')
+    const put = await v2RawCall('/artifacts/task-art/web-dist?runnerId=r10', { method: 'PUT', token, body: payload }, v2Ctx.routes)
+    assert.equal(put.status, 200, put.bytes.toString('utf8'))
+    const saved = JSON.parse(put.bytes.toString('utf8'))
+    assert.equal(saved.ok, true)
+    assert.equal(saved.name, 'web-dist')
+    assert.match(saved.digest, /^sha256:[0-9a-f]{64}$/)
+    assert.equal(saved.digest, 'sha256:' + createHash('sha256').update(payload).digest('hex'), 'digest 必须是这批字节的内容地址')
+    assert.equal(saved.bytes, payload.length)
+    assert.equal(saved.deduped, false)
+    const again = await v2RawCall('/artifacts/task-art/web-dist?runnerId=r10', { method: 'PUT', token, body: payload }, v2Ctx.routes)
+    assert.equal(JSON.parse(again.bytes.toString('utf8')).deduped, true, '同样的字节第二次进 CAS 必须去重')
+
+    // 未申报的名字 / 幽灵任务 / 空体 / 非法名字 / 方法 / 无 token。
+    const undeclared = await v2RawCall('/artifacts/task-art/nope?runnerId=r10', { method: 'PUT', token, body: payload }, v2Ctx.routes)
+    assert.equal(undeclared.status, 403)
+    assert.equal(JSON.parse(undeclared.bytes.toString('utf8')).code, 'ARTIFACT_NOT_DECLARED')
+    const ghost = await v2RawCall('/artifacts/ghost/web-dist?runnerId=r10', { method: 'PUT', token, body: payload }, v2Ctx.routes)
+    assert.equal(ghost.status, 404)
+    assert.equal(JSON.parse(ghost.bytes.toString('utf8')).code, 'TASK_UNKNOWN')
+    const empty = await v2RawCall('/artifacts/task-art/web-dist?runnerId=r10', { method: 'PUT', token, body: Buffer.alloc(0) }, v2Ctx.routes)
+    assert.equal(empty.status, 400)
+    const badName = await v2RawCall('/artifacts/task-art/Bad%20Name?runnerId=r10', { method: 'PUT', token, body: payload }, v2Ctx.routes)
+    assert.equal(badName.status, 400)
+    assert.equal(JSON.parse(badName.bytes.toString('utf8')).code, 'BAD_ARTIFACT_NAME')
+    const getOnArtifacts = await v2RawCall('/artifacts/task-art/web-dist?runnerId=r10', { method: 'GET', token }, v2Ctx.routes)
+    assert.equal(getOnArtifacts.status, 405)
+    const noToken = await v2RawCall('/artifacts/task-art/web-dist?runnerId=r10', { method: 'PUT', body: payload }, v2Ctx.routes)
+    assert.equal(noToken.status, 401)
+
+    // 声明的都到齐（optional 的可以不发）→ 任务照常成功。
+    const done = await v2Call('/complete', { token, body: { runnerId: 'r10', taskId: 'task-art', status: 'succeeded', exitCode: 0, artifacts: [{ name: 'web-dist', digest: saved.digest, bytes: saved.bytes }] } }, v2Ctx.routes)
+    assert.equal(done.body.ok, true)
+    assert.deepEqual(done.body.missing, [])
+    const result = await pending
+    assert.equal(result.status, 'success')
+
+    // 非 optional 缺件：构建退出码 0 也不算成功——下游 deploy 会无米下锅。
+    const pending2 = broker.claim(spec('task-art-missing', [{ name: 'web-dist', paths: ['dist/**'] }]), 'r10', { timeoutMs: 5000 })
+    await runtime.runnerProtocol({ path: '/claim', token, body: { runnerId: 'r10', waitMs: 0 } })
+    const missing = await v2Call('/complete', { token, body: { runnerId: 'r10', taskId: 'task-art-missing', status: 'succeeded', exitCode: 0 } }, v2Ctx.routes)
+    assert.deepEqual(missing.body.missing, ['web-dist'])
+    const failed = await pending2
+    assert.equal(failed.status, 'failed')
+    assert.equal(failed.code, 'ARTIFACT_MISSING')
+    assert.match(failed.error, /ARTIFACT_MISSING/)
+  } finally {
+    runtime.dispose()
+  }
+})
+
+checkAsync('P9-S11：M4 uses: collect 按 stage 翻译成任务声明，远程执行不在宿主 glob', async () => {
+  const { dir, project } = runnerProject()
+  const store = createStore({ dir: join(dir, '.state') })
+  try {
+    const pipe = parsePipe([
+      'stages:',
+      '  - id: build',
+      '    steps:',
+      '      - run: echo build',
+      '      - uses: collect',
+      '        with:',
+      '          name: web-dist',
+      '          paths:',
+      '            - dist/**',
+      '  - id: release',
+      '    steps:',
+      '      - run: echo release',
+    ].join('\n'))
+    // 声明按 stage 收敛：build 的产物不会出现在 release 的任务里（每个任务一个干净 workspace）。
+    assert.deepEqual(collectDeclarations(pipe, 'build'), [{ name: 'web-dist', paths: ['dist/**'], optional: false }])
+    assert.deepEqual(collectDeclarations(pipe, 'release'), [])
+    assert.deepEqual(collectDeclarations(null, 'build'), [])
+
+    const seen = []
+    const lines = []
+    const executor = {
+      kind: 'remote',
+      runnerId: 'r-collect',
+      execute: async (step, context) => { seen.push(context.artifacts); return { status: 'success', exitCode: 0, durationMs: 0 } },
+    }
+    const outcome = await runPipeline({ pipe, project, target: '', store, executor, stepTimeoutSec: 10, onLog: (entry) => lines.push(entry.line) })
+    assert.equal(outcome.status, 'success')
+    // 两个 stage 各下发自己的声明：build 带 web-dist，release 什么都没有
+    // （release 的任务里混进 build 的声明，只会让那个任务报 ARTIFACT_MISSING）。
+    assert.deepEqual(seen, [[{ name: 'web-dist', paths: ['dist/**'], optional: false }], []], '制品声明必须按 stage 随任务上下文下发')
+    const collectStep = outcome.stages.flatMap((stage) => stage.steps || []).find((step) => step.uses === 'collect')
+    assert.ok(collectStep, 'collect 步骤仍要出现在运行记录里')
+    assert.equal(collectStep.status, 'skipped', '远程构建不在宿主 glob（宿主目录里没有远程产物）')
+    assert.ok(lines.some((line) => line.includes('uses: collect 由 runner r-collect 执行')), '跳过原因要写在日志里')
+    assert.equal(remoteCollectStepNotice({ kind: 'local' }), '')
+  } finally {
+    store.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+checkAsync('P9-S12：M5 协议握手——v2 协商、v1 落 protocol=1、走错协议当场说清楚', async () => {
+  const workDir = mkdtempSync(join(tmpdir(), 'dsh-cicd-v2-'))
+  const v2Ctx = fakeContext()
+  const runtime = internals.createRuntime(v2Ctx, {
+    projects: [{ id: 'demo', path: projectDir }],
+    workDir,
+    scheduler: { enabled: false },
+    runners: { joinToken: 'join-secret' },
+  })
+  try {
+    internals.registerHttpRoutes(v2Ctx, runtime)
+    // 1) v2 注册：自报 2 → 通过，并把协商结果回给客户端（否则 runner 只能靠猜）。
+    const reg = await v2Call('/register', { body: { runnerId: 'r-v2', joinToken: 'join-secret', protocol: 2, tools: ['git'] } }, v2Ctx.routes)
+    assert.equal(reg.status, 200, JSON.stringify(reg.body))
+    assert.equal(reg.body.protocol, 2)
+    assert.equal(reg.body.minProtocol, 2)
+    const token = reg.body.runnerToken
+    assert.ok(token)
+
+    // 2) 自报 1 却敲 v2 端点 → 426 并说明支持范围（不是 401：凭据没问题，走错门了）。
+    const wrong = await v2Call('/register', { body: { runnerId: 'r-old', joinToken: 'join-secret', protocol: 1 } }, v2Ctx.routes)
+    assert.equal(wrong.status, 426)
+    assert.equal(wrong.body.code, 'RUNNER_PROTOCOL_UNSUPPORTED')
+    assert.match(wrong.body.error, /v2/)
+    assert.equal(runtime.runners().find((row) => row.runnerId === 'r-old'), undefined, '协商失败不能把机器登记进来')
+
+    // 3) v1 注册（/runner-register 走 runtime）→ protocol 落 1，响应也带 1。
+    const legacy = runtime.runnerRegister({ runnerId: 'r-v1', labels: 'cpu', version: '0.9.0', capacity: 1, token: 'join-secret' })
+    assert.equal(legacy.protocol, 1)
+    const rows = runtime.runners()
+    assert.equal(rows.find((row) => row.runnerId === 'r-v1').protocol, 1)
+    assert.equal(rows.find((row) => row.runnerId === 'r-v2').protocol, 2)
+
+    // 4) 跨协议借道一律拒绝：v1 机器敲 /runner/v2/claim、v2 机器去轮询 v1 队列。
+    const crossedIn = await v2Call('/claim', { token, body: { runnerId: 'r-v1', waitMs: 0 } }, v2Ctx.routes)
+    assert.equal(crossedIn.status, 409)
+    assert.equal(crossedIn.body.code, 'RUNNER_PROTOCOL_MISMATCH')
+    let pollErr = null
+    try { runtime.runnerPoll({ runnerId: 'r-v2' }) } catch (error) { pollErr = error }
+    assert.equal(pollErr?.code, 'RUNNER_PROTOCOL_MISMATCH')
+    let resultErr = null
+    try { runtime.runnerResult({ runnerId: 'r-v2', taskId: 'task-x', status: 'succeeded', exitCode: 0 }) } catch (error) { resultErr = error }
+    assert.equal(resultErr?.code, 'RUNNER_PROTOCOL_MISMATCH')
+
+    // 5) 两台机器并存，各跑一条：同一个 broker、同一个库，两条路径互不干扰。
+    const broker = runtime.runnerV2Broker
+    const spec = (taskId, command) => ({ taskId, runId: `run-${taskId}`, projectId: 'demo', stepIndex: 0, stageId: 'build', command, cwd: '.', env: {}, timeoutSec: 30 })
+    const v1Pending = broker.claim(spec('task-v1', 'echo v1'), 'r-v1', { timeoutMs: 5000 })
+    const v1Task = runtime.runnerPoll({ runnerId: 'r-v1' })
+    assert.equal(v1Task.task.taskId, 'task-v1')
+    runtime.runnerResult({ runnerId: 'r-v1', taskId: 'task-v1', status: 'success', exitCode: 0 })
+    assert.equal((await v1Pending).status, 'success')
+
+    const v2Pending = broker.claim(spec('task-v2', 'echo v2'), 'r-v2', { timeoutMs: 5000 })
+    const claimed = await v2Call('/claim', { token, body: { runnerId: 'r-v2', waitMs: 0 } }, v2Ctx.routes)
+    assert.equal(claimed.body.task.taskId, 'task-v2')
+    const done = await v2Call('/complete', { token, body: { runnerId: 'r-v2', taskId: 'task-v2', status: 'succeeded', exitCode: 0 } }, v2Ctx.routes)
+    assert.equal(done.body.ok, true)
+    assert.equal((await v2Pending).status, 'success')
+  } finally {
+    runtime.dispose()
+  }
+})
 
 let passed = 0
 for (const item of checks) {

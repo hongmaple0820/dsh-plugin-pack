@@ -1,8 +1,12 @@
 pub mod app;
+pub mod cache;
 pub mod cli;
 pub mod client;
+pub mod collect;
+pub mod cred;
 pub mod exec;
 pub mod journal;
 pub mod protocol;
 pub mod seq;
 pub mod util;
+pub mod workspace;
