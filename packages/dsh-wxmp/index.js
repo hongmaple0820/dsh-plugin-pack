@@ -577,9 +577,17 @@ export function apply(ctx, config = {}) {
       since: q.get('since') ? Number(q.get('since')) : null,
       limit: Number(q.get('limit')) || 50,
     }))
+    //   GET /article?link=…  → 按链接现抓正文（页面抽屉用；本地库不存正文，id 只对 sqlite 后端有效）
+    //   GET /article?id=N     → 读本地库单篇（仅 sqlite 后端有该 id）
     route('/api/plugins/wxmp/article', async (q) => {
+      const link = q.get('link') || ''
+      if (link) {
+        if (!/^https:\/\/mp\.weixin\.qq\.com\//.test(link)) throw new RangeError('link 需为 mp.weixin.qq.com 文章链接')
+        const article = await actions.readArticle(link)
+        return { article: { ...article, link, sourceUrl: link } }
+      }
       const id = Number(q.get('id'))
-      if (!Number.isInteger(id) || id <= 0) throw new RangeError('id 必填')
+      if (!Number.isInteger(id) || id <= 0) throw new RangeError('需要 link 或正整数 id')
       const article = store.getArticle(id)
       if (!article) throw new NotFoundError('文章不存在')
       return { article }

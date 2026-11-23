@@ -512,3 +512,44 @@ test('index.js：webhooks 路由 list/add/remove；config 初值生效；wxmp_lo
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+/* 回归：文章抽屉走 /article?link=（本地库不存正文，memory/storage 后端的 id 不稳定，按链接现抓） */
+test('index.js：/article?link= 现抓正文；非法 link 400；缺参 400；不存在 id 404', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wxmp-article-'))
+  const { ARTICLE_HTML } = await import('./fixtures.mjs')
+  const fetchArticleOk = async (url) => {
+    if (String(url).includes('mp.weixin.qq.com')) {
+      return {
+        status: 200,
+        headers: new Headers({ 'content-type': 'text/html; charset=utf-8' }),
+        text: async () => ARTICLE_HTML,
+        arrayBuffer: async () => new TextEncoder().encode(ARTICLE_HTML).buffer,
+      }
+    }
+    return { status: 200, text: '{}', headers: new Headers() }
+  }
+  const h = makeHarness()
+  withFakeSqlite(() => apply(h.ctx, { dataDir: dir, fetch: fetchArticleOk, pollIntervalMs: 0 }))
+  try {
+    const route = h.routes.get('/api/plugins/wxmp/article')
+    assert.ok(route, '缺少 /article 路由')
+    const base = 'https://h.test/api/plugins/wxmp/article'
+    const okJson = await (await route(new Request(base + '?link=' + encodeURIComponent('https://mp.weixin.qq.com/s/AAA111')))).json()
+    assert.equal(okJson.ok, true)
+    assert.ok(okJson.article && okJson.article.title, '应返回标题')
+    assert.equal(okJson.article.sourceUrl, 'https://mp.weixin.qq.com/s/AAA111')
+    assert.match(okJson.article.markdown, /\S/, 'markdown 不应为空')
+
+    const badLink = await route(new Request(base + '?link=' + encodeURIComponent('https://evil.test/x')))
+    assert.equal(badLink.status, 400)
+
+    const noArgs = await route(new Request(base))
+    assert.equal(noArgs.status, 400, '缺参应为 400 而不是 404')
+
+    const missing = await route(new Request(base + '?id=99999'))
+    assert.equal(missing.status, 404)
+  } finally {
+    h.dispose()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

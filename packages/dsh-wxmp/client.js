@@ -606,7 +606,9 @@ window.__ModuleLoader__.load({
         const controller = new AbortController()
         let alive = true
         setState({ status: 'loading', article: null, error: '' })
-        getJson(`/api/plugins/wxmp/article?id=${encodeURIComponent(target.id)}`, controller.signal)
+        // 本地库不存正文，且 memory/storage 后端的 id 不稳定：抽屉统一按链接现抓。
+        const url = target.sourceUrl || target.link
+        getJson(`/api/plugins/wxmp/article?link=${encodeURIComponent(url || '')}`, controller.signal)
           .then((payload) => { if (alive) setState({ status: 'ready', article: payload.article || null, error: '' }) })
           .catch((err) => {
             if (!alive || (err && err.name === 'AbortError')) return
@@ -638,7 +640,10 @@ window.__ModuleLoader__.load({
               state.status === 'loading' ? h(Skeleton)
                 : state.status === 'error' ? h(ErrorState, { message: state.error, onRetry: () => setRetryNonce((v) => v + 1) })
                 : state.article
-                  ? renderMarkdown(state.article.markdown)
+                  ? h(React.Fragment, null,
+                      state.article.title && state.article.title !== target.title
+                        ? h('div', { className: 'wxmp-drawer-meta' }, state.article.title) : null,
+                      renderMarkdown(state.article.markdown))
                   : h(EmptyState, { text: '正文为空。' })))),
         document.body)
     }
